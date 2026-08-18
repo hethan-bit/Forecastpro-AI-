@@ -1,0 +1,30 @@
+definition_version: 2
+entities:
+  forecastpro:
+    type: streamlit
+    identifier:
+      database: ZX
+      schema: ANALYTICS
+      name: FORECASTPRO_STREAMLIT
+    comment: >-
+      ForecastPro historical review and forecasting workflow for Streamlit in
+      Snowflake
+    title: ForecastPro AI
+    stage: ZX.ANALYTICS.FORECASTPRO_STREAMLIT_STAGE
+    query_warehouse: DC_ANALYTICS_WH
+    compute_pool: SYSTEM_COMPUTE_POOL_CPU
+    run_mode: SpcsOnly
+    execute_as: OWNER
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - data_access.py
+      - planning_source.py
+      - forecast_core.py
+      - workbook_export.py
+      - signal_utilization_curve.json
+      - FORECASTING_Q2_2026.csv
+      - environment.yml
+      - requirements.txt
+      - .streamlit/config.toml
+    idle_auto_shutdown_time_seconds: 86400
