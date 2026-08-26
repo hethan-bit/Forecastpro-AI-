@@ -637,6 +637,37 @@ def visible_tier(label: str, show_expansion: bool) -> bool:
     )
 
 
+def _fmt_dollar_commas(v: float) -> str:
+    return f"${v:,.0f}"
+
+def _fmt_compact_k(v: float) -> str:
+    abs_v = abs(v)
+    if abs_v >= 1_000_000:
+        return f"{v/1_000_000:.1f}M"
+    elif abs_v >= 1_000:
+        return f"{v/1_000:.1f}K"
+    return f"{v:.0f}"
+
+def _fmt_dollar_compact_m(v: float) -> str:
+    abs_v = abs(v)
+    if abs_v >= 1_000_000:
+        return f"${v/1_000_000:.1f}M"
+    elif abs_v >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:.0f}"
+
+def _fmt_dollar_0(v: float) -> str:
+    return f"${v:,.0f}"
+
+def _fmt_iroas(v: float) -> str:
+    return f"${v:,.2f}"
+
+def _range_str(lo: float, hi: float, fmt_func) -> str:
+    if abs(lo - hi) < 0.005:
+        return fmt_func(lo)
+    return f"{fmt_func(lo)} - {fmt_func(hi)}"
+
+
 def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
     """Render Previous / Next navigation buttons at the bottom of a tab."""
     st.markdown("---")
@@ -731,9 +762,8 @@ tab_names = ["1 Inputs"]
 if st.session_state.confirmed:
     tab_names.append("2 Review & Inputs")
 if st.session_state.forecast:
-    tab_names.append("3 Forecast Results")
-    tab_names.append("4 Charts")
-    tab_names.append("5 Annual & Quarterly Forecast")
+    tab_names.append("4 Forecast Results")
+    tab_names.append("5 Charts")
 
 # Initialize active_tab if not set or out of bounds
 if "active_tab" not in st.session_state or st.session_state.active_tab >= len(tab_names):
@@ -939,11 +969,50 @@ if st.session_state.preview and active_tab == 0:
 # =============================================================================
 if st.session_state.confirmed and active_tab == 1:
     selected_history = st.session_state.selected_history
-    st.session_state.setdefault("show_historical_kpis", False)
-    kpi_button_label = (
-        "Hide historical quarterly KPIs"
-        if st.session_state.show_historical_kpis
-        else "Show historical quarterly KPIs"
+    st.header("4. Historical Quarterly KPIs & Performance")
+    metrics = [
+        ("Delivered Volume", "delivered_volume"),
+        ("Spend", "source_spend"),
+        ("Frequency", "frequency"),
+        ("Prospects", "prospects"),
+        ("Incremental Customers", "incremental_customers"),
+        ("Incremental Revenue", "incremental_revenue"),
+        ("Avg. Inc. Rev", "average_incremental_revenue"),
+        ("CPIx", "cpix"),
+        ("iROAS", "iroas"),
+    ]
+    _hist_fmt = {
+        "delivered_volume": lambda v: f"{v:,.0f}",
+        "source_spend": lambda v: f"${v:,.0f}",
+        "frequency": lambda v: f"{v:.2f}",
+        "prospects": lambda v: f"{v:,.0f}",
+        "incremental_customers": lambda v: f"{v:,.0f}",
+        "incremental_revenue": lambda v: f"${v:,.0f}",
+        "average_incremental_revenue": lambda v: f"${v:,.2f}",
+        "cpix": lambda v: f"${v:,.2f}",
+        "iroas": lambda v: f"${v:.2f}",
+    }
+    summary = []
+    for label, field in metrics:
+        fmt = _hist_fmt.get(field, lambda v: f"{v:,.2f}")
+        values = [float(row[field]) for row in selected_history]
+        avg = sum(values) / len(values)
+        summary.append(
+            {
+                "Metric": label,
+                **{
+                    row["campaign_quarter"]: fmt(value)
+                    for row, value in zip(selected_history, values)
+                },
+                "Average": fmt(avg),
+            }
+        )
+    st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+
+    st.header("5. Load Q2 planning inputs")
+    st.caption(
+        "ForecastPro automatically matches the selected account to the approved "
+        "Q2 2026 forecast sheet."
     )
     if st.button(kpi_button_label, key="toggle_historical_kpis"):
         st.session_state.show_historical_kpis = not st.session_state.show_historical_kpis
@@ -1423,7 +1492,7 @@ if st.session_state.confirmed and active_tab == 1:
                 f"Factor {scenario_idx + 1} (%)",
                 min_value=0.0,
                 max_value=99.0,
-                value=10.0,
+                value=15.0 if scenario_idx == 1 else 10.0,
                 key=f"scenario_factor_{scenario_idx}",
             )
             scenario_names.append(name)
@@ -1549,32 +1618,49 @@ if st.session_state.forecast and active_tab == 2:
 
     st.header("Forecast Output Ranges")
     st.caption(f"{result['method']} · curve {result['version']}")
+    _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
+    # Build marginal ranges from projections across all historical quarters
+    from collections import defaultdict as _defaultdict
+    _marginal_cpix_values: dict[str, list[float]] = _defaultdict(list)
+    _marginal_iroas_values: dict[str, list[float]] = _defaultdict(list)
+    for row in visible_projections:
+        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+            _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
+        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+            _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
+
     range_frame = pd.DataFrame([
-        {"Tier": row.tier_label, "Investment": float(row.investment),
-         "Delivered": float(row.delivered_volume), "Prospects": float(row.prospects),
-         "Customers Min": float(row.incremental_customers.minimum),
-         "Customers Max": float(row.incremental_customers.maximum),
-         "Revenue Min": float(row.incremental_revenue.minimum),
-         "Revenue Max": float(row.incremental_revenue.maximum),
-         "CPIx Min": float(row.cpix.minimum), "CPIx Max": float(row.cpix.maximum),
-         "iROAS Min": float(row.iroas.minimum), "iROAS Max": float(row.iroas.maximum),
-         "New Signal Utilization": float(
-             curve_inputs[row.tier_label].new_signal_utilization * 100
-         ),
-         "Adjustment Factor": float(
-             curve_inputs[row.tier_label].adjustment_factor * 100
-         )}
+        {"Tier": row.tier_label,
+         "Investment Tier": _fmt_dollar_commas(float(row.investment)),
+         "Delivered Volume": f"{float(row.delivered_volume):,.0f}",
+         "# of Prospects": f"{float(row.prospects):,.0f}",
+         "Inc. Customers": _range_str(
+             float(row.incremental_customers.minimum),
+             float(row.incremental_customers.maximum),
+             _fmt_compact_k),
+         "Incremental Revenue": _range_str(
+             float(row.incremental_revenue.minimum),
+             float(row.incremental_revenue.maximum),
+             _fmt_dollar_compact_m),
+         "CPIx": _range_str(
+             float(row.cpix.minimum), float(row.cpix.maximum), _fmt_dollar_0),
+         "iROAS": _range_str(
+             float(row.iroas.minimum), float(row.iroas.maximum), _fmt_iroas),
+         "Marginal CPIx": _range_str(
+             min(_marginal_cpix_values[row.tier_label]),
+             max(_marginal_cpix_values[row.tier_label]),
+             _fmt_dollar_0)
+             if _marginal_cpix_values.get(row.tier_label) and row.tier_label != _first_tier_label
+             else "—",
+         "Marginal iROAS": _range_str(
+             min(_marginal_iroas_values[row.tier_label]),
+             max(_marginal_iroas_values[row.tier_label]),
+             _fmt_iroas)
+             if _marginal_iroas_values.get(row.tier_label) and row.tier_label != _first_tier_label
+             else "—"}
         for row in visible_ranges
     ])
-    st.dataframe(range_frame, hide_index=True, use_container_width=True,
-        column_config={
-            **{
-                col: st.column_config.NumberColumn(format="$%.2f")
-                for col in ["Investment", "Revenue Min", "Revenue Max", "CPIx Min", "CPIx Max"]
-            },
-            "New Signal Utilization": st.column_config.NumberColumn(format="%.1f%%"),
-            "Adjustment Factor": st.column_config.NumberColumn(format="%.1f%%"),
-        })
+    st.dataframe(range_frame, hide_index=True, use_container_width=True)
 
     # --- Expansion tiers (hidden by default, toggle to show) ---
     expansion_ranges = [
@@ -1584,44 +1670,263 @@ if st.session_state.forecast and active_tab == 2:
     if expansion_ranges:
         with st.expander("Show Expansion Tiers (Incremental Reach / Maximum Scale)", expanded=False):
             expansion_frame = pd.DataFrame([
-                {"Tier": row.tier_label, "Investment": float(row.investment),
-                 "Delivered": float(row.delivered_volume), "Prospects": float(row.prospects),
-                 "Customers Min": float(row.incremental_customers.minimum),
-                 "Customers Max": float(row.incremental_customers.maximum),
-                 "Revenue Min": float(row.incremental_revenue.minimum),
-                 "Revenue Max": float(row.incremental_revenue.maximum),
-                 "CPIx Min": float(row.cpix.minimum), "CPIx Max": float(row.cpix.maximum),
-                 "iROAS Min": float(row.iroas.minimum), "iROAS Max": float(row.iroas.maximum),
-                 "New Signal Utilization": float(
-                     curve_inputs[row.tier_label].new_signal_utilization * 100
-                 ),
-                 "Adjustment Factor": float(
-                     curve_inputs[row.tier_label].adjustment_factor * 100
-                 )}
+                {"Tier": row.tier_label,
+                 "Investment Tier": _fmt_dollar_commas(float(row.investment)),
+                 "Delivered Volume": f"{float(row.delivered_volume):,.0f}",
+                 "# of Prospects": f"{float(row.prospects):,.0f}",
+                 "Inc. Customers": _range_str(
+                     float(row.incremental_customers.minimum),
+                     float(row.incremental_customers.maximum),
+                     _fmt_compact_k),
+                 "Incremental Revenue": _range_str(
+                     float(row.incremental_revenue.minimum),
+                     float(row.incremental_revenue.maximum),
+                     _fmt_dollar_compact_m),
+                 "CPIx": _range_str(
+                     float(row.cpix.minimum), float(row.cpix.maximum), _fmt_dollar_0),
+                 "iROAS": _range_str(
+                     float(row.iroas.minimum), float(row.iroas.maximum), _fmt_iroas),
+                 "Marginal CPIx": _range_str(
+                     min(_marginal_cpix_values[row.tier_label]),
+                     max(_marginal_cpix_values[row.tier_label]),
+                     _fmt_dollar_0)
+                     if _marginal_cpix_values.get(row.tier_label)
+                     else "—",
+                 "Marginal iROAS": _range_str(
+                     min(_marginal_iroas_values[row.tier_label]),
+                     max(_marginal_iroas_values[row.tier_label]),
+                     _fmt_iroas)
+                     if _marginal_iroas_values.get(row.tier_label)
+                     else "—"}
                 for row in expansion_ranges
             ])
-            st.dataframe(expansion_frame, hide_index=True, use_container_width=True,
-                column_config={
-                    **{
-                        col: st.column_config.NumberColumn(format="$%.2f")
-                        for col in ["Investment", "Revenue Min", "Revenue Max", "CPIx Min", "CPIx Max"]
-                    },
-                    "New Signal Utilization": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Adjustment Factor": st.column_config.NumberColumn(format="%.1f%%"),
-                })
+            st.dataframe(expansion_frame, hide_index=True, use_container_width=True)
 
-    detail_tabs = st.tabs(["Marginal economics", "Investment trade-offs", "Improvement scenarios", "Historical reconciliation"])
+    detail_tabs = st.tabs(["Annual projections", "Quarterly projections", "Monthly breakdown", "Marginal economics", "Investment trade-offs", "Improvement scenarios", "Historical reconciliation"])
     with detail_tabs[0]:
+        st.markdown("**Annual Projections (x4)**")
+        annual_frame = pd.DataFrame([
+            {"Tier": row.tier_label,
+             "Investment Tier": _fmt_dollar_commas(float(row.investment) * 4),
+             "Delivered Volume": f"{float(row.delivered_volume) * 4:,.0f}",
+             "# of Prospects": f"{float(row.prospects) * 4:,.0f}",
+             "Inc. Customers": _range_str(
+                 float(row.incremental_customers.minimum) * 4,
+                 float(row.incremental_customers.maximum) * 4,
+                 _fmt_compact_k),
+             "Incremental Revenue": _range_str(
+                 float(row.incremental_revenue.minimum) * 4,
+                 float(row.incremental_revenue.maximum) * 4,
+                 _fmt_dollar_compact_m),
+             "CPIx": _range_str(
+                 float(row.cpix.minimum), float(row.cpix.maximum), _fmt_dollar_0),
+             "iROAS": _range_str(
+                 float(row.iroas.minimum), float(row.iroas.maximum), _fmt_iroas),
+             "Marginal CPIx": _range_str(
+                 min(_marginal_cpix_values[row.tier_label]),
+                 max(_marginal_cpix_values[row.tier_label]),
+                 _fmt_dollar_0)
+                 if _marginal_cpix_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                 else "—",
+             "Marginal iROAS": _range_str(
+                 min(_marginal_iroas_values[row.tier_label]),
+                 max(_marginal_iroas_values[row.tier_label]),
+                 _fmt_iroas)
+                 if _marginal_iroas_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                 else "—"}
+            for row in visible_ranges
+        ])
+        st.dataframe(annual_frame, hide_index=True, use_container_width=True)
+        _range_by_tier_ann = {r.tier_label: r for r in visible_ranges}
+        _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
+        _sig_util_ann = {
+            row.tier_label: float(row.new_signal_utilization * 100)
+            for row in visible_projections
+            if row.historical_quarter == latest_quarter
+        }
+        for name, factor, rows in result["improvements"]:
+            st.markdown(f"**Annual with {name} (+{float(factor)*100:.0f}%)**")
+            from collections import defaultdict as _dd2
+            _imp_by_tier_ann: dict[str, list] = _dd2(list)
+            for r in rows:
+                if visible_tier(r.tier_label, result["show_expansion"]):
+                    _imp_by_tier_ann[r.tier_label].append(r)
+            imp_rows = []
+            for tier_label, tier_rows in _imp_by_tier_ann.items():
+                rng = _range_by_tier_ann.get(tier_label)
+                custs = [float(r.incremental_customers) * 4 for r in tier_rows]
+                revs = [float(r.incremental_revenue) * 4 for r in tier_rows]
+                cpixs = [float(r.cpix) for r in tier_rows]
+                iroass = [float(r.iroas) for r in tier_rows]
+                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix and r.marginal_cpix > 0]
+                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas and r.marginal_iroas > 0]
+                if len(tier_rows) == 1:
+                    c = custs[0]
+                    cust_range = _range_str(c * (1 - _range_adj_ann), c * (1 + _range_adj_ann), _fmt_compact_k)
+                    rv = revs[0]
+                    rev_range = _range_str(rv * (1 - _range_adj_ann), rv * (1 + _range_adj_ann), _fmt_dollar_compact_m)
+                    cx = cpixs[0]
+                    cpix_range = _range_str(cx / (1 + _range_adj_ann), cx / (1 - _range_adj_ann), _fmt_dollar_0)
+                    ir = iroass[0]
+                    iroas_range = _range_str(ir * (1 - _range_adj_ann), ir * (1 + _range_adj_ann), _fmt_iroas)
+                    mcpix_range = _range_str(mcpixs[0] / (1 + _range_adj_ann), mcpixs[0] / (1 - _range_adj_ann), _fmt_dollar_0) if mcpixs else "—"
+                    miroas_range = _range_str(miroass[0] * (1 - _range_adj_ann), miroass[0] * (1 + _range_adj_ann), _fmt_iroas) if miroass else "—"
+                else:
+                    cust_range = _range_str(min(custs), max(custs), _fmt_compact_k)
+                    rev_range = _range_str(min(revs), max(revs), _fmt_dollar_compact_m)
+                    cpix_range = _range_str(min(cpixs), max(cpixs), _fmt_dollar_0)
+                    iroas_range = _range_str(min(iroass), max(iroass), _fmt_iroas)
+                    mcpix_range = _range_str(min(mcpixs), max(mcpixs), _fmt_dollar_0) if mcpixs else "—"
+                    miroas_range = _range_str(min(miroass), max(miroass), _fmt_iroas) if miroass else "—"
+                if tier_label == _first_tier_label:
+                    mcpix_range = "—"
+                    miroas_range = "—"
+                imp_rows.append({
+                    "Tier": tier_label,
+                    "Investment Tier": _fmt_dollar_commas(float(tier_rows[0].investment) * 4),
+                    "Delivered Volume": f"{float(rng.delivered_volume) * 4:,.0f}" if rng else "—",
+                    "# of Prospects": f"{float(rng.prospects) * 4:,.0f}" if rng else "—",
+                    "Inc. Customers": cust_range,
+                    "Incremental Revenue": rev_range,
+                    "CPIx": cpix_range,
+                    "iROAS": iroas_range,
+                    "Marginal CPIx": mcpix_range,
+                    "Marginal iROAS": miroas_range,
+                    "Signal Utilization": f"{_sig_util_ann.get(tier_label, 0):.1f}%",
+                })
+            if imp_rows:
+                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
+    with detail_tabs[1]:
+        st.markdown("**Quarterly Projections (Q1-Q4)**")
+        st.caption("Annual distributed by seasonal organic/incremental indexes.")
+        try:
+            indexes = seasonal_indexes(session, st.session_state.selected_source, st.session_state.selected_campaign, st.session_state.get("attribution_window", 30))
+            for q_num in range(1, 5):
+                q_key = f"Q{q_num}"
+                o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
+                i_pct = indexes["quarterly_incremental"].get(q_key, 0.25)
+                st.markdown(f"**{q_key}** (Organic: {o_pct*100:.1f}%, Incremental: {i_pct*100:.1f}%)")
+                st.dataframe(pd.DataFrame([
+                    {"Tier": row.tier_label,
+                     "Investment Tier": _fmt_dollar_commas(float(row.investment) * 4 * o_pct),
+                     "Delivered Volume": f"{float(row.delivered_volume) * 4 * o_pct:,.0f}",
+                     "# of Prospects": f"{float(row.prospects) * 4 * o_pct:,.0f}",
+                     "Inc. Customers": _range_str(
+                         float(row.incremental_customers.minimum) * 4 * i_pct,
+                         float(row.incremental_customers.maximum) * 4 * i_pct,
+                         _fmt_compact_k),
+                     "Incremental Revenue": _range_str(
+                         float(row.incremental_revenue.minimum) * 4 * i_pct,
+                         float(row.incremental_revenue.maximum) * 4 * i_pct,
+                         _fmt_dollar_compact_m),
+                     "CPIx": _range_str(
+                         float(row.cpix.minimum), float(row.cpix.maximum), _fmt_dollar_0),
+                     "iROAS": _range_str(
+                         float(row.iroas.minimum), float(row.iroas.maximum), _fmt_iroas),
+                     "Marginal CPIx": _range_str(
+                         min(_marginal_cpix_values[row.tier_label]),
+                         max(_marginal_cpix_values[row.tier_label]),
+                         _fmt_dollar_0)
+                         if _marginal_cpix_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                         else "—",
+                     "Marginal iROAS": _range_str(
+                         min(_marginal_iroas_values[row.tier_label]),
+                         max(_marginal_iroas_values[row.tier_label]),
+                         _fmt_iroas)
+                         if _marginal_iroas_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                         else "—"}
+                    for row in visible_ranges
+                ]), hide_index=True, use_container_width=True)
+        except Exception as exc:
+            st.warning(f"Quarterly projections could not be computed: {exc}")
+    with detail_tabs[2]:
+        st.markdown("**Monthly Breakdown (Template Tables 3a & 3b)**")
+        try:
+            indexes = seasonal_indexes(session, st.session_state.selected_source, st.session_state.selected_campaign, st.session_state.get("attribution_window", 30))
+            idx_col1, idx_col2 = st.columns(2)
+            with idx_col1:
+                st.markdown("**Quarterly indexes**")
+                st.dataframe(pd.DataFrame({"Quarter": [f"Q{i}" for i in range(1,5)],
+                    "Organic %": [f"{indexes['quarterly_organic'].get(f'Q{i}',0.25)*100:.1f}%" for i in range(1,5)],
+                    "Incremental %": [f"{indexes['quarterly_incremental'].get(f'Q{i}',0.25)*100:.1f}%" for i in range(1,5)]}),
+                    hide_index=True, use_container_width=True)
+            with idx_col2:
+                st.markdown("**Monthly indexes**")
+                mo_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+                st.dataframe(pd.DataFrame({"Month": mo_names,
+                    "Organic %": [f"{indexes['monthly_organic'].get(m,1/12)*100:.1f}%" for m in mo_names],
+                    "Incremental %": [f"{indexes['monthly_incremental'].get(m,1/12)*100:.1f}%" for m in mo_names]}),
+                    hide_index=True, use_container_width=True)
+
+            st.divider()
+
+            from forecast_core import quarterly_monthly_tables
+            tables_base = quarterly_monthly_tables(
+                visible_ranges, indexes["monthly_organic"], indexes["monthly_incremental"]
+            )
+
+            imp_factor = result.get("improvement_factors", {})
+            first_factor = next(iter(imp_factor.values()), None) if imp_factor else None
+            tables_improved = None
+            if first_factor is not None:
+                tables_improved = quarterly_monthly_tables(
+                    visible_ranges, indexes["monthly_organic"], indexes["monthly_incremental"],
+                    improvement_factor=first_factor
+                )
+
+            tier_labels = [r.tier_label for r in visible_ranges]
+            table_names_monthly = {
+                "investment": "Monthly Investment Allocations",
+                "customers": "Monthly Incremental Customers",
+                "revenue": "Monthly Incremental Revenue",
+                "cpix": "Monthly CPIx",
+                "iroas": "Monthly iROAS",
+            }
+
+            monthly_sub_tabs = st.tabs(list(table_names_monthly.values()))
+            for tab_idx, (table_key, table_title) in enumerate(table_names_monthly.items()):
+                with monthly_sub_tabs[tab_idx]:
+                    for q_num in range(1, 5):
+                        rows = tables_base[table_key].get(q_num, [])
+                        if not rows:
+                            continue
+                        cols_to_show = ["month", "index"] + tier_labels
+                        df = pd.DataFrame(rows)
+                        available_cols = [c for c in cols_to_show if c in df.columns]
+                        display_df = df[available_cols].rename(columns={"month": "Month", "index": "Index"})
+                        st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+                    if tables_improved:
+                        factor_name = next(iter(imp_factor.keys()), "Improvement")
+                        factor_val = float(first_factor) * 100
+                        st.divider()
+                        st.markdown(f"**With {factor_name} (+{factor_val:.0f}%)**")
+                        for q_num in range(1, 5):
+                            rows = tables_improved[table_key].get(q_num, [])
+                            if not rows:
+                                continue
+                            cols_to_show = ["month", "index"] + tier_labels
+                            df = pd.DataFrame(rows)
+                            available_cols = [c for c in cols_to_show if c in df.columns]
+                            display_df = df[available_cols].rename(columns={"month": "Month", "index": "Index"})
+                            st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+        except Exception as exc:
+            st.warning(f"Could not compute monthly tables: {exc}")
+    with detail_tabs[3]:
         marginal = [row for row in visible_projections if row.historical_quarter == latest_quarter]
         st.dataframe(pd.DataFrame([
-            {"Tier": row.tier_label, "Investment": float(row.investment),
-             "Marginal CPIx": float(row.marginal_cpix) if row.marginal_cpix and row.tier_label != "Baseline" else None,
-             "Marginal iROAS": float(row.marginal_iroas) if row.marginal_iroas and row.tier_label != "Baseline" else None,
-             "New Signal Utilization": float(row.new_signal_utilization * 100),
-             "Adjustment Factor": float(row.adjustment_factor * 100)}
+            {"Tier": row.tier_label,
+             "Investment Tier": _fmt_dollar_commas(float(row.investment)),
+             "Marginal CPIx": _fmt_dollar_0(float(row.marginal_cpix))
+                 if row.marginal_cpix and row.tier_label != _first_tier_label else "—",
+             "Marginal iROAS": _fmt_iroas(float(row.marginal_iroas))
+                 if row.marginal_iroas and row.tier_label != _first_tier_label else "—",
+             "New Signal Utilization": f"{float(row.new_signal_utilization * 100):.1f}%",
+             "Adjustment Factor": f"{float(row.adjustment_factor * 100):.1f}%"}
             for row in marginal
         ]), hide_index=True, use_container_width=True)
-    with detail_tabs[1]:
+    with detail_tabs[4]:
         chart_data = pd.DataFrame([
             {"Tier": row.tier_label, "Investment": float(row.investment),
              "CPIx midpoint": float((row.cpix.minimum + row.cpix.maximum) / 2),
@@ -1635,22 +1940,102 @@ if st.session_state.forecast and active_tab == 2:
         right.altair_chart(alt.Chart(chart_data).mark_line(point=True).encode(
             x=alt.X("Tier:N", sort=None), y="iROAS midpoint:Q", tooltip=list(chart_data.columns)
         ).properties(title="iROAS declines with investment"), use_container_width=True)
-    with detail_tabs[2]:
+    with detail_tabs[5]:
+        _range_by_tier = {r.tier_label: r for r in visible_ranges}
+        _range_adj = st.session_state.get("range_percent_input", 10) / 100
+        # Signal utilization lookup from base projections (same across scenarios)
+        _sig_util_by_tier = {
+            row.tier_label: float(row.new_signal_utilization * 100)
+            for row in visible_projections
+            if row.historical_quarter == latest_quarter
+        }
         for name, factor, rows in result["improvements"]:
             st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
                 f'<div class="kpi-label">{name}</div>'
                 f'<div class="kpi-value">+{float(factor)*100:.0f}% improvement</div></div>', unsafe_allow_html=True)
-            scenario_rows = [
-                {"Tier": r.tier_label, "Investment": float(r.investment),
-                 "Inc. Customers": float(r.incremental_customers), "Revenue": float(r.incremental_revenue),
-                 "CPIx": float(r.cpix), "iROAS": float(r.iroas)}
-                for r in rows if r.historical_quarter == latest_quarter
-                and visible_tier(r.tier_label, result["show_expansion"])]
+            # Group by tier to compute ranges across historical quarters
+            from collections import defaultdict as _dd
+            _imp_by_tier: dict[str, list] = _dd(list)
+            for r in rows:
+                if visible_tier(r.tier_label, result["show_expansion"]):
+                    _imp_by_tier[r.tier_label].append(r)
+            scenario_rows = []
+            for tier_label, tier_rows in _imp_by_tier.items():
+                rng = _range_by_tier.get(tier_label)
+                custs = [float(r.incremental_customers) for r in tier_rows]
+                revs = [float(r.incremental_revenue) for r in tier_rows]
+                cpixs = [float(r.cpix) for r in tier_rows]
+                iroass = [float(r.iroas) for r in tier_rows]
+                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix and r.marginal_cpix > 0]
+                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas and r.marginal_iroas > 0]
+                # For single quarter, apply ±range_percent (matching Excel template)
+                if len(tier_rows) == 1:
+                    c = custs[0]
+                    cust_range = _range_str(c * (1 - _range_adj), c * (1 + _range_adj), _fmt_compact_k)
+                    rv = revs[0]
+                    rev_range = _range_str(rv * (1 - _range_adj), rv * (1 + _range_adj), _fmt_dollar_compact_m)
+                    cx = cpixs[0]
+                    cpix_range = _range_str(cx / (1 + _range_adj), cx / (1 - _range_adj), _fmt_dollar_0)
+                    ir = iroass[0]
+                    iroas_range = _range_str(ir * (1 - _range_adj), ir * (1 + _range_adj), _fmt_iroas)
+                    if mcpixs:
+                        mc = mcpixs[0]
+                        mcpix_range = _range_str(mc / (1 + _range_adj), mc / (1 - _range_adj), _fmt_dollar_0)
+                    else:
+                        mcpix_range = "—"
+                    if miroass:
+                        mi = miroass[0]
+                        miroas_range = _range_str(mi * (1 - _range_adj), mi * (1 + _range_adj), _fmt_iroas)
+                    else:
+                        miroas_range = "—"
+                else:
+                    cust_range = _range_str(min(custs), max(custs), _fmt_compact_k)
+                    rev_range = _range_str(min(revs), max(revs), _fmt_dollar_compact_m)
+                    cpix_range = _range_str(min(cpixs), max(cpixs), _fmt_dollar_0)
+                    iroas_range = _range_str(min(iroass), max(iroass), _fmt_iroas)
+                    mcpix_range = _range_str(min(mcpixs), max(mcpixs), _fmt_dollar_0) if mcpixs else "—"
+                    miroas_range = _range_str(min(miroass), max(miroass), _fmt_iroas) if miroass else "—"
+                if tier_label == _first_tier_label:
+                    mcpix_range = "—"
+                    miroas_range = "—"
+                scenario_rows.append({
+                    "Tier": tier_label,
+                    "Investment Tier": _fmt_dollar_commas(float(tier_rows[0].investment)),
+                    "Delivered Volume": f"{float(rng.delivered_volume):,.0f}" if rng else "—",
+                    "# of Prospects": f"{float(rng.prospects):,.0f}" if rng else "—",
+                    "Inc. Customers": cust_range,
+                    "Incremental Revenue": rev_range,
+                    "CPIx": cpix_range,
+                    "iROAS": iroas_range,
+                    "Marginal CPIx": mcpix_range,
+                    "Marginal iROAS": miroas_range,
+                    "Signal Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
+                })
             if scenario_rows:
                 st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True)
-    with detail_tabs[3]:
-        st.dataframe(pd.DataFrame([{**asdict(row)} for row in visible_projections]),
-            hide_index=True, use_container_width=True)
+    with detail_tabs[6]:
+        _quarters_seen = []
+        for row in visible_projections:
+            if row.historical_quarter not in _quarters_seen:
+                _quarters_seen.append(row.historical_quarter)
+        for _q in _quarters_seen:
+            st.markdown(f"**{_q}**")
+            _q_rows = [row for row in visible_projections if row.historical_quarter == _q]
+            st.dataframe(pd.DataFrame([
+                {"Tier": row.tier_label,
+                 "Investment Tier": _fmt_dollar_commas(float(row.investment)),
+                 "Delivered Volume": f"{float(row.delivered_volume):,.0f}",
+                 "# of Prospects": f"{float(row.prospects):,.0f}",
+                 "Inc. Customers": f"{float(row.incremental_customers):,.0f}",
+                 "Incremental Revenue": _fmt_dollar_commas(float(row.incremental_revenue)),
+                 "CPIx": _fmt_dollar_0(float(row.cpix)),
+                 "iROAS": _fmt_iroas(float(row.iroas)),
+                 "Marginal CPIx": _fmt_dollar_0(float(row.marginal_cpix))
+                     if row.marginal_cpix and row.tier_label != _first_tier_label else "—",
+                 "Marginal iROAS": _fmt_iroas(float(row.marginal_iroas))
+                     if row.marginal_iroas and row.tier_label != _first_tier_label else "—"}
+                for row in _q_rows
+            ]), hide_index=True, use_container_width=True)
 
     workbook = build_workbook(st.session_state.source_account, st.session_state.historical_scope_label,
         datetime.now(timezone.utc).isoformat(), visible_ranges, result["ranges"], st.session_state.selected_history)
