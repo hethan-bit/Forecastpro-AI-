@@ -60,69 +60,51 @@ def discover_sources(
 
 
 
-def account_dimensions(
-    session: Any,
-    account_identifier: str,
-    sub_account: str | None = None,
-    event: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return four-dimension dependent filters from the fixed historical source."""
-    identifier = str(account_identifier or "").strip()
+def account_dimensions(session: Any, account_identifier: str, attribution_window: str) -> list[dict[str, Any]]:
+    identifier = str(account_identifier or '').strip()
     if not identifier:
         return []
-    filters = [
-        "(ACCT_NAME ILIKE ? OR TO_VARCHAR(ACCT_ID) ILIKE ?)",
-    ]
-    params: list[Any] = [f"%{identifier}%", f"%{identifier}%"]
-    if sub_account:
-        filters.append("UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))")
-        params.append(sub_account)
-    if event:
-        filters.append("UPPER(TRIM(COALESCE(EVENT, ''))) = UPPER(TRIM(?))")
-        params.append(event)
     query = f"""
-        SELECT DISTINCT SUB_ACCOUNT, EVENT, CHANNEL
+        SELECT DISTINCT SUB_ACCOUNT, EVENT
         FROM {REFERENCE_HISTORICAL_TABLE}
-        WHERE {' AND '.join(filters)}
-        ORDER BY SUB_ACCOUNT, EVENT, CHANNEL
+        WHERE ATTRIBUTION_WINDOW = ?
+          AND (ACCT_NAME ILIKE ? OR TO_VARCHAR(ACCT_ID) ILIKE ?)
+        ORDER BY SUB_ACCOUNT, EVENT
     """
-    return _rows(session.sql(query, params=params).collect())
+    pattern = f"%{identifier}%"
+    return _rows(session.sql(query, params=[attribution_window, pattern, pattern]).collect())
 
-def resolve_attribution_window(
+def campaign_names(
     session: Any,
+    table_name: str,
+    attribution_window: int = 30,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
-    channel: str | None = None,
-) -> int:
-    """Choose 30-day attribution when present, otherwise the largest available.
-
-    Attribution Window is intentionally resolved after the four authoritative
-    dimensions are selected; it is not a user input and campaign name is never
-    considered by this lookup.
-    """
-    where_clause, params = _dimension_filters(
-        account_name, sub_account, event, channel
-    )
-    query = f"""
-        SELECT
-            MAX(IFF(ATTRIBUTION_WINDOW = 30, 30, NULL)) AS WINDOW_30,
-            MAX(ATTRIBUTION_WINDOW) AS MAX_WINDOW
-        FROM {REFERENCE_HISTORICAL_TABLE}
-        WHERE {where_clause}
-    """
-    rows = _rows(session.sql(query, params=params).collect())
-    if not rows:
-        raise ValueError("No attribution windows are available for the selected historical inputs.")
-    row = rows[0]
-    value = row.get("WINDOW_30") or row.get("MAX_WINDOW")
-    if value is None:
-        raise ValueError("No attribution windows are available for the selected historical inputs.")
-    return int(value)
+) -> list[str]:
+    table = normalize_identifier(table_name)
+    filters = ["ATTRIBUTION_WINDOW = ?"]
+    params: list[Any] = [int(attribution_window)]
+    if account_name and table == REFERENCE_HISTORICAL_TABLE:
+        account_pattern = f"%{str(account_name).strip()}%"
+        filters.append("(ACCT_NAME ILIKE ? OR TO_VARCHAR(ACCT_ID) ILIKE ?)")
+        params.extend([account_pattern, account_pattern])
+    if sub_account and sub_account != "All":
+        filters.append("SUB_ACCOUNT = ?")
+        params.append(sub_account)
+    if event and event != "All":
+        filters.append("EVENT = ?")
+        params.append(event)
+    where_clause = " AND ".join(filters)
+    rows = session.sql(
+        f"SELECT DISTINCT CAMPAIGN_NAME FROM {table} WHERE {where_clause} ORDER BY 1",
+        params=params,
+    ).collect()
+    return [str(_row_dict(row)["CAMPAIGN_NAME"]) for row in rows]
 def _latest_historical_snapshots(
     rows: list[dict[str, Any]], period: str
 ) -> list[dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         period_value = (
             row["campaign_quarter"]
@@ -131,7 +113,7 @@ def _latest_historical_snapshots(
         )
         if not period_value:
             continue
-        key = period_value
+        key = (row["campaign_name"], period_value)
         prior = latest.get(key)
         if prior is None or (
             row["source_week_order"],
@@ -169,6 +151,7 @@ def _historical_row(row: dict[str, Any]) -> dict[str, Any]:
         "delivery_week": row.get("DELIVERY_WEEK"),
         "month_marker": str(row.get("MONTH_MARKER") or "").strip(),
         "campaign_quarter": quarter,
+        "campaign_name": str(row["CAMPAIGN_NAME"]),
         "delivered_volume": delivered,
         "prospects": prospects,
         "incremental_customers": customers,
@@ -236,47 +219,29 @@ def _quarter_sort(label: str) -> int:
     return int(match.group(2)) * 4 + int(match.group(1)) if match else 0
 
 
-def _dimension_filters(
-    account_name: str | None = None,
-    sub_account: str | None = None,
-    event: str | None = None,
-    channel: str | None = None,
-) -> tuple[str, list[Any]]:
-    """Build the four authoritative historical-dimension filters."""
-    filters: list[str] = []
-    params: list[Any] = []
-    if account_name:
-        account_pattern = f"%{str(account_name).strip()}%"
-        filters.append("(ACCT_NAME ILIKE ? OR TO_VARCHAR(ACCT_ID) ILIKE ?)")
-        params.extend([account_pattern, account_pattern])
-    if sub_account and sub_account != "All":
-        filters.append("UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))")
-        params.append(sub_account)
-    if event and event != "All":
-        filters.append("UPPER(TRIM(COALESCE(EVENT, ''))) = UPPER(TRIM(?))")
-        params.append(event)
-    if channel and channel != "All":
-        filters.append("UPPER(TRIM(COALESCE(CHANNEL, ''))) = UPPER(TRIM(?))")
-        params.append(channel)
-    if not filters:
-        raise ValueError("Account, sub account, event, and channel are required.")
-
-    return " AND ".join(filters), params
-
-
 def _slice_filters(
+    table: str,
     attribution_window: int,
+    campaign_name: str,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
-    channel: str | None = None,
 ) -> tuple[str, list[Any]]:
-    """Add the internally resolved attribution window to the four dimensions."""
-    dimension_clause, dimension_params = _dimension_filters(
-        account_name, sub_account, event, channel
-    )
-    filters = ["ATTRIBUTION_WINDOW = ?", dimension_clause]
-    params: list[Any] = [int(attribution_window), *dimension_params]
+    """Build the common account-to-campaign filter used by every historical query."""
+    filters = ["ATTRIBUTION_WINDOW = ?", "CAMPAIGN_NAME = ?"]
+    params: list[Any] = [int(attribution_window), campaign_name]
+
+    if table == REFERENCE_HISTORICAL_TABLE:
+        if account_name:
+            account_pattern = f"%{str(account_name).strip()}%"
+            filters.append("(ACCT_NAME ILIKE ? OR TO_VARCHAR(ACCT_ID) ILIKE ?)")
+            params.extend([account_pattern, account_pattern])
+        if sub_account and sub_account != "All":
+            filters.append("UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))")
+            params.append(sub_account)
+        if event and event != "All":
+            filters.append("UPPER(TRIM(COALESCE(EVENT, ''))) = UPPER(TRIM(?))")
+            params.append(event)
 
     return " AND ".join(filters), params
 
@@ -284,21 +249,21 @@ def _slice_filters(
 def historical_preview(
     session: Any,
     table_name: str,
+    campaign_name: str,
     attribution_window: int = 30,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
-    channel: str | None = None,
 ) -> list[dict[str, Any]]:
     return _latest_historical_snapshots(
         _historical_rows(
             session,
             table_name,
+            campaign_name,
             attribution_window,
             account_name,
             sub_account,
             event,
-            channel,
         ),
         period="quarter",
     )
@@ -307,22 +272,22 @@ def historical_preview(
 def historical_monthly_preview(
     session: Any,
     table_name: str,
+    campaign_name: str,
     attribution_window: int = 30,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
-    channel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the final cumulative snapshot for each month marker."""
     return _latest_historical_snapshots(
         _historical_rows(
             session,
             table_name,
+            campaign_name,
             attribution_window,
             account_name,
             sub_account,
             event,
-            channel,
         ),
         period="month",
     )
@@ -331,39 +296,38 @@ def historical_monthly_preview(
 def _historical_rows(
     session: Any,
     table_name: str,
+    campaign_name: str,
     attribution_window: int,
     account_name: str | None,
     sub_account: str | None,
     event: str | None,
-    channel: str | None,
 ) -> list[dict[str, Any]]:
     table = normalize_identifier(table_name)
     conversion_columns = (
-        ", SUM(TRT_CONVERSIONS) AS TRT_CONVERSIONS,"
-        " SUM(TRT_ORDERS) AS TRT_ORDERS, SUM(TRT_REVENUE) AS TRT_REVENUE,"
-        " SUM(CTR_CONVERSIONS) AS CTR_CONVERSIONS, SUM(CTR_ORDERS) AS CTR_ORDERS"
+        ", TRT_CONVERSIONS, TRT_ORDERS, TRT_REVENUE, CTR_CONVERSIONS, CTR_ORDERS"
+        if table == REFERENCE_HISTORICAL_TABLE
+        else ""
+    )
+    identity_columns = (
+        "ACCT_ID, ACCT_NAME, DELIVERY_WEEK, MONTH_MARKER,"
         if table == REFERENCE_HISTORICAL_TABLE
         else ""
     )
     where_clause, params = _slice_filters(
+        table,
         attribution_window,
+        campaign_name,
         account_name,
         sub_account,
         event,
-        channel,
     )
     query = f"""
-        SELECT CAMPAIGN_QUARTER, MONTH_MARKER,
-          SUM(DELIVERED) AS DELIVERED,
-          SUM(TRT_PROSPECTS) AS TRT_PROSPECTS,
-          SUM(INC_NEW_SALES) AS INC_NEW_SALES,
-          SUM(INC_REVENUE) AS INC_REVENUE{conversion_columns},
-          SUM(SPEND) AS SPEND,
-          MAX(CUS_MEASURE_THROUGH) AS CUS_MEASURE_THROUGH,
-          DELIVERY_WEEK AS WEEK_ORDER
+        SELECT {identity_columns}
+          CAMPAIGN_QUARTER, CAMPAIGN_NAME, DELIVERED, TRT_PROSPECTS,
+          INC_NEW_SALES, INC_REVENUE{conversion_columns}, SPEND,
+          CUS_MEASURE_THROUGH, DELIVERY_WEEK AS WEEK_ORDER
         FROM {table}
         WHERE {where_clause}
-        GROUP BY CAMPAIGN_QUARTER, MONTH_MARKER, DELIVERY_WEEK
         ORDER BY CAMPAIGN_QUARTER, DELIVERY_WEEK
     """
     valid = []
@@ -378,26 +342,28 @@ def _historical_rows(
 def seasonal_indexes(
     session: Any,
     table_name: str,
+    campaign_name: str,
     attribution_window: int = 30,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
-    channel: str | None = None,
 ) -> dict[str, Any]:
     """Compute quarterly and monthly organic + incremental seasonal indexes.
 
     Organic = TRT_CONVERSIONS + CTR_CONVERSIONS (total business conversions).
     Incremental = INC_NEW_SALES (attributed incremental customers only).
 
-    Uses the same four-dimension historical slice as the forecast inputs.
+    Falls back to ZX.ANALYTICS.ZX_ATTRIBUTION_CUMULATIVE_WEEKLY_PERFORMANCE
+    when the campaign-specific derived table lacks monthly data.
     """
     table = normalize_identifier(table_name)
     where_clause, params = _slice_filters(
+        table,
         attribution_window,
+        campaign_name,
         account_name,
         sub_account,
         event,
-        channel,
     )
 
 
@@ -405,15 +371,14 @@ def seasonal_indexes(
     qtr_query = f"""
         WITH latest AS (
             SELECT CAMPAIGN_QUARTER,
-                   SUM(COALESCE(TRT_CONVERSIONS, 0)) + SUM(COALESCE(CTR_CONVERSIONS, 0)) AS ORGANIC,
-                   SUM(COALESCE(INC_NEW_SALES, 0)) AS INCREMENTAL,
+                   COALESCE(TRT_CONVERSIONS, 0) + COALESCE(CTR_CONVERSIONS, 0) AS ORGANIC,
+                   COALESCE(INC_NEW_SALES, 0) AS INCREMENTAL,
                    ROW_NUMBER() OVER (
                        PARTITION BY CAMPAIGN_QUARTER
                        ORDER BY DELIVERY_WEEK DESC
                    ) AS rn
             FROM {table}
             WHERE {where_clause}
-            GROUP BY CAMPAIGN_QUARTER, DELIVERY_WEEK
         )
         SELECT CAMPAIGN_QUARTER, ORGANIC, INCREMENTAL
         FROM latest WHERE rn = 1
@@ -438,11 +403,11 @@ def seasonal_indexes(
 
     # Monthly: try derived table first, then fall back to cumulative weekly
     monthly_rows = _try_monthly_from_derived(
-        session, table, attribution_window, account_name, sub_account, event, channel
+        session, table, campaign_name, attribution_window, account_name, sub_account, event
     )
     if not monthly_rows or all(float(r.get("ORGANIC", 0) or 0) == 0 for r in monthly_rows):
         monthly_rows = _try_monthly_from_cumulative(
-            session, attribution_window, account_name, sub_account, event, channel
+            session, campaign_name, attribution_window, account_name, sub_account, event
         )
 
     # Quarterly percentages
@@ -535,26 +500,27 @@ def seasonal_indexes(
 def _try_monthly_from_derived(
     session: Any,
     table: str,
+    campaign_name: str,
     attribution_window: int,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
-    channel: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Try to get monthly data from the selected four-dimension slice."""
+    """Try to get monthly data from the campaign's derived weekly table."""
     try:
         where_clause, params = _slice_filters(
+            table,
             attribution_window,
+            campaign_name,
             account_name,
             sub_account,
             event,
-            channel,
         )
         query = f"""
             WITH latest AS (
                 SELECT DERIVED_MONTH,
-                       SUM(COALESCE(MONTHLY_TRT_CONVERSIONS, 0)) + SUM(COALESCE(MONTHLY_CTR_CONVERSIONS, 0)) AS ORGANIC,
-                       SUM(COALESCE(MONTHLY_INC_NEW_SALES, 0)) AS INCREMENTAL,
+                       COALESCE(MONTHLY_TRT_CONVERSIONS, 0) + COALESCE(MONTHLY_CTR_CONVERSIONS, 0) AS ORGANIC,
+                       COALESCE(MONTHLY_INC_NEW_SALES, 0) AS INCREMENTAL,
                        ROW_NUMBER() OVER (
                            PARTITION BY DERIVED_MONTH
                            ORDER BY DELIVERY_WEEK DESC
@@ -562,7 +528,6 @@ def _try_monthly_from_derived(
                 FROM {table}
                 WHERE {where_clause}
                   AND DERIVED_MONTH IS NOT NULL
-                GROUP BY DERIVED_MONTH, DELIVERY_WEEK
             )
             SELECT DERIVED_MONTH AS MONTH, ORGANIC, INCREMENTAL
             FROM latest WHERE rn = 1
@@ -575,40 +540,36 @@ def _try_monthly_from_derived(
 
 def _try_monthly_from_cumulative(
     session: Any,
+    campaign_name: str,
     attribution_window: int,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
-    channel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convert cumulative weekly rows to monthly deltas within each campaign quarter."""
     try:
         where_clause, params = _slice_filters(
+            REFERENCE_HISTORICAL_TABLE,
             attribution_window,
+            campaign_name,
             account_name,
             sub_account,
             event,
-            channel,
         )
         query = f"""
-            WITH weekly_rollup AS (
+            WITH weekly_diffs AS (
                 SELECT CAMPAIGN_QUARTER, DELIVERY_WEEK, MONTH_MARKER,
-                       SUM(COALESCE(TRT_CONVERSIONS, 0)) AS TRT,
-                       SUM(COALESCE(CTR_CONVERSIONS, 0)) AS CTR,
-                       SUM(COALESCE(INC_NEW_SALES, 0)) AS INC
+                       COALESCE(TRT_CONVERSIONS, 0) AS TRT,
+                       COALESCE(CTR_CONVERSIONS, 0) AS CTR,
+                       COALESCE(INC_NEW_SALES, 0) AS INC,
+                       LAG(COALESCE(TRT_CONVERSIONS, 0), 1, 0)
+                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY DELIVERY_WEEK) AS PREV_TRT,
+                       LAG(COALESCE(CTR_CONVERSIONS, 0), 1, 0)
+                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY DELIVERY_WEEK) AS PREV_CTR,
+                       LAG(COALESCE(INC_NEW_SALES, 0), 1, 0)
+                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY DELIVERY_WEEK) AS PREV_INC
                 FROM {REFERENCE_HISTORICAL_TABLE}
                 WHERE {where_clause}
-                GROUP BY CAMPAIGN_QUARTER, DELIVERY_WEEK, MONTH_MARKER
-            ),
-            weekly_diffs AS (
-                SELECT CAMPAIGN_QUARTER, DELIVERY_WEEK, MONTH_MARKER, TRT, CTR, INC,
-                       LAG(TRT, 1, 0)
-                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY DELIVERY_WEEK) AS PREV_TRT,
-                       LAG(CTR, 1, 0)
-                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY DELIVERY_WEEK) AS PREV_CTR,
-                       LAG(INC, 1, 0)
-                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY DELIVERY_WEEK) AS PREV_INC
-                FROM weekly_rollup
             ),
             weekly_increments AS (
                 SELECT MONTH_MARKER,
@@ -670,12 +631,13 @@ def monthly_cumulative_deltas(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     ordered = sorted(
         rows,
         key=lambda row: (
+            str(row.get("campaign_name") or "").casefold(),
             _quarter_sort(str(row.get("campaign_quarter") or "")),
             _monthly_sort_key(str(row.get("month_marker") or "")),
             int(row.get("source_week_order") or 0),
         ),
     )
-    previous: dict[str, dict[str, Any]] = {}
+    previous: dict[tuple[str, str], dict[str, Any]] = {}
     delta_fields = (
         ("incremental_customers", "monthly_incremental_customers"),
         ("incremental_revenue", "monthly_incremental_revenue"),
@@ -685,7 +647,10 @@ def monthly_cumulative_deltas(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     result: list[dict[str, Any]] = []
     for row in ordered:
         item = dict(row)
-        key = str(row.get("campaign_quarter") or "")
+        key = (
+            str(row.get("campaign_name") or ""),
+            str(row.get("campaign_quarter") or ""),
+        )
         prior = previous.get(key)
         for source_field, delta_field in delta_fields:
             current = row.get(source_field)
