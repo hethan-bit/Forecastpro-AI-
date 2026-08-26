@@ -19,9 +19,8 @@ import data_access as _data_access
 _data_access = importlib.reload(_data_access)
 from data_access import (
     active_session,
-    campaign_names,
-    discover_sources,
     account_dimensions,
+    resolve_attribution_window,
     historical_preview,
     historical_monthly_preview,
     seasonal_indexes,
@@ -85,12 +84,12 @@ st.markdown(
     color: #111111 !important;
   }
   .stApp { background: #FAFAFA !important; }
-  .block-container { padding-top: 2rem; max-width: 1600px; background: #FAFAFA !important; }
+  .block-container { padding-top: 0.6rem; max-width: 1600px; background: #FAFAFA !important; }
 
   /* === TYPOGRAPHY — Strong hierarchy === */
-  h1 { color: #111111 !important; font-family: 'DM Serif Display', serif !important; font-weight: 400 !important; font-size: 2.2rem !important; letter-spacing: -0.02em !important; line-height: 1.15 !important; }
-  h2 { color: #111111 !important; font-family: 'Space Grotesk', sans-serif !important; font-weight: 600 !important; font-size: 1.5rem !important; letter-spacing: -0.02em !important; }
-  h3 { color: #222222 !important; font-family: 'Space Grotesk', sans-serif !important; font-weight: 600 !important; font-size: 1.15rem !important; letter-spacing: -0.01em !important; }
+  h1 { color: #111111 !important; font-family: 'DM Serif Display', serif !important; font-weight: 400 !important; font-size: 2.2rem !important; letter-spacing: -0.02em !important; line-height: 1.15 !important; margin: 0.15rem 0 0.3rem !important; }
+  h2 { color: #111111 !important; font-family: 'Space Grotesk', sans-serif !important; font-weight: 600 !important; font-size: 1.5rem !important; letter-spacing: -0.02em !important; margin: 0.25rem 0 0.35rem !important; }
+  h3 { color: #222222 !important; font-family: 'Space Grotesk', sans-serif !important; font-weight: 600 !important; font-size: 1.15rem !important; letter-spacing: -0.01em !important; margin: 0.2rem 0 0.3rem !important; }
   p, span, label, .stMarkdown, [data-testid="stMarkdownContainer"] { color: #333333 !important; }
 
   /* === METRICS === */
@@ -129,8 +128,9 @@ st.markdown(
     background: #FFFFFF;
     border: 1px solid #ECECEC;
     border-radius: 16px;
-    padding: 1.4rem 1.6rem;
-    margin-bottom: 0.85rem;
+    padding: 1rem 1.2rem;
+    margin-bottom: 0.45rem;
+    min-height: 106px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.04);
     transition: all 0.2s ease;
   }
@@ -170,7 +170,7 @@ st.markdown(
     background: #FFFFFF;
     border: 1px solid #ECECEC;
     border-radius: 18px;
-    padding: 1.4rem;
+    padding: 1rem;
     text-align: center;
     transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
     box-shadow: 0 2px 8px rgba(0,0,0,0.04);
@@ -392,7 +392,7 @@ st.markdown(
   }
 
   /* === DIVIDERS === */
-  hr { border-color: #ECECEC !important; margin: 2rem 0 !important; }
+  hr { border-color: #ECECEC !important; margin: 0.4rem 0 !important; }
 
   /* === CAPTIONS === */
   .stCaption { color: #999999 !important; font-size: 0.78rem !important; letter-spacing: 0.04em; }
@@ -501,8 +501,18 @@ st.markdown(
   }
 
   /* === EXTRA SPACING === */
-  [data-testid="stVerticalBlock"] > div { margin-bottom: 0.3rem; }
-  [data-testid="stHorizontalBlock"] { gap: 1rem; }
+  [data-testid="stVerticalBlock"] > div { margin-bottom: 0.08rem; }
+  [data-testid="stHorizontalBlock"] { gap: 0.7rem; }
+  [data-testid="stMarkdownContainer"] p { margin: 0.15rem 0 !important; }
+
+  /* === INPUTS WORKFLOW — compact, related controls stay together === */
+  .compact-workflow-divider {
+    height: 1px;
+    background: #ECECEC;
+    margin: 0.55rem 0 0.7rem;
+  }
+  .inputs-intro { margin: 0 0 0.35rem; }
+  .inputs-action-row { margin: 0.15rem 0 0.4rem; }
 
   /* === NUCLEAR: Kill ALL dark backgrounds everywhere === */
   [data-testid="stAppViewContainer"],
@@ -535,12 +545,11 @@ st.markdown(
 def initialize_state() -> None:
     defaults = {
         "sources": [],
-        "campaigns": [],
         "preview": [],
         "confirmed": False,
         "forecast": None,
         "planning_campaigns": [],
-        "message": "Discover an approved historical source to begin.",
+        "message": "Select historical inputs to begin.",
         "source_account": "FRONTIER",
         "current_budget": 1_279_611.0,
         "cpm": 8.5,
@@ -550,6 +559,10 @@ def initialize_state() -> None:
         "frequency_at_max": 18.0,
         "selected_source": None,
         "selected_campaign": None,
+        "historical_scope_label": "Historical slice",
+        "selected_sub_account": None,
+        "selected_event": None,
+        "selected_channel": None,
         "monthly_history": [],
     }
     for key, value in defaults.items():
@@ -564,13 +577,15 @@ def get_session():
 def reset_for_new_account() -> None:
     """Clear all app state so user can start fresh with a new account."""
     keys_to_clear = [
-        "sources", "campaigns", "preview", "confirmed", "forecast",
+        "sources", "preview", "confirmed", "forecast",
         "planning_campaigns", "message", "source_account",
         "current_budget", "cpm", "planned_reach", "signal_utilization",
         "max_reach", "frequency_at_max", "_widget_frequency_at_max", "selected_source",
-        "selected_campaign", "selected_history", "tier_overrides",
+        "historical_scope_label", "selected_history", "tier_overrides",
+        "show_historical_kpis",
         "applied_planning_key", "active_tab", "num_scenarios",
-        "attribution_window",
+        "attribution_window", "selected_sub_account", "selected_event",
+        "selected_channel",
     ]
     for key in keys_to_clear:
         st.session_state.pop(key, None)
@@ -578,8 +593,6 @@ def reset_for_new_account() -> None:
 
 def reset_after_source() -> None:
     st.session_state.pop("_widget_selected_source_v2", None)
-    st.session_state.pop("_widget_selected_campaign", None)
-    st.session_state.campaigns = []
     st.session_state.preview = []
     st.session_state.monthly_history = []
     st.session_state.confirmed = False
@@ -617,10 +630,11 @@ def next_quarter(label: str) -> str:
 
 
 def visible_tier(label: str, show_expansion: bool) -> bool:
+    if label.startswith("Extended Scale"):
+        return False
     return show_expansion or not (
         label.startswith("Incremental Reach")
         or label.startswith("Maximum Scale")
-        or label.startswith("Extended Scale")
     )
 
 
@@ -676,29 +690,55 @@ initialize_state()
 # --- Get session (simple — no caching, no health checks) ---
 session = get_session()
 
+
+def load_historical_slice() -> None:
+    """Populate existing preview state from the four authoritative dimensions."""
+    table_name = REFERENCE_HISTORICAL_TABLE
+    filters = {
+        "account_name": st.session_state.source_account,
+        "sub_account": st.session_state.get("selected_sub_account"),
+        "event": st.session_state.get("selected_event"),
+        "channel": st.session_state.get("selected_channel"),
+    }
+    window = resolve_attribution_window(session, **filters)
+    st.session_state.attribution_window = window
+    rows = historical_preview(session, table_name, window, **filters)
+    monthly_rows = historical_monthly_preview(session, table_name, window, **filters)
+    default_keys = {
+        f"{row['campaign_quarter']}-{row['source_week_order']}"
+        for row in [
+            item for item in rows
+            if item["is_complete"] and item["spend_reconciled"]
+        ][:4]
+    }
+    for row in rows:
+        row["Use"] = (
+            f"{row['campaign_quarter']}-{row['source_week_order']}" in default_keys
+        )
+    st.session_state.preview = rows
+    st.session_state.monthly_history = monthly_rows
+    st.session_state.confirmed = False
+    st.session_state.forecast = None
+    st.session_state.selected_source = table_name
+    st.session_state.historical_scope_label = "Historical slice"
+
 # --- Common header ---
 st.markdown(
-    '<p style="color:#999;font-size:0.7rem;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:-0.5rem;">FORECASTPRO AI</p>',
+    '<p style="color:#999;font-size:0.7rem;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 0.15rem;">'
+    'FORECASTPRO AI <span style="color:#C0C0C0;padding:0 0.4rem;">·</span> '
+    '<span style="letter-spacing:0.06em;">FORECASTING POD PRODUCT</span></p>',
     unsafe_allow_html=True,
 )
 title_col, reset_col = st.columns([5, 1])
 with title_col:
     st.markdown(
-        '<h1 style="font-family:\'DM Serif Display\',serif !important;font-weight:2000 !important;font-size: 15rem !important;margin-bottom:0.1rem;">Forecast Engine</h1>'
-        '<p style="color:#888;font-size:0.82rem;font-weight:500;margin-top:0;letter-spacing:0.02em;">Forecasting Pod Product</p>',
+        '<h1 style="font-family:\'DM Serif Display\',serif !important;font-weight:700 !important;font-size:2.2rem !important;margin:0 0 0.1rem;">Forecast Engine</h1>',
         unsafe_allow_html=True,
     )
 with reset_col:
     if st.button("Start New Account", key="_reset_btn", help="Clear all state and start fresh for next account"):
         reset_for_new_account()
         st.rerun()
-    st.download_button(
-        "Download V3 source ZIP",
-        data=build_v3_source_zip(),
-        file_name="forecastpro_snowflake_q2fix_v3.zip",
-        mime="application/zip",
-        key="download_v3_source_zip",
-    )
 
 # st.markdown(
 #     '<div class="workflow">'
@@ -719,11 +759,9 @@ st.info(st.session_state.message)
 # =============================================================================
 # BUILD TAB LIST — tabs appear progressively as user advances
 # =============================================================================
-tab_names = ["1 Source & Snapshot"]
-if st.session_state.preview:
-    tab_names.append("2 Reconcile")
+tab_names = ["1 Inputs"]
 if st.session_state.confirmed:
-    tab_names.append("3 Review & Inputs")
+    tab_names.append("2 Review & Inputs")
 if st.session_state.forecast:
     tab_names.append("4 Forecast Results")
     tab_names.append("5 Charts")
@@ -741,22 +779,15 @@ for i, name in enumerate(tab_names):
             st.session_state.active_tab = i
             st.rerun()
 
-st.divider()
+st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
 active_tab = st.session_state.active_tab
 
 
 # =============================================================================
-# TAB 1: SOURCE & SNAPSHOT (Steps 1 and 2)
+# TAB 1: INPUTS, DISCOVERY, AND HISTORICAL RECONCILIATION
 # =============================================================================
 if active_tab == 0:
     st.header("1. Select historical inputs")
-    st.caption(
-        "Historical data is read from the cumulative weekly performance table. "        "The table itself is fixed; use the filters below to select the account slice."
-    )
-    account_identifier = st.text_input(
-        "Account name or Account ID",
-        value=st.session_state.get("source_account", "FRONTIER"),
-    )
     account_rows = session.sql(f"""
         SELECT DISTINCT ACCT_NAME
         FROM {REFERENCE_HISTORICAL_TABLE}
@@ -768,216 +799,104 @@ if active_tab == 0:
         for row in account_rows
         if row["ACCT_NAME"] is not None
     })
-    all_account_choice = st.selectbox(
-        "All accounts",
-        ["(select an account)"] + all_account_options,
-        index=(
-            0
-            if account_identifier.strip() not in all_account_options
-            else all_account_options.index(account_identifier.strip()) + 1
-        ),
-        key="_widget_all_account",
-    )
-    if all_account_choice != "(select an account)":
-        account_identifier = all_account_choice
-    window = st.selectbox(
-        "Attribution window", options=[7, 14, 21, 30], index=3,
-        key="_widget_attribution_window",
-    )
-    dimensions = {"sub_accounts": [], "events": []}
-    if account_identifier.strip():
-        try:
-            candidate_dimensions = account_dimensions(session, account_identifier.strip(), window)
-            if isinstance(candidate_dimensions, list):
-                dimensions = {
-                    "sub_accounts": sorted({
-                        str(row.get("SUB_ACCOUNT")).strip()
-                        for row in candidate_dimensions
-                        if isinstance(row, dict) and row.get("SUB_ACCOUNT")
-                    }),
-                    "events": sorted({
-                        str(row.get("EVENT")).strip()
-                        for row in candidate_dimensions
-                        if isinstance(row, dict) and row.get("EVENT")
-                    }),
-                }
-            else:
-                dimensions = candidate_dimensions or {"sub_accounts": [], "events": []}
-        except Exception as exc:
-            st.warning(f"Account filters could not be loaded yet: {exc}")
-    sub_options = dimensions.get("sub_accounts", []) or ["(none found)"]
-
-    sub_account_choice = st.selectbox(
-        "Sub account",
-        sub_options,
-        key="_widget_sub_account",
-    )
-
-    event_options = []
-
-    if sub_account_choice != "(none found)":
-        event_rows = session.sql(
-            f"""
-            SELECT DISTINCT EVENT
-            FROM {REFERENCE_HISTORICAL_TABLE}
-            WHERE TO_VARCHAR(ATTRIBUTION_WINDOW) = TO_VARCHAR(?)
-              AND (ACCT_NAME ILIKE ? OR TO_VARCHAR(ACCT_ID) ILIKE ?)
-              AND UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) =
-                  UPPER(TRIM(?))
-            ORDER BY EVENT
-            """,
-            params=[
-                int(window),
-                f"%{account_identifier.strip()}%",
-                f"%{account_identifier.strip()}%",
-                sub_account_choice,
-            ],
-        ).collect()
-
-        event_options = sorted(
-            {
-                str(row["EVENT"]).strip()
-                for row in event_rows
-                if row["EVENT"] is not None
-            }
+    saved_account = st.session_state.get("source_account")
+    primary_row = st.columns(2)
+    with primary_row[0]:
+        all_account_choice = st.selectbox(
+            "All Accounts",
+            ["(select an account)"] + all_account_options,
+            index=(
+                all_account_options.index(saved_account) + 1
+                if saved_account in all_account_options else 0
+            ),
+            key="_widget_all_account",
         )
 
-    event_options = event_options or ["(none found)"]
+    base_dimensions = []
+    if all_account_choice != "(select an account)":
+        try:
+            base_dimensions = account_dimensions(session, all_account_choice)
+        except Exception as exc:
+            st.warning(f"Account filters could not be loaded yet: {exc}")
+    sub_options = sorted({
+        str(row.get("SUB_ACCOUNT")).strip() for row in base_dimensions
+        if row.get("SUB_ACCOUNT")
+    }) or ["(none found)"]
 
-    event_choice = st.selectbox(
-        "Event",
-        event_options,
-        key="_widget_event",
-    )
+    # Event is displayed in row one, but is still derived from the selected
+    # account + sub-account exactly as before. Streamlit reruns after a changed
+    # selector, so stale dependent choices are refreshed before the next query.
+    selected_sub_hint = st.session_state.get("_widget_sub_account")
+    if selected_sub_hint not in sub_options:
+        selected_sub_hint = sub_options[0]
+
+    event_dimensions = []
+    if all_account_choice != "(select an account)" and selected_sub_hint != "(none found)":
+        event_dimensions = account_dimensions(
+            session, all_account_choice, sub_account=selected_sub_hint
+        )
+    event_options = sorted({
+        str(row.get("EVENT")).strip() for row in event_dimensions
+        if row.get("EVENT")
+    }) or ["(none found)"]
+    with primary_row[1]:
+        event_choice = st.selectbox("Event", event_options, key="_widget_event")
+
+    secondary_row = st.columns(2)
+    with secondary_row[0]:
+        sub_account_choice = st.selectbox(
+            "Sub Account", sub_options, key="_widget_sub_account"
+        )
+
+    channel_dimensions = []
+    if sub_account_choice != "(none found)" and event_choice != "(none found)":
+        channel_dimensions = account_dimensions(
+            session, all_account_choice,
+            sub_account=sub_account_choice, event=event_choice,
+        )
+    channel_options = sorted({
+        str(row.get("CHANNEL")).strip() for row in channel_dimensions
+        if row.get("CHANNEL")
+    }) or ["(none found)"]
+    with secondary_row[1]:
+        channel_choice = st.selectbox("Channel", channel_options, key="_widget_channel")
 
     table_name = REFERENCE_HISTORICAL_TABLE
-    if st.button("Discover campaign series", type="primary"):
+    if st.button("Load Historical Data", type="primary"):
         try:
-            st.session_state.source_account = account_identifier.strip()
+            if (
+                all_account_choice == "(select an account)"
+                or sub_account_choice == "(none found)"
+                or event_choice == "(none found)"
+                or channel_choice == "(none found)"
+            ):
+                raise ValueError("Select an account, sub account, event, and channel first.")
+            reset_after_source()
+            st.session_state.source_account = all_account_choice
             st.session_state.selected_sub_account = (
                 None if sub_account_choice == "(none found)" else sub_account_choice
             )
             st.session_state.selected_event = (
                 None if event_choice == "(none found)" else event_choice
             )
-            st.session_state.attribution_window = window
+            st.session_state.selected_channel = (
+                None if channel_choice == "(none found)" else channel_choice
+            )
             st.session_state.sources = [{"DERIVED_WEEKLY_TABLE": table_name}]
-            reset_after_source()
-            st.session_state.message = "Historical source filters applied."
+            load_historical_slice()
+            if not st.session_state.preview:
+                st.session_state.message = "No historical data matched the selected inputs."
+            else:
+                st.session_state.message = "Historical quarters are ready for review below."
             st.rerun()
         except Exception as exc:
-            st.error(f"Source filter setup failed: {exc}")
-
-    if st.session_state.sources:
-        st.caption(f"Using fixed historical source: {table_name}")
-        if st.button("Find campaign series"):
-            try:
-                try:
-                    st.session_state.campaigns = campaign_names(
-                        session,
-                        table_name,
-                        st.session_state.get("attribution_window", 30),
-                        account_name=st.session_state.source_account,
-                        sub_account=st.session_state.get("selected_sub_account"),
-                        event=st.session_state.get("selected_event"),
-                    )
-                except TypeError as signature_error:
-                    if "unexpected keyword argument" not in str(signature_error):
-                        raise
-                    discovery_filters = ["ATTRIBUTION_WINDOW = ?"]
-                    discovery_params = [st.session_state.get("attribution_window", 30)]
-                    if st.session_state.source_account:
-                        discovery_filters.append("ACCT_NAME ILIKE ?")
-                        discovery_params.append(st.session_state.source_account)
-                    if st.session_state.get("selected_sub_account"):
-                        discovery_filters.append("SUB_ACCOUNT = ?")
-                        discovery_params.append(st.session_state.selected_sub_account)
-                    if st.session_state.get("selected_event"):
-                        discovery_filters.append("EVENT = ?")
-                        discovery_params.append(st.session_state.selected_event)
-                    discovery_where = " AND ".join(discovery_filters)
-                    discovery_rows = session.sql(
-                        f"SELECT DISTINCT CAMPAIGN_NAME FROM {table_name} WHERE {discovery_where} ORDER BY 1",
-                        params=discovery_params,
-                    ).collect()
-                    st.session_state.campaigns = [
-                        str(row["CAMPAIGN_NAME"])
-                        for row in discovery_rows
-                        if row["CAMPAIGN_NAME"] is not None
-                    ]
-                st.session_state.preview = []
-                st.session_state.confirmed = False
-                st.session_state.forecast = None
-                st.session_state.message = (
-                    f"Found {len(st.session_state.campaigns)} matching campaign series."
-                )
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Campaign discovery failed: {exc}")
-
-    if st.session_state.campaigns:
-        selected_campaign = st.selectbox(
-            "Campaign series", st.session_state.campaigns,
-            key="_widget_selected_campaign_v2",
-        )
-        if st.button("Load final quarterly snapshots", type="primary"):
-            try:
-                try:
-                    rows = historical_preview(
-                        session, table_name, selected_campaign,
-                        st.session_state.get("attribution_window", 30),
-                        account_name=st.session_state.source_account,
-                        sub_account=st.session_state.get("selected_sub_account"),
-                        event=st.session_state.get("selected_event"),
-                    )
-                    monthly_rows = historical_monthly_preview(
-                        session, table_name, selected_campaign,
-                        st.session_state.get("attribution_window", 30),
-                        account_name=st.session_state.source_account,
-                        sub_account=st.session_state.get("selected_sub_account"),
-                        event=st.session_state.get("selected_event"),
-                    )
-                except TypeError as signature_error:
-                    if "unexpected keyword argument" not in str(signature_error):
-                        raise
-                    rows = historical_preview(
-                        session, table_name, selected_campaign,
-                        st.session_state.get("attribution_window", 30),
-                        account_name=st.session_state.source_account,
-                    )
-                    monthly_rows = historical_monthly_preview(
-                        session, table_name, selected_campaign,
-                        st.session_state.get("attribution_window", 30),
-                        account_name=st.session_state.source_account,
-                    )
-                default_keys = {
-                    f"{row['campaign_quarter']}-{row['source_week_order']}"
-                    for row in [
-                        item for item in rows
-                        if item["is_complete"] and item["spend_reconciled"]
-                    ][:4]
-                }
-                for row in rows:
-                    row["Use"] = f"{row['campaign_quarter']}-{row['source_week_order']}" in default_keys
-                st.session_state.preview = rows
-                st.session_state.monthly_history = monthly_rows
-                st.session_state.confirmed = False
-                st.session_state.forecast = None
-                st.session_state.selected_source = table_name
-                st.session_state.selected_campaign = selected_campaign
-                st.session_state.message = "The four most recent complete, reconciled quarters are selected by default."
-                st.session_state.active_tab = 1
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Historical preview failed: {exc}")
-
-        tab_nav_buttons(tab_names, 0)
+            st.error(f"Historical data could not be loaded: {exc}")
 
 
-# TAB 2: RECONCILE (Step 3)
+# HISTORICAL QUARTER REVIEW — remains on the Inputs tab
 # =============================================================================
-if st.session_state.preview and active_tab == 1:
-    st.header("3. Select, reconcile, and confirm")
+if st.session_state.preview and active_tab == 0:
+    st.subheader("Historical quarter data — review and approve")
     display = pd.DataFrame(
         [
             {
@@ -994,9 +913,6 @@ if st.session_state.preview and active_tab == 1:
                 "Revenue": float(row["incremental_revenue"]),
                 "CPIx": float(row["cpix"]),
                 "iROAS": float(row["iroas"]),
-                "Spend check": "Pass"
-                if row["spend_reconciled"]
-                else f"Difference {row['spend_difference']}",
             }
             for row in st.session_state.preview
         ]
@@ -1026,10 +942,11 @@ if st.session_state.preview and active_tab == 1:
     ]
     incomplete = [row for row in selected_history if not row["is_complete"]]
     unreconciled = [row for row in selected_history if not row["spend_reconciled"]]
-    partial_approved = st.checkbox(
-        "I reviewed and approve the selected partial quarter(s).",
-        disabled=not incomplete,
-    )
+    partial_approved = False
+    if incomplete:
+        partial_approved = st.checkbox(
+            "I reviewed and approve the selected partial quarter(s)."
+        )
     can_confirm = (
         bool(selected_history)
         and not unreconciled
@@ -1044,16 +961,14 @@ if st.session_state.preview and active_tab == 1:
         st.session_state.message = (
             "Historical inputs confirmed. Configure the planning and forecast inputs."
         )
-        st.session_state.active_tab = 2
+        st.session_state.active_tab = 1
         st.rerun()
 
-    tab_nav_buttons(tab_names, 1)
-
 
 # =============================================================================
-# TAB 3: REVIEW & INPUTS (Steps 4-5)
+# TAB 2: REVIEW & INPUTS
 # =============================================================================
-if st.session_state.confirmed and active_tab == 2:
+if st.session_state.confirmed and active_tab == 1:
     selected_history = st.session_state.selected_history
     st.header("4. Historical Quarterly KPIs & Performance")
     metrics = [
@@ -1100,63 +1015,45 @@ if st.session_state.confirmed and active_tab == 2:
         "ForecastPro automatically matches the selected account to the approved "
         "Q2 2026 forecast sheet."
     )
-    planning_quarter = "Q2 2026"
-    try:
-        matching_campaigns = planning_campaigns(
-            st.session_state.source_account, planning_quarter
-        )
-        if matching_campaigns:
-            planning_key = st.selectbox(
-                "Q2 planning campaign",
-                matching_campaigns,
-                key="selected_planning_campaign",
+    if "show_historical_kpis" not in st.session_state:
+        st.session_state.show_historical_kpis = False
+    kpi_button_label = "Hide Historical KPIs" if st.session_state.show_historical_kpis else "Show Historical KPIs"
+    if st.button(kpi_button_label, key="toggle_historical_kpis"):
+        st.session_state.show_historical_kpis = not st.session_state.show_historical_kpis
+        st.rerun()
+
+    if st.session_state.show_historical_kpis:
+        st.header("4. Historical Quarterly KPIs & Performance")
+        metrics = [
+            ("Delivered Volume", "delivered_volume"),
+            ("Spend", "source_spend"),
+            ("Frequency", "frequency"),
+            ("Prospects", "prospects"),
+            ("Incremental Customers", "incremental_customers"),
+            ("Incremental Revenue", "incremental_revenue"),
+            ("Avg. Inc. Rev", "average_incremental_revenue"),
+            ("CPIx", "cpix"),
+            ("iROAS", "iroas"),
+        ]
+        summary = []
+        for label, field in metrics:
+            values = [float(row[field]) for row in selected_history]
+            summary.append(
+                {
+                    "Metric": label,
+                    **{
+                        row["campaign_quarter"]: value
+                        for row, value in zip(selected_history, values)
+                    },
+                    "Average": sum(values) / len(values),
+                }
             )
-            if st.session_state.get("applied_planning_key") != planning_key:
-                values = planning_input(planning_key, planning_quarter)
-                st.session_state.current_budget = float(values["campaign_budget"])
-                st.session_state.cpm = float(values["cpm"])
-                st.session_state.planned_reach = float(values["planned_reach"])
-                st.session_state.max_reach = float(values["maximum_reach"])
-                st.session_state.signal_utilization = float(
-                    values["signal_utilization"]
-                )
-                planning_frequency = float(values["frequency_at_max"])
-                st.session_state.frequency_at_max = planning_frequency
-                st.session_state["_widget_frequency_at_max"] = planning_frequency
-                st.session_state.tier_overrides = {}
-                st.session_state.tier_adjustments = {}
-                st.session_state.applied_planning_key = planning_key
-                st.session_state.message = (
-                    f"{planning_key} Q2 planning inputs applied automatically."
-                )
-                st.rerun()
-            st.success(
-                f"{planning_key} is selected from the approved "
-                f"{planning_quarter} forecast sheet."
-            )
-        else:
-            st.warning(
-                f'No {planning_quarter} planning campaign matched '
-                f'"{st.session_state.source_account}". '
-                "You can still enter the planning values manually below."
-            )
-    except Exception as exc:
-        st.error(f"Approved Q2 forecast sheet could not be loaded: {exc}")
+        st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
 
     historical_frequency = sum(
         float(row["frequency"]) for row in selected_history
     ) / len(selected_history)
 
-    st.markdown('<div class="section-header">6. Inputs and calculated investment tiers</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-subtitle">Auto-populated values come from the Q2 planning source. '
-        'Frequency remains analyst-controlled, with an automatic safeguard when Sustainable Scale '
-        'would otherwise fall below Current Budget.</div>',
-        unsafe_allow_html=True,
-    )
-
-    # --- Read-only display values (row 1) ---
-    row1 = st.columns(4)
     current_budget = st.session_state.current_budget
     cpm = st.session_state.cpm
     planned_reach = st.session_state.planned_reach
@@ -1187,36 +1084,6 @@ if st.session_state.confirmed and active_tab == 2:
         st.session_state.tier_adjustments = {}
         frequency_auto_adjusted = True
 
-    def kpi_card(col, label, value, hint="", accent=False):
-        val_class = "kpi-value-accent" if accent else "kpi-value"
-        hint_html = f'<div class="kpi-hint">{hint}</div>' if hint else ""
-        col.markdown(
-            f'<div class="kpi-card"><div class="kpi-label">{label}</div>'
-            f'<div class="{val_class}">{value}</div>{hint_html}</div>',
-            unsafe_allow_html=True,
-        )
-
-    kpi_card(row1[0], "Current Budget", money(current_budget))
-    kpi_card(row1[1], "Forecast CPM", f"${float(cpm):,.2f}")
-    kpi_card(row1[2], "Planned Reach", number(planned_reach))
-    kpi_card(row1[3], "Historical Prospect Frequency", f"{historical_frequency:.2f}", "Use to calculate prospects")
-
-    # --- Read-only display values (row 2) ---
-    row2 = st.columns(4)
-    kpi_card(row2[0], "Current Signal Utilization", f"{int(signal_utilization * 100)}%")
-    kpi_card(row2[1], "Max Reach to Maintain Performance", number(max_reach))
-
-    suggested_frequency = recommended_frequency
-    freq_for_calc = st.session_state.frequency_at_max
-    max_volume_max_signal = max_reach * freq_for_calc
-    kpi_card(row2[2], "Max Volume with Max Signal Utilization", number(max_volume_max_signal), accent=True)
-
-    # --- Editable: Frequency at Max Reach Utilization ---
-    # The persistent value deliberately has a different key from the widget.
-    # Streamlit removes widget keys on another tab; the persistent value must
-    # therefore survive Forecast → Review navigation and +/- button reruns.
-    freq_col1, freq_col2 = st.columns(2)
-
     def _frequency_changed():
         st.session_state.frequency_at_max = float(
             st.session_state[frequency_widget_key]
@@ -1227,24 +1094,8 @@ if st.session_state.confirmed and active_tab == 2:
             "Frequency changed. Create a new forecast draft to update results."
         )
 
-    frequency_at_max = freq_col1.number_input(
-        "Frequency at Max Reach Utilization",
-        min_value=minimum_viable_frequency,
-        key=frequency_widget_key,
-        on_change=_frequency_changed,
-        help=(
-            f"Minimum {minimum_viable_frequency:.2f} keeps Sustainable Scale "
-            "at or above Current Budget."
-        ),
-    )
-    st.session_state.frequency_at_max = float(frequency_at_max)
-    freq_col1.caption(
-        f"Recommended: {suggested_frequency:.2f}. Minimum safe value: "
-        f"{minimum_viable_frequency:.2f}."
-    )
-
     def _apply_suggested():
-        value = round(suggested_frequency, 2)
+        value = round(recommended_frequency, 2)
         st.session_state.frequency_at_max = value
         st.session_state[frequency_widget_key] = value
         st.session_state.tier_adjustments = {}
@@ -1253,39 +1104,139 @@ if st.session_state.confirmed and active_tab == 2:
             "Recommended frequency applied. Create a new forecast draft to update results."
         )
 
-    freq_col1.button(
-        f"Use recommended {suggested_frequency:.2f}",
-        on_click=_apply_suggested,
+    st.markdown(
+        '<div class="section-header">5. Load Q2 planning inputs '
+        '<span class="muted">(Data selected from the approved Q2 2026 forecast sheet)</span>'
+        '</div>',
+        unsafe_allow_html=True,
     )
-    freq_col1.caption("Analyst override is permitted above the minimum safe value.")
+    planning_quarter = "Q2 2026"
+    planning_col, frequency_col, range_col = st.columns(3)
+    with planning_col:
+        try:
+            matching_campaigns = planning_campaigns(
+                st.session_state.source_account, planning_quarter
+            )
+            if matching_campaigns:
+                planning_key = st.selectbox(
+                    "Q2 planning campaign",
+                    matching_campaigns,
+                    key="selected_planning_campaign",
+                )
+                if st.session_state.get("applied_planning_key") != planning_key:
+                    values = planning_input(planning_key, planning_quarter)
+                    st.session_state.current_budget = float(values["campaign_budget"])
+                    st.session_state.cpm = float(values["cpm"])
+                    st.session_state.planned_reach = float(values["planned_reach"])
+                    st.session_state.max_reach = float(values["maximum_reach"])
+                    st.session_state.signal_utilization = float(
+                        values["signal_utilization"]
+                    )
+                    planning_frequency = float(values["frequency_at_max"])
+                    st.session_state.frequency_at_max = planning_frequency
+                    st.session_state[frequency_widget_key] = planning_frequency
+                    st.session_state.tier_overrides = {}
+                    st.session_state.tier_adjustments = {}
+                    st.session_state.applied_planning_key = planning_key
+                    st.session_state.message = (
+                        f"{planning_key} Q2 planning inputs applied automatically."
+                    )
+                    st.rerun()
+            else:
+                st.warning(
+                    f'No {planning_quarter} planning campaign matched '
+                    f'"{st.session_state.source_account}". '
+                    "You can still enter the planning values manually below."
+                )
+        except Exception as exc:
+            st.error(f"Approved Q2 forecast sheet could not be loaded: {exc}")
+
+    with frequency_col:
+        frequency_at_max = st.number_input(
+            "Frequency at Max Reach Utilization",
+            min_value=minimum_viable_frequency,
+            key=frequency_widget_key,
+            on_change=_frequency_changed,
+            help=(
+                f"Minimum {minimum_viable_frequency:.2f} keeps Sustainable Scale "
+                "at or above Current Budget."
+            ),
+        )
+        st.session_state.frequency_at_max = float(frequency_at_max)
+        st.button(
+            f"Use recommended {recommended_frequency:.2f}",
+            on_click=_apply_suggested,
+            key="use_recommended_frequency",
+        )
+
+    with range_col:
+        range_percent = st.number_input(
+            "One-quarter range adjustment",
+            min_value=0,
+            max_value=99,
+            value=10,
+            key="range_percent_input",
+        )
+
     if frequency_auto_adjusted:
-        freq_col2.info(
+        st.info(
             f"Frequency was automatically raised from {previous_frequency:.2f} "
             f"to {frequency_at_max:.2f} because the Q2 value would place "
             "Sustainable Scale below Current Budget."
         )
 
-    # Calculated values
+    # Calculated values retained for the existing tier and forecast methodology.
     max_investment = max_reach * frequency_at_max * cpm / 1000
     maximum_scale = (max_reach * 1.25) * frequency_at_max / 1000 * cpm
     extended_scale = (max_reach * 1.50) * frequency_at_max / 1000 * cpm
 
-    calc_row = st.columns(3)
-    kpi_card(calc_row[0], "Max Investment with Max Signal Utilization", money(max_investment), accent=True)
-    kpi_card(calc_row[1], "Maximum Scale (1.25x)", money(maximum_scale), accent=True)
-    kpi_card(calc_row[2], "Extended Scale (1.5x)", money(extended_scale),
-             hint="For accounts at 90-100% utilization where standard tiers are compressed", accent=True)
-
-    # --- One-quarter range adjustment ---
-    range_col1, range_col2 = st.columns(2)
-    range_percent = range_col1.number_input(
-        "One-quarter range adjustment",
-        min_value=0,
-        max_value=99,
-        value=10,
-        key="range_percent_input",
+    st.markdown(
+        '<div class="section-header">6. Inputs and calculated investment tiers</div>',
+        unsafe_allow_html=True,
     )
-    range_col1.caption("10% uncertainty for one historical quarter")
+
+    def kpi_card(col, label, value, hint="", accent=False):
+        val_class = "kpi-value-accent" if accent else "kpi-value"
+        hint_html = f'<div class="kpi-hint">{hint}</div>' if hint else ""
+        col.markdown(
+            f'<div class="kpi-card"><div class="kpi-label">{label}</div>'
+            f'<div class="{val_class}">{value}</div>{hint_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # A compact, consistently sized 3 x 3 planning grid.
+    row1 = st.columns(3)
+    kpi_card(row1[0], "Current Budget", money(current_budget))
+    kpi_card(row1[1], "Forecast CPM", f"${float(cpm):,.2f}")
+    kpi_card(row1[2], "Planned Reach", number(planned_reach))
+
+    row2 = st.columns(3)
+    kpi_card(
+        row2[0],
+        "Historical Prospect Frequency",
+        f"{historical_frequency:.2f}",
+        "Used to calculate prospects",
+    )
+    kpi_card(
+        row2[1], "Current Signal Utilization", f"{int(signal_utilization * 100)}%"
+    )
+    kpi_card(row2[2], "Max Reach to Maintain Performance", number(max_reach))
+
+    row3 = st.columns(3)
+    max_volume_max_signal = max_reach * frequency_at_max
+    kpi_card(
+        row3[0],
+        "Max Volume with Max Signal Utilization",
+        number(max_volume_max_signal),
+        accent=True,
+    )
+    kpi_card(
+        row3[1],
+        "Max Investment with Max Signal Utilization",
+        money(max_investment),
+        accent=True,
+    )
+    kpi_card(row3[2], "Maximum Scale (1.25x)", money(maximum_scale), accent=True)
 
     st.divider()
 
@@ -1335,7 +1286,8 @@ if st.session_state.confirmed and active_tab == 2:
         st.session_state.get("source_account"),
         st.session_state.get("selected_sub_account"),
         st.session_state.get("selected_event"),
-        st.session_state.get("selected_campaign"),
+        st.session_state.get("selected_channel"),
+        st.session_state.get("attribution_window"),
         tuple(labels),
     )
     if st.session_state.get("tier_scope_signature") != tier_scope_signature:
@@ -1518,11 +1470,6 @@ if st.session_state.confirmed and active_tab == 2:
 
     # --- Improvement Scenarios ---
     st.subheader("Improvement scenarios")
-    st.markdown(
-        '<div class="section-subtitle">Each scenario assumes a performance improvement '
-        'factor (e.g., new model, new channel). Add up to 10 independent scenarios.</div>',
-        unsafe_allow_html=True,
-    )
 
     if "num_scenarios" not in st.session_state:
         st.session_state.num_scenarios = 2
@@ -1641,18 +1588,18 @@ if st.session_state.confirmed and active_tab == 2:
                 "show_expansion": show_expansion,
             }
             st.session_state.message = "Forecast draft created. Review the ranges, quality checks, and marginal economics."
-            st.session_state.active_tab = 3
+            st.session_state.active_tab = 2
             st.rerun()
         except Exception as exc:
             st.error(f"Forecast calculation failed: {exc}")
 
-    tab_nav_buttons(tab_names, 2)
+    tab_nav_buttons(tab_names, 1)
 
 
 # =============================================================================
-# TAB 4: FORECAST RESULTS
+# TAB 3: FORECAST RESULTS
 # =============================================================================
-if st.session_state.forecast and active_tab == 3:
+if st.session_state.forecast and active_tab == 2:
     result = st.session_state.forecast
     visible_ranges = [
         row for row in result["ranges"]
@@ -1726,7 +1673,6 @@ if st.session_state.forecast and active_tab == 3:
     ]
     if expansion_ranges:
         with st.expander("Show Expansion Tiers (Incremental Reach / Maximum Scale)", expanded=False):
-            st.caption("Extended reach tiers beyond Sustainable Scale for high-utilization scenarios.")
             expansion_frame = pd.DataFrame([
                 {"Tier": row.tier_label,
                  "Investment Tier": _fmt_dollar_commas(float(row.investment)),
@@ -1858,7 +1804,18 @@ if st.session_state.forecast and active_tab == 3:
         st.markdown("**Quarterly Projections (Q1-Q4)**")
         st.caption("Annual distributed by seasonal organic/incremental indexes.")
         try:
-            indexes = seasonal_indexes(session, st.session_state.selected_source, st.session_state.selected_campaign, st.session_state.get("attribution_window", 30))
+            if not st.session_state.get("selected_source"):
+                st.info("Select a data source to view quarterly projections.")
+                raise ValueError("No source selected")
+            indexes = seasonal_indexes(
+                session,
+                st.session_state.selected_source,
+                attribution_window=st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.get("source_account"),
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
             for q_num in range(1, 5):
                 q_key = f"Q{q_num}"
                 o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
@@ -1900,7 +1857,18 @@ if st.session_state.forecast and active_tab == 3:
     with detail_tabs[2]:
         st.markdown("**Monthly Breakdown (Template Tables 3a & 3b)**")
         try:
-            indexes = seasonal_indexes(session, st.session_state.selected_source, st.session_state.selected_campaign, st.session_state.get("attribution_window", 30))
+            if not st.session_state.get("selected_source"):
+                st.info("Select a data source to view monthly breakdown.")
+                raise ValueError("No source selected")
+            indexes = seasonal_indexes(
+                session,
+                st.session_state.selected_source,
+                attribution_window=st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.get("source_account"),
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
             idx_col1, idx_col2 = st.columns(2)
             with idx_col1:
                 st.markdown("**Quarterly indexes**")
@@ -1973,7 +1941,6 @@ if st.session_state.forecast and active_tab == 3:
             st.warning(f"Could not compute monthly tables: {exc}")
     with detail_tabs[3]:
         marginal = [row for row in visible_projections if row.historical_quarter == latest_quarter]
-        st.caption(f"{upcoming}, based on {latest_quarter}.")
         st.dataframe(pd.DataFrame([
             {"Tier": row.tier_label,
              "Investment Tier": _fmt_dollar_commas(float(row.investment)),
@@ -2096,19 +2063,19 @@ if st.session_state.forecast and active_tab == 3:
                 for row in _q_rows
             ]), hide_index=True, use_container_width=True)
 
-    workbook = build_workbook(st.session_state.source_account, st.session_state.selected_campaign,
+    workbook = build_workbook(st.session_state.source_account, st.session_state.historical_scope_label,
         datetime.now(timezone.utc).isoformat(), visible_ranges, result["ranges"], st.session_state.selected_history)
     safe_account = re.sub(r"[^a-z0-9]+", "-", st.session_state.source_account.lower()).strip("-") or "forecast"
     st.download_button("Download Excel workbook", workbook, f"{safe_account}-forecast.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
-    tab_nav_buttons(tab_names, 3)
+    tab_nav_buttons(tab_names, 2)
 
 
 # =============================================================================
-# TAB 5: CHARTS (all tiers from Baseline to Maximum Scale)
+# TAB 4: CHARTS (all tiers from Baseline to Maximum Scale)
 # =============================================================================
-if st.session_state.forecast and active_tab == 4:
+if st.session_state.forecast and active_tab == 3:
     result = st.session_state.forecast
     # Use ALL tiers (standard + expansion) for charts
     all_ranges = sorted(result["ranges"], key=lambda r: float(r.investment))
@@ -2118,7 +2085,6 @@ if st.session_state.forecast and active_tab == 4:
     )
 
     st.header("Forecast Charts")
-    st.caption("Visual comparison of all tiers from Baseline through Maximum Scale (+25%).")
 
     # Build chart dataframe with ALL tiers
     chart_df = pd.DataFrame([
@@ -2255,5 +2221,166 @@ if st.session_state.forecast and active_tab == 4:
         tooltip=["Tier", alt.Tooltip("Investment:Q", format="$,.0f"), "Tier Type"],
     ).properties(title="Investment tiers — standard (blue) vs extension (orange)", height=380)
     st.altair_chart(invest_chart, use_container_width=True)
+
+    tab_nav_buttons(tab_names, 3)
+
+
+# =============================================================================
+# TAB 5: ANNUAL & QUARTERLY FORECAST
+# =============================================================================
+if st.session_state.forecast and active_tab == 4:
+    result = st.session_state.forecast
+    visible_ranges = [
+        row for row in result["ranges"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    visible_projections = [
+        row for row in result["projections"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    latest_quarter = max(
+        (row["campaign_quarter"] for row in st.session_state.selected_history),
+        key=quarter_value,
+    )
+    upcoming = next_quarter(latest_quarter)
+
+    st.header("Annual & Quarterly Forecast")
+    forecast_tabs = st.tabs(["Annual projections", "Quarterly projections", "Monthly breakdown"])
+
+    with forecast_tabs[0]:
+        st.markdown("**Annual Projections (x4)**")
+        annual_frame = pd.DataFrame([
+            {"Tier": row.tier_label, "Annual Investment": float(row.investment) * 4,
+             "Delivered": float(row.delivered_volume) * 4, "Prospects": float(row.prospects) * 4,
+             "Inc. Customers (Min)": float(row.incremental_customers.minimum) * 4,
+             "Inc. Customers (Max)": float(row.incremental_customers.maximum) * 4,
+             "Inc. Revenue (Min)": float(row.incremental_revenue.minimum) * 4,
+             "Inc. Revenue (Max)": float(row.incremental_revenue.maximum) * 4,
+             "CPIx (Min)": float(row.cpix.minimum), "CPIx (Max)": float(row.cpix.maximum),
+             "iROAS (Min)": float(row.iroas.minimum), "iROAS (Max)": float(row.iroas.maximum)}
+            for row in visible_ranges
+        ])
+        st.dataframe(annual_frame, hide_index=True, use_container_width=True,
+            column_config={col: st.column_config.NumberColumn(format="$%.0f")
+                for col in ["Annual Investment", "Inc. Revenue (Min)", "Inc. Revenue (Max)"]})
+        for name, factor, rows in result["improvements"]:
+            st.markdown(f"**Annual with {name} (+{float(factor)*100:.0f}%)**")
+            imp_rows = [{"Tier": r.tier_label, "Annual Investment": float(r.investment)*4,
+                "Inc. Customers": float(r.incremental_customers)*4, "Inc. Revenue": float(r.incremental_revenue)*4,
+                "CPIx": float(r.cpix), "iROAS": float(r.iroas)}
+                for r in rows if r.historical_quarter == latest_quarter and visible_tier(r.tier_label, result["show_expansion"])]
+            if imp_rows:
+                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
+
+    with forecast_tabs[1]:
+        st.markdown("**Quarterly Projections (Q1-Q4)**")
+        try:
+            indexes = seasonal_indexes(
+                session, st.session_state.selected_source,
+                st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.source_account,
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
+            for q_num in range(1, 5):
+                q_key = f"Q{q_num}"
+                o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
+                i_pct = indexes["quarterly_incremental"].get(q_key, 0.25)
+                st.markdown(f"**{q_key}** (Organic: {o_pct*100:.1f}%, Incremental: {i_pct*100:.1f}%)")
+                st.dataframe(pd.DataFrame([
+                    {"Tier": row.tier_label, "Investment": float(row.investment)*4*o_pct,
+                     "Inc. Customers (Min)": float(row.incremental_customers.minimum)*4*i_pct,
+                     "Inc. Customers (Max)": float(row.incremental_customers.maximum)*4*i_pct,
+                     "Inc. Revenue (Min)": float(row.incremental_revenue.minimum)*4*i_pct,
+                     "Inc. Revenue (Max)": float(row.incremental_revenue.maximum)*4*i_pct}
+                    for row in visible_ranges
+                ]), hide_index=True, use_container_width=True,
+                    column_config={col: st.column_config.NumberColumn(format="$%.0f")
+                        for col in ["Investment", "Inc. Revenue (Min)", "Inc. Revenue (Max)"]})
+        except Exception as exc:
+            st.warning(f"Quarterly projections could not be computed: {exc}")
+
+    with forecast_tabs[2]:
+        st.markdown("**Monthly Breakdown (Template Tables 3a & 3b)**")
+        try:
+            indexes = seasonal_indexes(
+                session, st.session_state.selected_source,
+                st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.source_account,
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
+            idx_col1, idx_col2 = st.columns(2)
+            with idx_col1:
+                st.markdown("**Quarterly indexes**")
+                st.dataframe(pd.DataFrame({"Quarter": [f"Q{i}" for i in range(1,5)],
+                    "Organic %": [f"{indexes['quarterly_organic'].get(f'Q{i}',0.25)*100:.1f}%" for i in range(1,5)],
+                    "Incremental %": [f"{indexes['quarterly_incremental'].get(f'Q{i}',0.25)*100:.1f}%" for i in range(1,5)]}),
+                    hide_index=True, use_container_width=True)
+            with idx_col2:
+                st.markdown("**Monthly indexes**")
+                mo_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+                st.dataframe(pd.DataFrame({"Month": mo_names,
+                    "Organic %": [f"{indexes['monthly_organic'].get(m,1/12)*100:.1f}%" for m in mo_names],
+                    "Incremental %": [f"{indexes['monthly_incremental'].get(m,1/12)*100:.1f}%" for m in mo_names]}),
+                    hide_index=True, use_container_width=True)
+
+            st.divider()
+
+            from forecast_core import quarterly_monthly_tables
+            tables_base = quarterly_monthly_tables(
+                visible_ranges, indexes["monthly_organic"], indexes["monthly_incremental"]
+            )
+
+            imp_factor = result.get("improvement_factors", {})
+            first_factor = next(iter(imp_factor.values()), None) if imp_factor else None
+            tables_improved = None
+            if first_factor is not None:
+                tables_improved = quarterly_monthly_tables(
+                    visible_ranges, indexes["monthly_organic"], indexes["monthly_incremental"],
+                    improvement_factor=first_factor
+                )
+
+            tier_labels = [r.tier_label for r in visible_ranges]
+            table_names = {
+                "investment": "Monthly Investment Allocations",
+                "customers": "Monthly Incremental Customers",
+                "revenue": "Monthly Incremental Revenue",
+                "cpix": "Monthly CPIx",
+                "iroas": "Monthly iROAS",
+            }
+
+            monthly_sub_tabs = st.tabs(list(table_names.values()))
+            for tab_idx, (table_key, table_title) in enumerate(table_names.items()):
+                with monthly_sub_tabs[tab_idx]:
+                    for q_num in range(1, 5):
+                        rows = tables_base[table_key].get(q_num, [])
+                        if not rows:
+                            continue
+                        cols_to_show = ["month", "index"] + tier_labels
+                        df = pd.DataFrame(rows)
+                        available_cols = [c for c in cols_to_show if c in df.columns]
+                        display_df = df[available_cols].rename(columns={"month": "Month", "index": "Index"})
+                        st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+                    if tables_improved:
+                        factor_name = next(iter(imp_factor.keys()), "Improvement")
+                        factor_val = float(first_factor) * 100
+                        st.divider()
+                        st.markdown(f"**With {factor_name} (+{factor_val:.0f}%)**")
+                        for q_num in range(1, 5):
+                            rows = tables_improved[table_key].get(q_num, [])
+                            if not rows:
+                                continue
+                            cols_to_show = ["month", "index"] + tier_labels
+                            df = pd.DataFrame(rows)
+                            available_cols = [c for c in cols_to_show if c in df.columns]
+                            display_df = df[available_cols].rename(columns={"month": "Month", "index": "Index"})
+                            st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+        except Exception as exc:
+            st.warning(f"Could not compute monthly tables: {exc}")
 
     tab_nav_buttons(tab_names, 4)
