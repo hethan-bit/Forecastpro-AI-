@@ -558,6 +558,7 @@ def initialize_state() -> None:
         "max_reach": 10_000_000.0,
         "frequency_at_max": 18.0,
         "selected_source": None,
+        "selected_campaign": None,
         "historical_scope_label": "Historical slice",
         "selected_sub_account": None,
         "selected_event": None,
@@ -1014,6 +1015,9 @@ if st.session_state.confirmed and active_tab == 1:
         "ForecastPro automatically matches the selected account to the approved "
         "Q2 2026 forecast sheet."
     )
+    if "show_historical_kpis" not in st.session_state:
+        st.session_state.show_historical_kpis = False
+    kpi_button_label = "Hide Historical KPIs" if st.session_state.show_historical_kpis else "Show Historical KPIs"
     if st.button(kpi_button_label, key="toggle_historical_kpis"):
         st.session_state.show_historical_kpis = not st.session_state.show_historical_kpis
         st.rerun()
@@ -1800,7 +1804,18 @@ if st.session_state.forecast and active_tab == 2:
         st.markdown("**Quarterly Projections (Q1-Q4)**")
         st.caption("Annual distributed by seasonal organic/incremental indexes.")
         try:
-            indexes = seasonal_indexes(session, st.session_state.selected_source, st.session_state.selected_campaign, st.session_state.get("attribution_window", 30))
+            if not st.session_state.get("selected_source"):
+                st.info("Select a data source to view quarterly projections.")
+                raise ValueError("No source selected")
+            indexes = seasonal_indexes(
+                session,
+                st.session_state.selected_source,
+                attribution_window=st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.get("source_account"),
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
             for q_num in range(1, 5):
                 q_key = f"Q{q_num}"
                 o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
@@ -1842,7 +1857,18 @@ if st.session_state.forecast and active_tab == 2:
     with detail_tabs[2]:
         st.markdown("**Monthly Breakdown (Template Tables 3a & 3b)**")
         try:
-            indexes = seasonal_indexes(session, st.session_state.selected_source, st.session_state.selected_campaign, st.session_state.get("attribution_window", 30))
+            if not st.session_state.get("selected_source"):
+                st.info("Select a data source to view monthly breakdown.")
+                raise ValueError("No source selected")
+            indexes = seasonal_indexes(
+                session,
+                st.session_state.selected_source,
+                attribution_window=st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.get("source_account"),
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
             idx_col1, idx_col2 = st.columns(2)
             with idx_col1:
                 st.markdown("**Quarterly indexes**")
