@@ -24,6 +24,8 @@ from data_access import (
     historical_preview,
     historical_monthly_preview,
     seasonal_indexes,
+    load_actual_for_quarter,
+    load_weekly_cumulative,
     REFERENCE_HISTORICAL_TABLE,
 )
 from forecast_core import (
@@ -563,6 +565,7 @@ def initialize_state() -> None:
         "selected_sub_account": None,
         "selected_event": None,
         "selected_channel": None,
+        "projection_quarter": None,
         "monthly_history": [],
     }
     for key, value in defaults.items():
@@ -585,7 +588,7 @@ def reset_for_new_account() -> None:
         "show_historical_kpis",
         "applied_planning_key", "active_tab", "num_scenarios",
         "attribution_window", "selected_sub_account", "selected_event",
-        "selected_channel",
+        "selected_channel", "projection_quarter",
     ]
     for key in keys_to_clear:
         st.session_state.pop(key, None)
@@ -704,11 +707,21 @@ def load_historical_slice() -> None:
     st.session_state.attribution_window = window
     rows = historical_preview(session, table_name, window, **filters)
     monthly_rows = historical_monthly_preview(session, table_name, window, **filters)
+
+    # Sort rows in reverse chronological order (most recent quarter first)
+    def _quarter_sort_key(row):
+        q = row.get("campaign_quarter", "")
+        parts = q.split()
+        if len(parts) == 2:
+            return (-int(parts[1]), -int(parts[0].replace("Q", "")))
+        return (0, 0)
+
+    rows.sort(key=_quarter_sort_key)
     default_keys = {
         f"{row['campaign_quarter']}-{row['source_week_order']}"
         for row in [
             item for item in rows
-            if item["is_complete"] and item["spend_reconciled"]
+            if item["is_complete"]
         ][:4]
     }
     for row in rows:
@@ -784,7 +797,7 @@ active_tab = st.session_state.active_tab
 
 
 # =============================================================================
-# TAB 1: INPUTS, DISCOVERY, AND HISTORICAL RECONCILIATION
+# TAB 1: INPUTS & DISCOVERY
 # =============================================================================
 if active_tab == 0:
     st.header("1. Select historical inputs")
@@ -861,6 +874,30 @@ if active_tab == 0:
     with secondary_row[1]:
         channel_choice = st.selectbox("Channel", channel_options, key="_widget_channel")
 
+    # --- Projection quarter selector ---
+    def _build_projection_quarters() -> list[str]:
+        """Current quarter + past 8 quarters (2 years back)."""
+        from datetime import date as _date
+        today = _date.today()
+        current_q = (today.month - 1) // 3 + 1
+        current_y = today.year
+        quarters = []
+        for offset in range(0, 9):  # 0 = current, 1..8 = past
+            idx = current_y * 4 + (current_q - 1) - offset
+            y = idx // 4
+            q = idx % 4 + 1
+            quarters.append(f"Q{q} {y}")
+        return quarters
+
+    _projection_quarter_options = _build_projection_quarters()
+    projection_quarter_choice = st.selectbox(
+        "Projection quarter",
+        _projection_quarter_options,
+        index=0,
+        key="_widget_projection_quarter",
+        help="Quarter to forecast for. Only quarters before this will be available as reference inputs.",
+    )
+
     table_name = REFERENCE_HISTORICAL_TABLE
     if st.button("Load Historical Data", type="primary"):
         try:
@@ -882,6 +919,7 @@ if active_tab == 0:
             st.session_state.selected_channel = (
                 None if channel_choice == "(none found)" else channel_choice
             )
+            st.session_state.projection_quarter = projection_quarter_choice
             st.session_state.sources = [{"DERIVED_WEEKLY_TABLE": table_name}]
             load_historical_slice()
             if not st.session_state.preview:
@@ -897,6 +935,24 @@ if active_tab == 0:
 # =============================================================================
 if st.session_state.preview and active_tab == 0:
     st.subheader("Historical quarter data — review and approve")
+
+    # Filter to only quarters BEFORE the projection quarter
+    def _quarter_sort_value(label: str) -> int:
+        parts = label.strip().split()
+        if len(parts) == 2:
+            return int(parts[1]) * 4 + int(parts[0].replace("Q", ""))
+        return 0
+
+    _proj_q = st.session_state.get("projection_quarter")
+    _proj_q_val = _quarter_sort_value(_proj_q) if _proj_q else 99999
+    _eligible_preview = [
+        row for row in st.session_state.preview
+        if _quarter_sort_value(row["campaign_quarter"]) < _proj_q_val
+    ]
+    if not _eligible_preview:
+        st.warning("No historical quarters exist before the selected projection quarter.")
+        st.stop()
+
     display = pd.DataFrame(
         [
             {
@@ -914,14 +970,14 @@ if st.session_state.preview and active_tab == 0:
                 "CPIx": float(row["cpix"]),
                 "iROAS": float(row["iroas"]),
             }
-            for row in st.session_state.preview
+            for row in _eligible_preview
         ]
     )
     edited = st.data_editor(
         display,
         hide_index=True,
         use_container_width=True,
-        key=f"history_editor_{hash(str([r['campaign_quarter'] for r in st.session_state.preview]))}",
+        key=f"history_editor_{hash(str([r['campaign_quarter'] for r in _eligible_preview]))}",
         disabled=[column for column in display.columns if column != "Use"],
         column_config={
             "Use": st.column_config.CheckboxColumn(required=True),
@@ -937,11 +993,10 @@ if st.session_state.preview and active_tab == 0:
     selected_quarters = set(edited.loc[edited["Use"], "Quarter"].tolist())
     selected_history = [
         row
-        for row in st.session_state.preview
+        for row in _eligible_preview
         if row["campaign_quarter"] in selected_quarters
     ]
     incomplete = [row for row in selected_history if not row["is_complete"]]
-    unreconciled = [row for row in selected_history if not row["spend_reconciled"]]
     partial_approved = False
     if incomplete:
         partial_approved = st.checkbox(
@@ -949,7 +1004,6 @@ if st.session_state.preview and active_tab == 0:
         )
     can_confirm = (
         bool(selected_history)
-        and not unreconciled
         and (not incomplete or partial_approved)
     )
     if st.button(
@@ -974,7 +1028,7 @@ if st.session_state.confirmed and active_tab == 1:
     metrics = [
         ("Delivered Volume", "delivered_volume"),
         ("Spend", "source_spend"),
-        ("Frequency", "frequency"),
+        ("Historical Average Frequency", "frequency"),
         ("Prospects", "prospects"),
         ("Incremental Customers", "incremental_customers"),
         ("Incremental Revenue", "incremental_revenue"),
@@ -1027,7 +1081,7 @@ if st.session_state.confirmed and active_tab == 1:
         metrics = [
             ("Delivered Volume", "delivered_volume"),
             ("Spend", "source_spend"),
-            ("Frequency", "frequency"),
+("Historical Average Frequency", "frequency"),
             ("Prospects", "prospects"),
             ("Incremental Customers", "incremental_customers"),
             ("Incremental Revenue", "incremental_revenue"),
@@ -1155,6 +1209,7 @@ if st.session_state.confirmed and active_tab == 1:
         frequency_at_max = st.number_input(
             "Frequency at Max Reach Utilization",
             min_value=minimum_viable_frequency,
+            step=0.5,
             key=frequency_widget_key,
             on_change=_frequency_changed,
             help=(
@@ -1621,6 +1676,7 @@ if st.session_state.forecast and active_tab == 2:
     }
 
     st.header("Forecast Output Ranges")
+    st.subheader("One Quarter Projection")
     st.caption(f"{result['method']} · curve {result['version']}")
     _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
     # Build marginal ranges from projections across all historical quarters
@@ -1706,8 +1762,39 @@ if st.session_state.forecast and active_tab == 2:
             ])
             st.dataframe(expansion_frame, hide_index=True, use_container_width=True)
 
-    detail_tabs = st.tabs(["Annual projections", "Quarterly projections", "Monthly breakdown", "Marginal economics", "Investment trade-offs", "Improvement scenarios", "Historical reconciliation"])
-    with detail_tabs[0]:
+    # --- Determine if we need an extra tab (intra-quarter or predicted vs actual) ---
+    _proj_q_label = st.session_state.get("projection_quarter")
+    _extra_tab_type = None  # "intra" or "pva" or None
+    _actual_data = None
+    _intra_max_week = 0
+    if _proj_q_label:
+        _actual_data = load_actual_for_quarter(
+            session,
+            _proj_q_label,
+            attribution_window=st.session_state.get("attribution_window", 30),
+            account_name=st.session_state.get("source_account"),
+            sub_account=st.session_state.get("selected_sub_account"),
+            event=st.session_state.get("selected_event"),
+            channel=st.session_state.get("selected_channel"),
+        )
+        if _actual_data:
+            _intra_max_week = _actual_data.get("MAX_WEEK", 0)
+            # Check if this is the current quarter
+            from datetime import date as _date
+            _today = _date.today()
+            _cur_q_label = f"Q{(_today.month - 1) // 3 + 1} {_today.year}"
+            if _proj_q_label == _cur_q_label and 0 < _intra_max_week < 12:
+                _extra_tab_type = "intra"
+            elif _intra_max_week >= 12:
+                _extra_tab_type = "pva"
+
+    _tab_list = ["Improvement scenarios", "Annual projections", "Seasonal index projections", "Monthly breakdown", "Marginal economics", "Investment trade-offs"]
+    if _extra_tab_type == "intra":
+        _tab_list.append("Intra-quarter forecast")
+    elif _extra_tab_type == "pva":
+        _tab_list.append("Predicted vs Actual")
+    detail_tabs = st.tabs(_tab_list)
+    with detail_tabs[1]:
         st.markdown("**Annual Projections (x4)**")
         annual_frame = pd.DataFrame([
             {"Tier": row.tier_label,
@@ -1800,8 +1887,8 @@ if st.session_state.forecast and active_tab == 2:
                 })
             if imp_rows:
                 st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
-    with detail_tabs[1]:
-        st.markdown("**Quarterly Projections (Q1-Q4)**")
+    with detail_tabs[2]:
+        st.markdown("**Seasonal Index Projections (Q1-Q4)**")
         st.caption("Annual distributed by seasonal organic/incremental indexes.")
         try:
             if not st.session_state.get("selected_source"):
@@ -1854,7 +1941,7 @@ if st.session_state.forecast and active_tab == 2:
                 ]), hide_index=True, use_container_width=True)
         except Exception as exc:
             st.warning(f"Quarterly projections could not be computed: {exc}")
-    with detail_tabs[2]:
+    with detail_tabs[3]:
         st.markdown("**Monthly Breakdown (Template Tables 3a & 3b)**")
         try:
             if not st.session_state.get("selected_source"):
@@ -1939,7 +2026,7 @@ if st.session_state.forecast and active_tab == 2:
 
         except Exception as exc:
             st.warning(f"Could not compute monthly tables: {exc}")
-    with detail_tabs[3]:
+    with detail_tabs[4]:
         marginal = [row for row in visible_projections if row.historical_quarter == latest_quarter]
         st.dataframe(pd.DataFrame([
             {"Tier": row.tier_label,
@@ -1952,7 +2039,7 @@ if st.session_state.forecast and active_tab == 2:
              "Adjustment Factor": f"{float(row.adjustment_factor * 100):.1f}%"}
             for row in marginal
         ]), hide_index=True, use_container_width=True)
-    with detail_tabs[4]:
+    with detail_tabs[5]:
         chart_data = pd.DataFrame([
             {"Tier": row.tier_label, "Investment": float(row.investment),
              "CPIx midpoint": float((row.cpix.minimum + row.cpix.maximum) / 2),
@@ -1966,7 +2053,7 @@ if st.session_state.forecast and active_tab == 2:
         right.altair_chart(alt.Chart(chart_data).mark_line(point=True).encode(
             x=alt.X("Tier:N", sort=None), y="iROAS midpoint:Q", tooltip=list(chart_data.columns)
         ).properties(title="iROAS declines with investment"), use_container_width=True)
-    with detail_tabs[5]:
+    with detail_tabs[0]:
         _range_by_tier = {r.tier_label: r for r in visible_ranges}
         _range_adj = st.session_state.get("range_percent_input", 10) / 100
         # Signal utilization lookup from base projections (same across scenarios)
@@ -2039,29 +2126,251 @@ if st.session_state.forecast and active_tab == 2:
                 })
             if scenario_rows:
                 st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True)
-    with detail_tabs[6]:
-        _quarters_seen = []
-        for row in visible_projections:
-            if row.historical_quarter not in _quarters_seen:
-                _quarters_seen.append(row.historical_quarter)
-        for _q in _quarters_seen:
-            st.markdown(f"**{_q}**")
-            _q_rows = [row for row in visible_projections if row.historical_quarter == _q]
-            st.dataframe(pd.DataFrame([
-                {"Tier": row.tier_label,
-                 "Investment Tier": _fmt_dollar_commas(float(row.investment)),
-                 "Delivered Volume": f"{float(row.delivered_volume):,.0f}",
-                 "# of Prospects": f"{float(row.prospects):,.0f}",
-                 "Inc. Customers": f"{float(row.incremental_customers):,.0f}",
-                 "Incremental Revenue": _fmt_dollar_commas(float(row.incremental_revenue)),
-                 "CPIx": _fmt_dollar_0(float(row.cpix)),
-                 "iROAS": _fmt_iroas(float(row.iroas)),
-                 "Marginal CPIx": _fmt_dollar_0(float(row.marginal_cpix))
-                     if row.marginal_cpix and row.tier_label != _first_tier_label else "—",
-                 "Marginal iROAS": _fmt_iroas(float(row.marginal_iroas))
-                     if row.marginal_iroas and row.tier_label != _first_tier_label else "—"}
-                for row in _q_rows
-            ]), hide_index=True, use_container_width=True)
+
+    # --- EXTRA TAB: Intra-quarter forecast or Predicted vs Actual ---
+    if _extra_tab_type == "intra":
+        with detail_tabs[6]:
+            st.subheader(f"Intra-Quarter Forecast: {_proj_q_label} (Week {_intra_max_week} of 12)")
+            st.caption("Currently mid-quarter. Projecting performance to maturity using historical maturity curves from reference quarters.")
+
+            # Load weekly cumulative data for reference quarters and current quarter
+            _ref_quarter_labels = [row["campaign_quarter"] for row in st.session_state.selected_history]
+            _ref_weekly_df = load_weekly_cumulative(
+                session,
+                _ref_quarter_labels,
+                attribution_window=st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.get("source_account"),
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
+            _cur_weekly_df = load_weekly_cumulative(
+                session,
+                [_proj_q_label],
+                attribution_window=st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.get("source_account"),
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
+
+            _ref_has_week12 = _ref_weekly_df[_ref_weekly_df["DELIVERY_WEEK"] == 12] if not _ref_weekly_df.empty else pd.DataFrame()
+            if not _ref_has_week12.empty and not _cur_weekly_df.empty:
+                _total_invest = float(_ref_has_week12["SPEND"].mean())
+
+                # Build maturity curves from reference quarterly data
+                _rev_pivot = _ref_weekly_df.pivot_table(
+                    index="DELIVERY_WEEK", columns="CAMPAIGN_QUARTER", values="INC_REVENUE"
+                )
+                _cur_rev = _cur_weekly_df.set_index("DELIVERY_WEEK")["INC_REVENUE"]
+
+                # Inc Rev Cumulative table
+                st.markdown("#### Inc Rev (Cumulative)")
+                _rev_table = pd.DataFrame({"Week": [f"w{w}" for w in range(1, 13)]})
+                _ref_q_list = sorted(_rev_pivot.columns)
+                for q in _ref_q_list:
+                    _rev_table[q] = [
+                        _rev_pivot.loc[w, q] if w in _rev_pivot.index and pd.notna(_rev_pivot.loc[w, q]) else None
+                        for w in range(1, 13)
+                    ]
+                _rev_table["Median"] = _rev_table[_ref_q_list].median(axis=1)
+                _rev_table["Stdev"] = _rev_table[_ref_q_list].std(axis=1, ddof=1)
+                _median_at_12 = _rev_table["Median"].iloc[11] if len(_rev_table) >= 12 else _rev_table["Median"].iloc[-1]
+                _rev_table["Maturity Curve"] = _rev_table["Median"] / _median_at_12 if (_median_at_12 and pd.notna(_median_at_12) and float(_median_at_12) != 0) else 0
+                _rev_table["Upper Band"] = _rev_table["Median"] + _rev_table["Stdev"]
+                _rev_table["Lower Band"] = _rev_table["Median"] - _rev_table["Stdev"]
+
+                _rev_fmt = {c: "${:,.0f}" for c in _rev_table.columns if c not in ("Week", "Maturity Curve")}
+                _rev_fmt["Maturity Curve"] = "{:.0%}"
+                st.dataframe(_rev_table.style.format(_rev_fmt, na_rep="—"), use_container_width=True, hide_index=True)
+
+                # Summary metrics
+                _mat_pct_at_current = float(_rev_table.loc[_intra_max_week - 1, "Maturity Curve"]) if _intra_max_week <= len(_rev_table) else 1.0
+                _actual_rev_now = float(_cur_rev.loc[_intra_max_week]) if _intra_max_week in _cur_rev.index else 0
+                _exp_ending_rev = _actual_rev_now / _mat_pct_at_current if _mat_pct_at_current > 0 else 0
+                _actual_spend_now = float(_cur_weekly_df.set_index("DELIVERY_WEEK")["SPEND"].loc[_intra_max_week]) if _intra_max_week in _cur_weekly_df.set_index("DELIVERY_WEEK").index else 0
+                _iroas_actual = _actual_rev_now / _actual_spend_now if _actual_spend_now > 0 else 0
+                _iroas_exp_ending = _exp_ending_rev / _total_invest if _total_invest > 0 else 0
+
+                metric_cols = st.columns(4)
+                with metric_cols[0]:
+                    st.metric("Projected Ending Inc Revenue", f"${_exp_ending_rev:,.0f}",
+                              delta=f"from ${_actual_rev_now:,.0f} actual at w{_intra_max_week}")
+                with metric_cols[1]:
+                    st.metric("Projected Ending iROAS", f"{_iroas_exp_ending:.2f}x",
+                              delta=f"actual now: {_iroas_actual:.2f}x")
+                with metric_cols[2]:
+                    st.metric("Maturity at Week " + str(_intra_max_week), f"{_mat_pct_at_current * 100:.1f}%",
+                              delta="of final revenue achieved")
+                with metric_cols[3]:
+                    st.metric("Projected Total Investment", f"${_total_invest:,.0f}",
+                              delta="avg of reference quarters")
+
+                # Chart: current actual vs reference bands
+                _chart_rows = []
+                for w in range(1, _intra_max_week + 1):
+                    row_idx = w - 1
+                    if row_idx < len(_rev_table):
+                        r = _rev_table.iloc[row_idx]
+                        _actual_val = float(_cur_rev.loc[w]) if w in _cur_rev.index else None
+                        _chart_rows.append({"Week": f"w{w}", "Type": f"{_proj_q_label} Actual", "Value": _actual_val})
+                        _chart_rows.append({"Week": f"w{w}", "Type": "Upper Band", "Value": r.get("Upper Band")})
+                        _chart_rows.append({"Week": f"w{w}", "Type": "Lower Band", "Value": r.get("Lower Band")})
+                        _chart_rows.append({"Week": f"w{w}", "Type": "Median", "Value": r.get("Median")})
+                _chart_df = pd.DataFrame(_chart_rows).dropna()
+
+                if not _chart_df.empty:
+                    chart = (
+                        alt.Chart(_chart_df)
+                        .mark_line(point=True)
+                        .encode(
+                            x=alt.X("Week:N", title="Week"),
+                            y=alt.Y("Value:Q", title="Cumulative Inc Revenue", axis=alt.Axis(format="$,.0f")),
+                            color=alt.Color("Type:N", scale=alt.Scale(
+                                domain=[f"{_proj_q_label} Actual", "Upper Band", "Lower Band", "Median"],
+                                range=["#18A999", "#3569A8", "#E8573A", "#888888"]
+                            )),
+                            strokeDash=alt.condition(
+                                alt.datum.Type == f"{_proj_q_label} Actual",
+                                alt.value([0]),
+                                alt.value([5, 3]),
+                            ),
+                        )
+                        .properties(title="Inc Revenue: Current vs Reference Range", height=300)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+
+                # Forecast projection tables
+                st.markdown("---")
+                st.markdown(f"#### {_proj_q_label} Forecast")
+                st.caption("Current actuals projected to maturity. Expected Ending = Actual / Maturity Curve %.")
+                _cur_spend_series = _cur_weekly_df.set_index("DELIVERY_WEEK")["SPEND"]
+                _forecast_rows = []
+                for w in range(1, _intra_max_week + 1):
+                    if w not in _cur_rev.index:
+                        continue
+                    _act_rev = float(_cur_rev.loc[w])
+                    _act_spend = float(_cur_spend_series.loc[w]) if w in _cur_spend_series.index else 0
+                    _mat_pct = float(_rev_table.loc[w - 1, "Maturity Curve"]) if w <= len(_rev_table) else 1.0
+                    _upper = float(_rev_table.loc[w - 1, "Upper Band"]) if w <= len(_rev_table) else _act_rev
+                    _lower = float(_rev_table.loc[w - 1, "Lower Band"]) if w <= len(_rev_table) else _act_rev
+                    _exp_end_rev = _act_rev / _mat_pct if _mat_pct > 0 else 0
+                    _iroas_a = _act_rev / _act_spend if _act_spend > 0 else 0
+                    _iroas_exp = _exp_end_rev / _total_invest if _total_invest > 0 else 0
+                    _forecast_rows.append({
+                        "Week": f"w{w}",
+                        "Investment": _act_spend,
+                        "Inc Rev (Actual)": _act_rev,
+                        "Upper Band": _upper,
+                        "Lower Band": _lower,
+                        "Expected Ending Inc Rev": _exp_end_rev,
+                        "iROAS (Actual)": _iroas_a,
+                        "Expected Ending iROAS": _iroas_exp,
+                    })
+                if _forecast_rows:
+                    _fcast_df = pd.DataFrame(_forecast_rows)
+                    st.dataframe(_fcast_df.style.format({
+                        "Investment": "${:,.0f}",
+                        "Inc Rev (Actual)": "${:,.0f}",
+                        "Upper Band": "${:,.0f}",
+                        "Lower Band": "${:,.0f}",
+                        "Expected Ending Inc Rev": "${:,.0f}",
+                        "iROAS (Actual)": "{:.3f}x",
+                        "Expected Ending iROAS": "{:.3f}x",
+                    }), use_container_width=True, hide_index=True)
+            else:
+                st.warning("Not enough reference quarter data (need at least one quarter with 12 weeks) to build maturity curves.")
+
+    elif _extra_tab_type == "pva":
+        with detail_tabs[6]:
+            st.subheader(f"Predicted vs Actual: {_proj_q_label}")
+            st.caption("Comparing forecast predictions against actual results for this completed quarter.")
+
+            actual_customers = _actual_data["INC_CUSTOMERS"]
+            actual_revenue = _actual_data["INC_REVENUE"]
+            actual_delivered = _actual_data["DELIVERED"]
+            actual_spend = _actual_data["SPEND"]
+
+            # Find predicted tier closest to actual spend
+            _base_projections = [
+                row for row in visible_projections
+                if row.historical_quarter == latest_quarter
+            ]
+            if _base_projections and actual_spend > 0:
+                _closest = min(_base_projections, key=lambda r: abs(float(r.investment) - actual_spend))
+                matched_tier = _closest.tier_label
+                pred_customers = float(_closest.incremental_customers)
+                pred_revenue = float(_closest.incremental_revenue)
+                pred_delivered = float(_closest.delivered_volume)
+                pred_spend = float(_closest.investment)
+
+                st.caption(f"Matched actual spend (${actual_spend:,.0f}) to nearest tier: {matched_tier} (${pred_spend:,.0f})")
+
+                # Summary metrics
+                metric_cols = st.columns(3)
+                with metric_cols[0]:
+                    delta_cust = ((actual_customers - pred_customers) / pred_customers * 100) if pred_customers else 0
+                    st.metric("Inc. Customers", f"{actual_customers:,.0f}",
+                              delta=f"{delta_cust:+.1f}% vs predicted ({pred_customers:,.0f})")
+                with metric_cols[1]:
+                    delta_rev = ((actual_revenue - pred_revenue) / pred_revenue * 100) if pred_revenue else 0
+                    st.metric("Inc. Revenue", f"${actual_revenue:,.0f}",
+                              delta=f"{delta_rev:+.1f}% vs predicted (${pred_revenue:,.0f})")
+                with metric_cols[2]:
+                    delta_del = ((actual_delivered - pred_delivered) / pred_delivered * 100) if pred_delivered else 0
+                    st.metric("Delivered Volume", f"{actual_delivered:,.0f}",
+                              delta=f"{delta_del:+.1f}% vs predicted ({pred_delivered:,.0f})")
+
+                # Bar charts: side-by-side Predicted vs Actual
+                comparison_data = pd.DataFrame([
+                    {"Metric": "Inc. Customers", "Type": "Predicted", "Value": pred_customers},
+                    {"Metric": "Inc. Customers", "Type": "Actual", "Value": actual_customers},
+                    {"Metric": "Inc. Revenue", "Type": "Predicted", "Value": pred_revenue},
+                    {"Metric": "Inc. Revenue", "Type": "Actual", "Value": actual_revenue},
+                    {"Metric": "Delivered Volume", "Type": "Predicted", "Value": pred_delivered},
+                    {"Metric": "Delivered Volume", "Type": "Actual", "Value": actual_delivered},
+                ])
+                pva_cols = st.columns(3)
+                for i, metric in enumerate(["Inc. Customers", "Inc. Revenue", "Delivered Volume"]):
+                    with pva_cols[i]:
+                        chart_data = comparison_data[comparison_data["Metric"] == metric]
+                        y_format = "$,.0f" if metric == "Inc. Revenue" else ",.0f"
+                        chart = (
+                            alt.Chart(chart_data)
+                            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                            .encode(
+                                x=alt.X("Type:N", title=None, axis=alt.Axis(labelAngle=0)),
+                                y=alt.Y("Value:Q", title=metric, axis=alt.Axis(format=y_format)),
+                                color=alt.Color("Type:N", scale=alt.Scale(
+                                    domain=["Predicted", "Actual"], range=["#3569A8", "#18A999"]
+                                ), legend=None),
+                                tooltip=[alt.Tooltip("Type:N"), alt.Tooltip("Value:Q", format=y_format)],
+                            )
+                            .properties(title=metric, height=250)
+                        )
+                        st.altair_chart(chart, use_container_width=True)
+
+                # Comparison table
+                _pva_table = pd.DataFrame([
+                    {"Metric": "Spend", "Predicted": pred_spend, "Actual": actual_spend,
+                     "Difference": actual_spend - pred_spend,
+                     "% Diff": (actual_spend - pred_spend) / pred_spend * 100 if pred_spend else 0},
+                    {"Metric": "Delivered Volume", "Predicted": pred_delivered, "Actual": actual_delivered,
+                     "Difference": actual_delivered - pred_delivered,
+                     "% Diff": (actual_delivered - pred_delivered) / pred_delivered * 100 if pred_delivered else 0},
+                    {"Metric": "Inc. Customers", "Predicted": pred_customers, "Actual": actual_customers,
+                     "Difference": actual_customers - pred_customers,
+                     "% Diff": (actual_customers - pred_customers) / pred_customers * 100 if pred_customers else 0},
+                    {"Metric": "Inc. Revenue", "Predicted": pred_revenue, "Actual": actual_revenue,
+                     "Difference": actual_revenue - pred_revenue,
+                     "% Diff": (actual_revenue - pred_revenue) / pred_revenue * 100 if pred_revenue else 0},
+                ])
+                st.dataframe(_pva_table.style.format({
+                    "Predicted": "${:,.0f}", "Actual": "${:,.0f}",
+                    "Difference": "${:,.0f}", "% Diff": "{:+.1f}%",
+                }), use_container_width=True, hide_index=True)
+            else:
+                st.info("No matching tier found for actual spend comparison.")
 
     workbook = build_workbook(st.session_state.source_account, st.session_state.historical_scope_label,
         datetime.now(timezone.utc).isoformat(), visible_ranges, result["ranges"], st.session_state.selected_history)
@@ -2245,7 +2554,7 @@ if st.session_state.forecast and active_tab == 4:
     upcoming = next_quarter(latest_quarter)
 
     st.header("Annual & Quarterly Forecast")
-    forecast_tabs = st.tabs(["Annual projections", "Quarterly projections", "Monthly breakdown"])
+    forecast_tabs = st.tabs(["Annual projections", "Seasonal index projections", "Monthly breakdown"])
 
     with forecast_tabs[0]:
         st.markdown("**Annual Projections (x4)**")

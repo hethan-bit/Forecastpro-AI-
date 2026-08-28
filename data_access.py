@@ -714,3 +714,108 @@ def historical_monthly_preview(*args: Any, **kwargs: Any) -> list[dict[str, Any]
     return monthly_cumulative_deltas(
         _original_historical_monthly_preview(*args, **kwargs)
     )
+
+
+def load_actual_for_quarter(
+    session: Any,
+    quarter_label: str,
+    attribution_window: int = 30,
+    account_name: str | None = None,
+    sub_account: str | None = None,
+    event: str | None = None,
+    channel: str | None = None,
+) -> dict[str, Any] | None:
+    """Load actual results for a specific quarter at its latest available week.
+
+    Returns a dict with DELIVERED, INC_CUSTOMERS, INC_REVENUE, SPEND, MAX_WEEK
+    or None if no data exists for that quarter.
+    """
+    where_clause, params = _slice_filters(
+        attribution_window, account_name, sub_account, event, channel
+    )
+    query = f"""
+        WITH target AS (
+            SELECT CAMPAIGN_QUARTER,
+                   MAX(DELIVERY_WEEK) AS MAX_WEEK
+            FROM {REFERENCE_HISTORICAL_TABLE}
+            WHERE {where_clause}
+              AND CAMPAIGN_QUARTER = ?
+            GROUP BY CAMPAIGN_QUARTER
+        )
+        SELECT
+            d.CAMPAIGN_QUARTER,
+            SUM(d.DELIVERED) AS DELIVERED,
+            SUM(d.INC_NEW_SALES) AS INC_CUSTOMERS,
+            SUM(d.INC_REVENUE) AS INC_REVENUE,
+            SUM(d.SPEND) AS SPEND,
+            t.MAX_WEEK
+        FROM {REFERENCE_HISTORICAL_TABLE} d
+        JOIN target t
+          ON d.CAMPAIGN_QUARTER = t.CAMPAIGN_QUARTER
+         AND d.DELIVERY_WEEK = t.MAX_WEEK
+        WHERE {where_clause}
+          AND d.CAMPAIGN_QUARTER = ?
+        GROUP BY d.CAMPAIGN_QUARTER, t.MAX_WEEK
+    """
+    all_params = params + [quarter_label] + params + [quarter_label]
+    try:
+        rows = _rows(session.sql(query, params=all_params).collect())
+    except Exception:
+        return None
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "CAMPAIGN_QUARTER": row.get("CAMPAIGN_QUARTER"),
+        "DELIVERED": float(row.get("DELIVERED", 0)),
+        "INC_CUSTOMERS": float(row.get("INC_CUSTOMERS", 0)),
+        "INC_REVENUE": float(row.get("INC_REVENUE", 0)),
+        "SPEND": float(row.get("SPEND", 0)),
+        "MAX_WEEK": int(row.get("MAX_WEEK", 0)),
+    }
+
+
+def load_weekly_cumulative(
+    session: Any,
+    quarter_labels: list[str],
+    attribution_window: int = 30,
+    account_name: str | None = None,
+    sub_account: str | None = None,
+    event: str | None = None,
+    channel: str | None = None,
+) -> "pd.DataFrame":
+    """Load week-by-week cumulative data for given quarters.
+
+    Returns a DataFrame with CAMPAIGN_QUARTER, DELIVERY_WEEK, DELIVERED,
+    INC_NEW_SALES, INC_REVENUE, SPEND, TRT_PROSPECTS, FREQUENCY.
+    """
+    import pandas as pd
+
+    if not quarter_labels:
+        return pd.DataFrame()
+    where_clause, params = _slice_filters(
+        attribution_window, account_name, sub_account, event, channel
+    )
+    placeholders = ", ".join("?" for _ in quarter_labels)
+    query = f"""
+        SELECT CAMPAIGN_QUARTER, DELIVERY_WEEK,
+               SUM(DELIVERED) AS DELIVERED,
+               SUM(INC_NEW_SALES) AS INC_NEW_SALES,
+               SUM(INC_REVENUE) AS INC_REVENUE,
+               SUM(SPEND) AS SPEND,
+               SUM(TRT_PROSPECTS) AS TRT_PROSPECTS,
+               CASE WHEN SUM(TRT_PROSPECTS) > 0
+                    THEN SUM(DELIVERED) * 1.0 / SUM(TRT_PROSPECTS)
+                    ELSE 0 END AS FREQUENCY
+        FROM {REFERENCE_HISTORICAL_TABLE}
+        WHERE {where_clause}
+          AND CAMPAIGN_QUARTER IN ({placeholders})
+          AND DELIVERY_WEEK <= 12
+        GROUP BY CAMPAIGN_QUARTER, DELIVERY_WEEK
+        ORDER BY CAMPAIGN_QUARTER, DELIVERY_WEEK
+    """
+    all_params = params + list(quarter_labels)
+    try:
+        return session.sql(query, params=all_params).to_pandas()
+    except Exception:
+        return pd.DataFrame()
