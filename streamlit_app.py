@@ -643,6 +643,37 @@ def number(value) -> str:
     return f"{float(value):,.0f}"
 
 
+def _fmt_dollar_commas(v: float) -> str:
+    return f"${v:,.0f}"
+
+def _fmt_compact_k(v: float) -> str:
+    abs_v = abs(v)
+    if abs_v >= 1_000_000:
+        return f"{v/1_000_000:.1f}M"
+    elif abs_v >= 1_000:
+        return f"{v/1_000:.1f}K"
+    return f"{v:.0f}"
+
+def _fmt_dollar_compact_m(v: float) -> str:
+    abs_v = abs(v)
+    if abs_v >= 1_000_000:
+        return f"${v/1_000_000:.1f}M"
+    elif abs_v >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:.0f}"
+
+def _fmt_dollar_0(v: float) -> str:
+    return f"${v:,.0f}"
+
+def _fmt_iroas(v: float) -> str:
+    return f"${v:,.2f}"
+
+def _range_str(lo: float, hi: float, fmt_func) -> str:
+    if abs(lo - hi) < 0.005:
+        return fmt_func(lo)
+    return f"{fmt_func(lo)} - {fmt_func(hi)}"
+
+
 MONTH_NAMES = (
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -938,9 +969,17 @@ tab_names = ["1 Inputs"]
 if st.session_state.confirmed:
     tab_names.append("2 Review & Inputs")
 if st.session_state.forecast:
-    tab_names.append("3 Forecast Results")
+    _is_quarterly = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
+    if _is_quarterly:
+        tab_names.append("3a Quarterly Forecast")
+        tab_names.append("3b Monthly Split")
+    else:
+        tab_names.append("3a Annual Forecast")
+        tab_names.append("3b Quarterly Split")
+        tab_names.append("3c Monthly Split")
     tab_names.append("4 Charts")
-    tab_names.append("5 Annual & Quarterly Forecast")
+
+_charts_tab_idx = len(tab_names) - 1  # Charts is always the last tab
 
 # Initialize active_tab if not set or out of bounds
 if "active_tab" not in st.session_state or st.session_state.active_tab >= len(tab_names):
@@ -1986,7 +2025,7 @@ if st.session_state.confirmed and active_tab == 1:
                 ],
                 "show_expansion": show_expansion,
             }
-            st.session_state.message = "Forecast draft created. Review the ranges, quality checks, and marginal economics."
+            st.session_state.message = "Forecast draft created."
             st.session_state.active_tab = 2
             st.rerun()
         except Exception as exc:
@@ -2019,131 +2058,6 @@ if st.session_state.forecast and active_tab == 2:
         if row.historical_quarter == latest_quarter
     }
 
-    workbook = build_workbook(
-        st.session_state.source_account,
-        st.session_state.historical_scope_label,
-        datetime.now(timezone.utc).isoformat(),
-        visible_ranges,
-        result["ranges"],
-        st.session_state.selected_history,
-    )
-    safe_account = re.sub(r"[^a-z0-9]+", "-", st.session_state.source_account.lower()).strip("-") or "forecast"
-    results_title_col, results_download_col = st.columns([6, 1])
-    with results_title_col:
-        st.header("Forecast Output Ranges")
-    with results_download_col:
-        st.download_button(
-            "⇩ Download",
-            workbook,
-            f"{safe_account}-forecast.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_forecast_workbook",
-            help="Download the Excel forecasting report.",
-            use_container_width=True,
-        )
-    st.caption(f"{result['method']} · curve {result['version']}")
-    range_frame = pd.DataFrame([
-        {"Tier": row.tier_label, "Investment": float(row.investment),
-         "Delivered": float(row.delivered_volume), "Prospects": float(row.prospects),
-         "Customers Min": float(row.incremental_customers.minimum),
-         "Customers Max": float(row.incremental_customers.maximum),
-         "Revenue Min": float(row.incremental_revenue.minimum),
-         "Revenue Max": float(row.incremental_revenue.maximum),
-         "CPIx Min": float(row.cpix.minimum), "CPIx Max": float(row.cpix.maximum),
-         "iROAS Min": float(row.iroas.minimum), "iROAS Max": float(row.iroas.maximum),
-         "New Signal Utilization": float(
-             curve_inputs[row.tier_label].new_signal_utilization * 100
-         ),
-         "Adjustment Factor": float(
-             curve_inputs[row.tier_label].adjustment_factor * 100
-         )}
-        for row in visible_ranges
-    ])
-    st.dataframe(range_frame, hide_index=True, use_container_width=True,
-        column_config={
-            **{
-                col: st.column_config.NumberColumn(format="$%.2f")
-                for col in ["Investment", "Revenue Min", "Revenue Max", "CPIx Min", "CPIx Max"]
-            },
-            "New Signal Utilization": st.column_config.NumberColumn(format="%.1f%%"),
-            "Adjustment Factor": st.column_config.NumberColumn(format="%.1f%%"),
-        })
-
-    # --- Expansion tiers (hidden by default, toggle to show) ---
-    expansion_ranges = [
-        row for row in result["ranges"]
-        if not visible_tier(row.tier_label, False)
-    ]
-    if expansion_ranges:
-        with st.expander("Show Expansion Tiers (Incremental Reach / Maximum Scale)", expanded=False):
-            expansion_frame = pd.DataFrame([
-                {"Tier": row.tier_label, "Investment": float(row.investment),
-                 "Delivered": float(row.delivered_volume), "Prospects": float(row.prospects),
-                 "Customers Min": float(row.incremental_customers.minimum),
-                 "Customers Max": float(row.incremental_customers.maximum),
-                 "Revenue Min": float(row.incremental_revenue.minimum),
-                 "Revenue Max": float(row.incremental_revenue.maximum),
-                 "CPIx Min": float(row.cpix.minimum), "CPIx Max": float(row.cpix.maximum),
-                 "iROAS Min": float(row.iroas.minimum), "iROAS Max": float(row.iroas.maximum),
-                 "New Signal Utilization": float(
-                     curve_inputs[row.tier_label].new_signal_utilization * 100
-                 ),
-                 "Adjustment Factor": float(
-                     curve_inputs[row.tier_label].adjustment_factor * 100
-                 )}
-                for row in expansion_ranges
-            ])
-            st.dataframe(expansion_frame, hide_index=True, use_container_width=True,
-                column_config={
-                    **{
-                        col: st.column_config.NumberColumn(format="$%.2f")
-                        for col in ["Investment", "Revenue Min", "Revenue Max", "CPIx Min", "CPIx Max"]
-                    },
-                    "New Signal Utilization": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Adjustment Factor": st.column_config.NumberColumn(format="%.1f%%"),
-                })
-
-    detail_tabs = st.tabs(["Marginal economics", "Investment trade-offs", "Improvement scenarios", "Historical reconciliation"])
-    with detail_tabs[0]:
-        marginal = [row for row in visible_projections if row.historical_quarter == latest_quarter]
-        st.dataframe(pd.DataFrame([
-            {"Tier": row.tier_label, "Investment": float(row.investment),
-             "Marginal CPIx": float(row.marginal_cpix) if row.marginal_cpix and row.tier_label != "Baseline" else None,
-             "Marginal iROAS": float(row.marginal_iroas) if row.marginal_iroas and row.tier_label != "Baseline" else None,
-             "New Signal Utilization": float(row.new_signal_utilization * 100),
-             "Adjustment Factor": float(row.adjustment_factor * 100)}
-            for row in marginal
-        ]), hide_index=True, use_container_width=True)
-    with detail_tabs[1]:
-        chart_data = pd.DataFrame([
-            {"Tier": row.tier_label, "Investment": float(row.investment),
-             "CPIx midpoint": float((row.cpix.minimum + row.cpix.maximum) / 2),
-             "iROAS midpoint": float((row.iroas.minimum + row.iroas.maximum) / 2)}
-            for row in visible_ranges
-        ])
-        left, right = st.columns(2)
-        left.altair_chart(alt.Chart(chart_data).mark_line(point=True).encode(
-            x=alt.X("Tier:N", sort=None, axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)), y="CPIx midpoint:Q", tooltip=list(chart_data.columns)
-        ).properties(title="CPIx rises with investment"), use_container_width=True)
-        right.altair_chart(alt.Chart(chart_data).mark_line(point=True).encode(
-            x=alt.X("Tier:N", sort=None, axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)), y="iROAS midpoint:Q", tooltip=list(chart_data.columns)
-        ).properties(title="iROAS declines with investment"), use_container_width=True)
-    with detail_tabs[2]:
-        for name, factor, rows in result["improvements"]:
-            st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
-                f'<div class="kpi-label">{name}</div>'
-                f'<div class="kpi-value">+{float(factor)*100:.1f}% improvement</div></div>', unsafe_allow_html=True)
-            scenario_rows = [
-                {"Tier": r.tier_label, "Investment": float(r.investment),
-                 "Inc. Customers": float(r.incremental_customers), "Revenue": float(r.incremental_revenue),
-                 "CPIx": float(r.cpix), "iROAS": float(r.iroas)}
-                for r in rows if r.historical_quarter == latest_quarter
-                and visible_tier(r.tier_label, result["show_expansion"])]
-            if scenario_rows:
-                st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True)
-    with detail_tabs[3]:
-        st.dataframe(pd.DataFrame([{**asdict(row)} for row in visible_projections]),
-            hide_index=True, use_container_width=True)
     st.header("Forecast Output Ranges")
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
     _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
@@ -2448,7 +2362,7 @@ if (st.session_state.forecast
 
     try:
         session = get_session()
-        indexes = seasonal_indexes(
+        indexes = effective_monthly_indexes(seasonal_indexes(
             session,
             st.session_state.selected_source,
             attribution_window=st.session_state.get("attribution_window", 30),
@@ -2456,7 +2370,7 @@ if (st.session_state.forecast
             sub_account=st.session_state.get("selected_sub_account"),
             event=st.session_state.get("selected_event"),
             channel=st.session_state.get("selected_channel"),
-        )
+        ))
         for q_num in range(1, 5):
             q_key = f"Q{q_num}"
             o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
@@ -2551,7 +2465,7 @@ if (st.session_state.forecast
 
     try:
         session = get_session()
-        indexes = seasonal_indexes(
+        indexes = effective_monthly_indexes(seasonal_indexes(
             session,
             st.session_state.selected_source,
             attribution_window=st.session_state.get("attribution_window", 30),
@@ -2559,7 +2473,7 @@ if (st.session_state.forecast
             sub_account=st.session_state.get("selected_sub_account"),
             event=st.session_state.get("selected_event"),
             channel=st.session_state.get("selected_channel"),
-        )
+        ))
 
         for q_num in range(1, 5):
             months = QUARTER_MONTHS_MAP[q_num]
@@ -2666,7 +2580,7 @@ if (st.session_state.forecast
 
     try:
         session = get_session()
-        indexes = seasonal_indexes(
+        indexes = effective_monthly_indexes(seasonal_indexes(
             session,
             st.session_state.selected_source,
             attribution_window=st.session_state.get("attribution_window", 30),
@@ -2674,7 +2588,7 @@ if (st.session_state.forecast
             sub_account=st.session_state.get("selected_sub_account"),
             event=st.session_state.get("selected_event"),
             channel=st.session_state.get("selected_channel"),
-        )
+        ))
 
         # Compute monthly proportions within this quarter
         org_sum = sum(indexes["monthly_organic"].get(m, 1/12) for m in _proj_months)
@@ -2809,7 +2723,6 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     # --- Chart 2: iROAS across all tiers ---
     st.subheader("iROAS by Investment Tier")
     iroas_band = alt.Chart(chart_df).mark_area(opacity=0.25, color="#4da6ff").encode(
-        x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
         x=_x_axis,
         y=alt.Y("iROAS Min:Q", title="iROAS"),
         y2="iROAS Max:Q",
@@ -2829,13 +2742,6 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     # --- Chart 3: Incremental Customers across all tiers ---
     st.subheader("Incremental Customers by Investment Tier")
     cust_band = alt.Chart(chart_df).mark_area(opacity=0.25, color="#10b981").encode(
-        x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("Customers Min:Q", title="Incremental Customers"),
-        y2="Customers Max:Q",
-    )
-    cust_line = alt.Chart(chart_df).mark_line(point=True, color="#10b981", strokeWidth=2.5).encode(
-        x=alt.X("Tier:N", sort=tier_order, axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("Customers Midpoint:Q", title="Incremental Customers"),
         x=_x_axis,
         y=alt.Y("Customers Min:Q", title="Incremental Customers", axis=alt.Axis(format="~s")),
         y2="Customers Max:Q",
@@ -2855,13 +2761,13 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     # --- Chart 4: Incremental Revenue across all tiers ---
     st.subheader("Incremental Revenue by Investment Tier")
     rev_band = alt.Chart(chart_df).mark_area(opacity=0.25, color="#8b5cf6").encode(
-        x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("Revenue Min:Q", title="Incremental Revenue ($)"),
+        x=_x_axis,
+        y=alt.Y("Revenue Min:Q", title="Incremental Revenue", axis=alt.Axis(format="$~s")),
         y2="Revenue Max:Q",
     )
     rev_line = alt.Chart(chart_df).mark_line(point=True, color="#8b5cf6", strokeWidth=2.5).encode(
-        x=alt.X("Tier:N", sort=tier_order, axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("Revenue Midpoint:Q", title="Incremental Revenue ($)"),
+        x=_x_axis,
+        y=alt.Y("Revenue Midpoint:Q", title="Incremental Revenue", axis=alt.Axis(format="$~s")),
         tooltip=["Tier", "Revenue Min", "Revenue Midpoint", "Revenue Max", alt.Tooltip("Investment:Q", format="$,.0f")],
     )
     st.altair_chart(
@@ -2875,8 +2781,6 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     st.subheader("Delivered Volume & Prospects by Tier")
     vol_col, pros_col = st.columns(2)
     vol_chart = alt.Chart(chart_df).mark_bar(color="#06b6d4", opacity=0.8).encode(
-        x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("Delivered:Q", title="Delivered Volume"),
         x=_x_axis,
         y=alt.Y("Delivered:Q", title="Delivered Volume", axis=alt.Axis(format="~s")),
         tooltip=["Tier", alt.Tooltip("Delivered:Q", format=",.0f"), alt.Tooltip("Investment:Q", format="$,.0f")],
@@ -2884,8 +2788,6 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     vol_col.altair_chart(vol_chart, use_container_width=True)
 
     pros_chart = alt.Chart(chart_df).mark_bar(color="#f59e0b", opacity=0.8).encode(
-        x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("Prospects:Q", title="Prospects"),
         x=_x_axis,
         y=alt.Y("Prospects:Q", title="Prospects", axis=alt.Axis(format="~s")),
         tooltip=["Tier", alt.Tooltip("Prospects:Q", format=",.0f"), alt.Tooltip("Investment:Q", format="$,.0f")],
@@ -2902,8 +2804,6 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     invest_chart = alt.Chart(chart_df).mark_bar(
         cornerRadiusTopLeft=4, cornerRadiusTopRight=4
     ).encode(
-        x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("Investment:Q", title="Investment ($)"),
         x=_x_axis,
         y=alt.Y("Investment:Q", title="Investment", axis=alt.Axis(format="$~s")),
         color=alt.Color("Tier Type:N", scale=alt.Scale(
