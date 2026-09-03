@@ -2002,7 +2002,7 @@ if (st.session_state.forecast
     if _annual_scenario != "Baseline":
         st.caption(f"Annual forecast ({_annual_scenario}) distributed across Q1–Q4 using seasonal indexes.")
     else:
-        st.caption("Annual forecast distributed across Q1–Q4 using seasonal indexes.")
+        st.caption("The annual forecast is distributed across Q1–Q4 using seasonal indexes.")
 
     try:
         session = get_session()
