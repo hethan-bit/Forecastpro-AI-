@@ -14,6 +14,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)
 REFERENCE_HISTORICAL_TABLE = (
     "ZX.ANALYTICS.ZX_ATTRIBUTION_CUMULATIVE_WEEKLY_PERFORMANCE"
 )
+ORGANIC_DAILY_TABLE = "ZX.ANALYTICS.ZX_ATTRIBUTION_DAILY_CONVERSION_SUMMARY"
 
 
 def active_session():
@@ -386,97 +387,33 @@ def seasonal_indexes(
 ) -> dict[str, Any]:
     """Compute quarterly and monthly organic + incremental seasonal indexes.
 
-    Organic = TRT_CONVERSIONS + CTR_CONVERSIONS (total business conversions).
+    Organic = RELEVANT_ORGANIC_CONVERSIONS from the daily organic source.
     Incremental = INC_NEW_SALES (attributed incremental customers only).
 
-    Uses the same four-dimension historical slice as the forecast inputs.
+    Both sources use the same four-dimension historical slice as the forecast
+    inputs. Attribution window remains applicable only to the cumulative weekly
+    incremental source. Quarterly indexes are deliberately derived from the
+    corresponding three monthly indexes, so the two displays always reconcile.
     """
-    table = normalize_identifier(table_name)
-    where_clause, params = _slice_filters(
-        attribution_window,
-        account_name,
-        sub_account,
-        event,
-        channel,
+    # Monthly organic comes directly from daily conversions; incremental stays
+    # on the existing cumulative-weekly delta logic.
+    incremental_monthly_rows = _try_monthly_from_cumulative(
+        session, attribution_window, account_name, sub_account, event, channel
     )
-
-
-    # Quarterly: organic (TRT + CTR) and incremental by CAMPAIGN_QUARTER
-    qtr_query = f"""
-        WITH latest AS (
-            SELECT CAMPAIGN_QUARTER,
-                   SUM(COALESCE(TRT_CONVERSIONS, 0)) + SUM(COALESCE(CTR_CONVERSIONS, 0)) AS ORGANIC,
-                   SUM(COALESCE(INC_NEW_SALES, 0)) AS INCREMENTAL,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY CAMPAIGN_QUARTER
-                       ORDER BY DELIVERY_WEEK DESC
-                   ) AS rn
-            FROM {table}
-            WHERE {where_clause}
-            GROUP BY CAMPAIGN_QUARTER, DELIVERY_WEEK
+    incremental_by_month = {
+        str(row.get("MONTH", "")): float(row.get("INCREMENTAL", 0) or 0)
+        for row in incremental_monthly_rows
+    }
+    monthly_rows = [
+        {
+            "MONTH": row["MONTH"],
+            "ORGANIC": row.get("ORGANIC", 0),
+            "INCREMENTAL": incremental_by_month.get(str(row["MONTH"]), 0.0),
+        }
+        for row in _daily_organic_months(
+            session, account_name, sub_account, event, channel
         )
-        SELECT CAMPAIGN_QUARTER, ORGANIC, INCREMENTAL
-        FROM latest WHERE rn = 1
-        ORDER BY CAMPAIGN_QUARTER
-    """
-    qtr_rows = _rows(
-        session.sql(qtr_query, params=params).collect()
-    )
-
-    # Seasonal allocation must use one value per calendar quarter. Restrict to
-    # the latest four campaign quarters before normalizing, otherwise an older
-    # Q1/Q2/Q3/Q4 can remain in the denominator after its display key is replaced.
-    qtr_rows = sorted(
-        (
-            row
-            for row in qtr_rows
-            if _quarter_sort(str(row.get("CAMPAIGN_QUARTER", ""))) > 0
-        ),
-        key=lambda row: _quarter_sort(str(row.get("CAMPAIGN_QUARTER", ""))),
-        reverse=True,
-    )[:4]
-
-    # Monthly: try derived table first, then fall back to cumulative weekly
-    monthly_rows = _try_monthly_from_derived(
-        session, table, attribution_window, account_name, sub_account, event, channel
-    )
-    if not monthly_rows or all(float(r.get("ORGANIC", 0) or 0) == 0 for r in monthly_rows):
-        monthly_rows = _try_monthly_from_cumulative(
-            session, attribution_window, account_name, sub_account, event, channel
-        )
-
-    # Quarterly percentages
-    # If fewer than 4 quarters of data, use the standard seasonal benchmarks
-    # from the forecasting template (prevents 100% allocation to a single quarter)
-    total_organic_qtr = sum(float(r.get("ORGANIC", 0) or 0) for r in qtr_rows)
-    total_inc_qtr = sum(float(r.get("INCREMENTAL", 0) or 0) for r in qtr_rows)
-
-    distinct_quarters = set()
-    for r in qtr_rows:
-        match = re.fullmatch(r"Q([1-4])\s*\d{4}", str(r.get("CAMPAIGN_QUARTER", "")).upper())
-        if match:
-            distinct_quarters.add(match.group(1))
-
-    if len(distinct_quarters) < 4:
-        # Standard seasonal benchmarks from the forecasting template
-        quarterly_organic = {"Q1": 0.26, "Q2": 0.25, "Q3": 0.26, "Q4": 0.23}
-        quarterly_incremental = {"Q1": 0.232, "Q2": 0.255, "Q3": 0.304, "Q4": 0.209}
-    else:
-        quarterly_organic = {}
-        quarterly_incremental = {}
-        for r in qtr_rows:
-            qtr_label = str(r["CAMPAIGN_QUARTER"])
-            match = re.fullmatch(r"Q([1-4])\s*\d{4}", qtr_label.upper())
-            if match:
-                q_key = f"Q{match.group(1)}"
-                quarterly_organic[q_key] = (
-                    float(r.get("ORGANIC", 0) or 0) / total_organic_qtr
-                    if total_organic_qtr else 0.25
-                )
-                quarterly_incremental[q_key] = (
-                    float(r.get("INCREMENTAL", 0) or 0) / total_inc_qtr
-                    if total_inc_qtr else 0.25
-                )
+    ]
 
     # Monthly percentages — ALWAYS try to compute from actual data
     # regardless of how many quarters exist
@@ -520,9 +457,23 @@ def seasonal_indexes(
             "Jul": 0.09, "Aug": 0.102, "Sep": 0.112,
             "Oct": 0.085, "Nov": 0.062, "Dec": 0.062,
         }
-    for q in ["Q1", "Q2", "Q3", "Q4"]:
-        quarterly_organic.setdefault(q, 0.25)
-        quarterly_incremental.setdefault(q, 0.25)
+    # Quarterly indexes use the exact same monthly allocation shown to the
+    # analyst. This avoids mixing quarter-end snapshots with independent
+    # month-of-year aggregates (the former caused Q1 != Jan + Feb + Mar).
+    quarter_months = {
+        "Q1": ("Jan", "Feb", "Mar"),
+        "Q2": ("Apr", "May", "Jun"),
+        "Q3": ("Jul", "Aug", "Sep"),
+        "Q4": ("Oct", "Nov", "Dec"),
+    }
+    quarterly_organic = {
+        quarter: sum(monthly_organic.get(month, 0.0) for month in months)
+        for quarter, months in quarter_months.items()
+    }
+    quarterly_incremental = {
+        quarter: sum(monthly_incremental.get(month, 0.0) for month in months)
+        for quarter, months in quarter_months.items()
+    }
 
     return {
         "quarterly_organic": quarterly_organic,
@@ -530,6 +481,55 @@ def seasonal_indexes(
         "monthly_organic": monthly_organic,
         "monthly_incremental": monthly_incremental,
     }
+
+
+def _daily_organic_quarters(
+    session: Any,
+    account_name: str | None = None,
+    sub_account: str | None = None,
+    event: str | None = None,
+    channel: str | None = None,
+) -> list[dict[str, Any]]:
+    """Aggregate authoritative daily organic conversions by calendar quarter."""
+    where_clause, params = _dimension_filters(
+        account_name, sub_account, event, channel
+    )
+    query = f"""
+        SELECT CONCAT(
+                   'Q', DATE_PART('QUARTER', CONVERSION_DATE), ' ',
+                   DATE_PART('YEAR', CONVERSION_DATE)
+               ) AS CAMPAIGN_QUARTER,
+               SUM(COALESCE(RELEVANT_ORGANIC_CONVERSIONS, 0)) AS ORGANIC
+        FROM {ORGANIC_DAILY_TABLE}
+        WHERE {where_clause}
+          AND CONVERSION_DATE IS NOT NULL
+        GROUP BY 1
+        ORDER BY 1
+    """
+    return _rows(session.sql(query, params=params).collect())
+
+
+def _daily_organic_months(
+    session: Any,
+    account_name: str | None = None,
+    sub_account: str | None = None,
+    event: str | None = None,
+    channel: str | None = None,
+) -> list[dict[str, Any]]:
+    """Aggregate authoritative daily organic conversions by month of year."""
+    where_clause, params = _dimension_filters(
+        account_name, sub_account, event, channel
+    )
+    query = f"""
+        SELECT TO_CHAR(CONVERSION_DATE, 'Mon') AS MONTH,
+               SUM(COALESCE(RELEVANT_ORGANIC_CONVERSIONS, 0)) AS ORGANIC
+        FROM {ORGANIC_DAILY_TABLE}
+        WHERE {where_clause}
+          AND CONVERSION_DATE IS NOT NULL
+        GROUP BY MONTH(CONVERSION_DATE), TO_CHAR(CONVERSION_DATE, 'Mon')
+        ORDER BY MONTH(CONVERSION_DATE)
+    """
+    return _rows(session.sql(query, params=params).collect())
 
 
 def _try_monthly_from_derived(
@@ -715,107 +715,3 @@ def historical_monthly_preview(*args: Any, **kwargs: Any) -> list[dict[str, Any]
         _original_historical_monthly_preview(*args, **kwargs)
     )
 
-
-def load_actual_for_quarter(
-    session: Any,
-    quarter_label: str,
-    attribution_window: int = 30,
-    account_name: str | None = None,
-    sub_account: str | None = None,
-    event: str | None = None,
-    channel: str | None = None,
-) -> dict[str, Any] | None:
-    """Load actual results for a specific quarter at its latest available week.
-
-    Returns a dict with DELIVERED, INC_CUSTOMERS, INC_REVENUE, SPEND, MAX_WEEK
-    or None if no data exists for that quarter.
-    """
-    where_clause, params = _slice_filters(
-        attribution_window, account_name, sub_account, event, channel
-    )
-    query = f"""
-        WITH target AS (
-            SELECT CAMPAIGN_QUARTER,
-                   MAX(DELIVERY_WEEK) AS MAX_WEEK
-            FROM {REFERENCE_HISTORICAL_TABLE}
-            WHERE {where_clause}
-              AND CAMPAIGN_QUARTER = ?
-            GROUP BY CAMPAIGN_QUARTER
-        )
-        SELECT
-            d.CAMPAIGN_QUARTER,
-            SUM(d.DELIVERED) AS DELIVERED,
-            SUM(d.INC_NEW_SALES) AS INC_CUSTOMERS,
-            SUM(d.INC_REVENUE) AS INC_REVENUE,
-            SUM(d.SPEND) AS SPEND,
-            t.MAX_WEEK
-        FROM {REFERENCE_HISTORICAL_TABLE} d
-        JOIN target t
-          ON d.CAMPAIGN_QUARTER = t.CAMPAIGN_QUARTER
-         AND d.DELIVERY_WEEK = t.MAX_WEEK
-        WHERE {where_clause}
-          AND d.CAMPAIGN_QUARTER = ?
-        GROUP BY d.CAMPAIGN_QUARTER, t.MAX_WEEK
-    """
-    all_params = params + [quarter_label] + params + [quarter_label]
-    try:
-        rows = _rows(session.sql(query, params=all_params).collect())
-    except Exception:
-        return None
-    if not rows:
-        return None
-    row = rows[0]
-    return {
-        "CAMPAIGN_QUARTER": row.get("CAMPAIGN_QUARTER"),
-        "DELIVERED": float(row.get("DELIVERED", 0)),
-        "INC_CUSTOMERS": float(row.get("INC_CUSTOMERS", 0)),
-        "INC_REVENUE": float(row.get("INC_REVENUE", 0)),
-        "SPEND": float(row.get("SPEND", 0)),
-        "MAX_WEEK": int(row.get("MAX_WEEK", 0)),
-    }
-
-
-def load_weekly_cumulative(
-    session: Any,
-    quarter_labels: list[str],
-    attribution_window: int = 30,
-    account_name: str | None = None,
-    sub_account: str | None = None,
-    event: str | None = None,
-    channel: str | None = None,
-) -> "pd.DataFrame":
-    """Load week-by-week cumulative data for given quarters.
-
-    Returns a DataFrame with CAMPAIGN_QUARTER, DELIVERY_WEEK, DELIVERED,
-    INC_NEW_SALES, INC_REVENUE, SPEND, TRT_PROSPECTS, FREQUENCY.
-    """
-    import pandas as pd
-
-    if not quarter_labels:
-        return pd.DataFrame()
-    where_clause, params = _slice_filters(
-        attribution_window, account_name, sub_account, event, channel
-    )
-    placeholders = ", ".join("?" for _ in quarter_labels)
-    query = f"""
-        SELECT CAMPAIGN_QUARTER, DELIVERY_WEEK,
-               SUM(DELIVERED) AS DELIVERED,
-               SUM(INC_NEW_SALES) AS INC_NEW_SALES,
-               SUM(INC_REVENUE) AS INC_REVENUE,
-               SUM(SPEND) AS SPEND,
-               SUM(TRT_PROSPECTS) AS TRT_PROSPECTS,
-               CASE WHEN SUM(TRT_PROSPECTS) > 0
-                    THEN SUM(DELIVERED) * 1.0 / SUM(TRT_PROSPECTS)
-                    ELSE 0 END AS FREQUENCY
-        FROM {REFERENCE_HISTORICAL_TABLE}
-        WHERE {where_clause}
-          AND CAMPAIGN_QUARTER IN ({placeholders})
-          AND DELIVERY_WEEK <= 12
-        GROUP BY CAMPAIGN_QUARTER, DELIVERY_WEEK
-        ORDER BY CAMPAIGN_QUARTER, DELIVERY_WEEK
-    """
-    all_params = params + list(quarter_labels)
-    try:
-        return session.sql(query, params=all_params).to_pandas()
-    except Exception:
-        return pd.DataFrame()
