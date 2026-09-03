@@ -1,100 +1,77 @@
-"""Read the approved Q2 planning export bundled with the Snowflake app."""
+"""Read approved planning inputs from the Snowflake planning-input table."""
 
 from __future__ import annotations
 
-import csv
 from decimal import Decimal
-from pathlib import Path
+from typing import Any
 
-DEFAULT_PLANNING_SOURCE = Path(__file__).with_name("FORECASTING_Q2_2026.csv")
+PLANNING_INPUT_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS"
 
 
-def planning_campaigns(
+def planning_quarters(
+    session: Any,
     account_name: str,
-    quarter: str = "Q2 2026",
-    source_path: Path = DEFAULT_PLANNING_SOURCE,
+    sub_account: str,
+    channel: str,
 ) -> list[str]:
-    """Return Q2 campaign keys that match the selected ForecastPro account."""
-    account = _match_text(account_name)
-    matches = []
-    for row in _rows(source_path):
-        if _match_text(row.get("Quarter")) != _match_text(quarter):
-            continue
-        searchable = " ".join(
-            str(row.get(column) or "")
-            for column in (
-                "Client",
-                "New Client",
-                "Client + Campaign + Channel",
-                "CLIENT_CODE",
-            )
-        )
-        campaign_key = str(row.get("Client + Campaign + Channel") or "").strip()
-        if campaign_key and account in _match_text(searchable):
-            matches.append(campaign_key)
-    return sorted(dict.fromkeys(matches), key=str.casefold)
-
+    """Return planning quarters available for one account/sub-account/channel slice."""
+    rows = session.sql(
+        f"""
+        SELECT DISTINCT QUARTER
+        FROM {PLANNING_INPUT_TABLE}
+        WHERE QUARTER IS NOT NULL
+          AND UPPER(TRIM(ACCOUNT_NAME)) = UPPER(TRIM(?))
+          AND UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))
+          AND UPPER(TRIM(COALESCE(CHANNEL, ''))) = UPPER(TRIM(?))
+        ORDER BY QUARTER
+        """,
+        params=[account_name, sub_account, channel],
+    ).collect()
+    return [str(row["QUARTER"]).strip() for row in rows if row["QUARTER"]]
 
 def planning_input(
-    campaign_key: str,
-    quarter: str = "Q2 2026",
-    source_path: Path = DEFAULT_PLANNING_SOURCE,
+    session: Any,
+    quarter: str,
+    account_name: str,
+    sub_account: str,
+    channel: str,
 ) -> dict[str, Decimal]:
-    """Return the five planning fields used by the forecast draft."""
-    for row in _rows(source_path):
-        if (
-            _match_text(row.get("Quarter")) == _match_text(quarter)
-            and str(row.get("Client + Campaign + Channel") or "").strip()
-            == campaign_key
-        ):
-            return {
-                "campaign_budget": _decimal(row, "Campaign Budget"),
-                "cpm": _decimal(row, "CPM"),
-                "planned_reach": _decimal(row, "Planned Campaign Reach"),
-                "maximum_reach": _decimal(
-                    row, "Maximum Reach to Maintain Performance"
-                ),
-                "signal_utilization": _decimal(
-                    row, "Signal Utilization (to total signals available)"
-                ),
-                "frequency_at_max": _decimal(row, "Frequency"),
-            }
-    raise ValueError(
-        "Selected campaign was not found in the approved Q2 forecast sheet"
-    )
+    """Return the one planning row for the selected historical slice.
 
-
-def _rows(source_path: Path) -> list[dict[str, str]]:
-    for encoding in ("utf-8-sig", "cp1252"):
-        try:
-            with source_path.open(encoding=encoding, newline="") as handle:
-                return [
-                    {
-                        (key or "").replace("\u00a0", " ").strip():
-                        (value or "").replace("\u00a0", " ").strip()
-                        for key, value in row.items()
-                    }
-                    for row in csv.DictReader(handle)
-                ]
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("The approved Q2 forecast sheet has an unsupported encoding")
-
-
-def _match_text(value: object) -> str:
-    return " ".join(str(value or "").casefold().split())
-
-
-def _decimal(row: dict[str, str], column: str) -> Decimal:
-    value = (
-        str(row.get(column) or "")
-        .replace(",", "")
-        .replace("$", "")
-        .replace("\u00a0", "")
-        .strip()
-    )
-    if not value:
-        raise ValueError(f"Q2 forecast sheet is missing {column}")
-    if value.endswith("%"):
-        return Decimal(value[:-1]) / Decimal("100")
-    return Decimal(value)
+    Event intentionally is not a key here: it is not present in the approved
+    planning table. The table's unique grain is quarter/account/sub-account/channel.
+    """
+    query = f"""
+        SELECT CAMPAIGN_BUDGET, CPM, PLANNED_CAMPAIGN_REACH,
+               MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE,
+               SIGNAL_UTILIZATION, FREQUENCY
+        FROM {PLANNING_INPUT_TABLE}
+        WHERE UPPER(TRIM(QUARTER)) = UPPER(TRIM(?))
+          AND UPPER(TRIM(ACCOUNT_NAME)) = UPPER(TRIM(?))
+          AND UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))
+          AND UPPER(TRIM(COALESCE(CHANNEL, ''))) = UPPER(TRIM(?))
+    """
+    rows = session.sql(
+        query, params=[quarter, account_name, sub_account, channel]
+    ).collect()
+    if not rows:
+        raise ValueError(
+            "No planning inputs match the selected quarter, account, sub account, and channel."
+        )
+    if len(rows) > 1:
+        raise ValueError(
+            "More than one planning row matches the selected quarter, account, sub account, and channel."
+        )
+    row = rows[0]
+    return {
+        "campaign_budget": Decimal(str(row["CAMPAIGN_BUDGET"])),
+        "cpm": Decimal(str(row["CPM"])),
+        "planned_reach": Decimal(str(row["PLANNED_CAMPAIGN_REACH"])),
+        "maximum_reach": Decimal(
+            str(row["MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE"])
+        ),
+        # FORECASTING_INPUTS stores percent points (for example, 100 for 100%).
+        # ForecastPro calculations and percent formatting use decimal fractions.
+        "signal_utilization": Decimal(str(row["SIGNAL_UTILIZATION"])) / Decimal("100"),
+        "frequency_at_max": Decimal(str(row["FREQUENCY"])),
+    }
