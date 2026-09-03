@@ -558,10 +558,13 @@ def initialize_state() -> None:
         "max_reach": 10_000_000.0,
         "frequency_at_max": 18.0,
         "selected_source": None,
+        "selected_campaign": None,
         "historical_scope_label": "Historical slice",
         "selected_sub_account": None,
         "selected_event": None,
         "selected_channel": None,
+        "projection_mode": "Quarterly",
+        "projection_quarter": None,
         "monthly_history": [],
         "monthly_index_mode": "Automatic",
         "manual_monthly_organic": {},
@@ -866,11 +869,21 @@ def load_historical_slice() -> None:
     st.session_state.attribution_window = window
     rows = historical_preview(session, table_name, window, **filters)
     monthly_rows = historical_monthly_preview(session, table_name, window, **filters)
+
+    # Sort rows in reverse chronological order (most recent quarter first)
+    def _quarter_sort_key(row):
+        q = row.get("campaign_quarter", "")
+        parts = q.split()
+        if len(parts) == 2:
+            return (-int(parts[1]), -int(parts[0].replace("Q", "")))
+        return (0, 0)
+
+    rows.sort(key=_quarter_sort_key)
     default_keys = {
         f"{row['campaign_quarter']}-{row['source_week_order']}"
         for row in [
             item for item in rows
-            if item["is_complete"] and item["spend_reconciled"]
+            if item["is_complete"]
         ][:4]
     }
     for row in rows:
@@ -947,7 +960,7 @@ active_tab = st.session_state.active_tab
 
 
 # =============================================================================
-# TAB 1: INPUTS, DISCOVERY, AND HISTORICAL RECONCILIATION
+# TAB 1: INPUTS & DISCOVERY
 # =============================================================================
 if active_tab == 0:
     st.header("1. Select historical inputs")
@@ -1189,6 +1202,40 @@ if active_tab == 0:
         if planning_inputs_ready:
             st.caption("No approved planning quarter is available for this account, sub account, and channel.")
 
+    # --- Projection quarter & mode (side by side) ---
+    def _build_projection_quarters() -> list[str]:
+        from datetime import date as _date
+        today = _date.today()
+        current_q = (today.month - 1) // 3 + 1
+        current_y = today.year
+        quarters = []
+        for offset in range(0, 9):
+            idx = current_y * 4 + (current_q - 1) - offset
+            y = idx // 4
+            q = idx % 4 + 1
+            quarters.append(f"Q{q} {y}")
+        return quarters
+
+    _projection_quarter_options = _build_projection_quarters()
+    proj_row = st.columns(2)
+    with proj_row[0]:
+        projection_quarter_choice = st.selectbox(
+            "Projection quarter",
+            _projection_quarter_options,
+            index=0,
+            key="_widget_projection_quarter",
+            help="Quarter to forecast for. Historical quarters before this will be available as reference inputs.",
+        )
+    with proj_row[1]:
+        projection_mode = st.radio(
+            "Projection mode",
+            options=["Quarterly", "Annual"],
+            index=0,
+            horizontal=True,
+            key="_widget_projection_mode",
+            help="Quarterly projects a single quarter; Annual multiplies by 4.",
+        )
+
     table_name = REFERENCE_HISTORICAL_TABLE
     if st.button("Load Historical Data", type="primary"):
         try:
@@ -1210,6 +1257,8 @@ if active_tab == 0:
             st.session_state.selected_channel = (
                 None if channel_choice == "(none found)" else channel_choice
             )
+            st.session_state.projection_mode = projection_mode
+            st.session_state.projection_quarter = projection_quarter_choice
             st.session_state.sources = [{"DERIVED_WEEKLY_TABLE": table_name}]
             load_historical_slice()
             if not st.session_state.preview:
@@ -1225,6 +1274,31 @@ if active_tab == 0:
 # =============================================================================
 if st.session_state.preview and active_tab == 0:
     st.subheader("Historical quarter data — review and approve")
+
+    # Filter to quarters before the projection quarter, sorted most recent first
+    def _quarter_sort_value(label: str) -> int:
+        parts = label.strip().split()
+        if len(parts) == 2:
+            return int(parts[1]) * 4 + int(parts[0].replace("Q", ""))
+        return 0
+
+    _proj_q = st.session_state.get("projection_quarter")
+    _proj_q_val = _quarter_sort_value(_proj_q) if _proj_q else 99999
+    _eligible_preview = sorted(
+        [row for row in st.session_state.preview
+         if _quarter_sort_value(row["campaign_quarter"]) < _proj_q_val],
+        key=lambda row: _quarter_sort_value(row["campaign_quarter"]),
+        reverse=True,
+    )
+    # Default: pre-select the 4 most recent quarters
+    for i, row in enumerate(_eligible_preview):
+        if "Use" not in row or row["Use"] is None:
+            row["Use"] = i < 4
+
+    if not _eligible_preview:
+        st.warning("No historical quarters exist before the selected projection quarter.")
+        st.stop()
+
     display = pd.DataFrame(
         [
             {
@@ -1242,14 +1316,14 @@ if st.session_state.preview and active_tab == 0:
                 "CPIx": float(row["cpix"]),
                 "iROAS": float(row["iroas"]),
             }
-            for row in st.session_state.preview
+            for row in _eligible_preview
         ]
     )
     edited = st.data_editor(
         display,
         hide_index=True,
         use_container_width=True,
-        key=f"history_editor_{hash(str([r['campaign_quarter'] for r in st.session_state.preview]))}",
+        key=f"history_editor_{hash(str([r['campaign_quarter'] for r in _eligible_preview]))}",
         disabled=[column for column in display.columns if column != "Use"],
         column_config={
             "Use": st.column_config.CheckboxColumn(required=True),
@@ -1265,7 +1339,7 @@ if st.session_state.preview and active_tab == 0:
     selected_quarters = set(edited.loc[edited["Use"], "Quarter"].tolist())
     selected_history = [
         row
-        for row in st.session_state.preview
+        for row in _eligible_preview
         if row["campaign_quarter"] in selected_quarters
     ]
 
@@ -1287,7 +1361,6 @@ if st.session_state.preview and active_tab == 0:
         st.warning(f"Could not load monthly breakdown: {exc}")
 
     incomplete = [row for row in selected_history if not row["is_complete"]]
-    unreconciled = [row for row in selected_history if not row["spend_reconciled"]]
     partial_approved = False
     if incomplete:
         partial_approved = st.checkbox(
@@ -1295,7 +1368,6 @@ if st.session_state.preview and active_tab == 0:
         )
     can_confirm = (
         bool(selected_history)
-        and not unreconciled
         and (not incomplete or partial_approved)
     )
     if st.button(
@@ -1322,6 +1394,9 @@ if st.session_state.confirmed and active_tab == 1:
         if st.session_state.show_historical_kpis
         else "Show historical quarterly KPIs"
     )
+    if "show_historical_kpis" not in st.session_state:
+        st.session_state.show_historical_kpis = False
+    kpi_button_label = "Hide Historical KPIs" if st.session_state.show_historical_kpis else "Show Historical KPIs"
     if st.button(kpi_button_label, key="toggle_historical_kpis"):
         st.session_state.show_historical_kpis = not st.session_state.show_historical_kpis
         st.rerun()
@@ -1331,7 +1406,7 @@ if st.session_state.confirmed and active_tab == 1:
         metrics = [
             ("Delivered Volume", "delivered_volume"),
             ("Spend", "source_spend"),
-            ("Frequency", "frequency"),
+("Historical Average Frequency", "frequency"),
             ("Prospects", "prospects"),
             ("Incremental Customers", "incremental_customers"),
             ("Incremental Revenue", "incremental_revenue"),
@@ -1452,7 +1527,7 @@ if st.session_state.confirmed and active_tab == 1:
         frequency_at_max = st.number_input(
             "Frequency at Max Reach Utilization",
             min_value=minimum_viable_frequency,
-            step=1.0,
+            step=0.5,
             key=frequency_widget_key,
             on_change=_frequency_changed,
             help=(
@@ -1822,9 +1897,8 @@ if st.session_state.confirmed and active_tab == 1:
                 f"Factor {scenario_idx + 1} (%)",
                 min_value=0.0,
                 max_value=99.0,
-                value=default_factor,
-                step=0.1,
-                format="%.1f",
+                value=15.0 if scenario_idx == 1 else 10.0,
+                step=0.5,
                 key=f"scenario_factor_{scenario_idx}",
             )
             scenario_names.append(name)
@@ -2070,14 +2144,609 @@ if st.session_state.forecast and active_tab == 2:
     with detail_tabs[3]:
         st.dataframe(pd.DataFrame([{**asdict(row)} for row in visible_projections]),
             hide_index=True, use_container_width=True)
+    st.header("Forecast Output Ranges")
+    _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
+    _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
+    # Build marginal ranges from projections across all historical quarters
+    from collections import defaultdict as _defaultdict
+    _marginal_cpix_values: dict[str, list[float]] = _defaultdict(list)
+    _marginal_iroas_values: dict[str, list[float]] = _defaultdict(list)
+    for row in visible_projections:
+        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+            _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
+        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+            _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
+
+    _sig_util_all = {
+        row.tier_label: float(row.new_signal_utilization * 100)
+        for row in visible_projections
+        if row.historical_quarter == latest_quarter
+    }
+
+    if _is_quarterly_mode:
+        # --- Quarterly mode: show one-quarter baseline table ---
+        st.subheader("One Quarter Projection")
+        range_frame = pd.DataFrame([
+            {"Tier": row.tier_label,
+             "Investment Tier": _fmt_dollar_commas(float(row.investment)),
+             "Delivered Volume": f"{float(row.delivered_volume):,.0f}",
+             "# of Prospects": f"{float(row.prospects):,.0f}",
+             "Inc. Customers": _range_str(
+                 float(row.incremental_customers.minimum),
+                 float(row.incremental_customers.maximum),
+                 _fmt_compact_k),
+             "Incremental Revenue": _range_str(
+                 float(row.incremental_revenue.minimum),
+                 float(row.incremental_revenue.maximum),
+                 _fmt_dollar_compact_m),
+             "CPIx": _range_str(
+                 float(row.cpix.minimum), float(row.cpix.maximum), _fmt_dollar_0),
+             "iROAS": _range_str(
+                 float(row.iroas.minimum), float(row.iroas.maximum), _fmt_iroas),
+             "Marginal CPIx": _range_str(
+                 min(_marginal_cpix_values[row.tier_label]),
+                 max(_marginal_cpix_values[row.tier_label]),
+                 _fmt_dollar_0)
+                 if _marginal_cpix_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                 else "—",
+             "Marginal iROAS": _range_str(
+                 min(_marginal_iroas_values[row.tier_label]),
+                 max(_marginal_iroas_values[row.tier_label]),
+                 _fmt_iroas)
+                 if _marginal_iroas_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                 else "—"}
+            for row in visible_ranges
+        ])
+        st.dataframe(range_frame, hide_index=True, use_container_width=True)
+
+    # --- Sub-content depends on projection mode ---
+    _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
+
+    # === Helper: render improvement scenarios ===
+    def _render_improvement_scenarios(simple_headers=False):
+        _range_by_tier = {r.tier_label: r for r in visible_ranges}
+        _range_adj = st.session_state.get("range_percent_input", 10) / 100
+        _sig_util_by_tier = {
+            row.tier_label: float(row.new_signal_utilization * 100)
+            for row in visible_projections
+            if row.historical_quarter == latest_quarter
+        }
+        for name, factor, rows in result["improvements"]:
+            if simple_headers:
+                st.subheader(f"+{float(factor)*100:.0f}% Improvement")
+            else:
+                st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
+                    f'<div class="kpi-label">{name}</div>'
+                    f'<div class="kpi-value">+{float(factor)*100:.0f}% improvement</div></div>', unsafe_allow_html=True)
+            from collections import defaultdict as _dd
+            _imp_by_tier: dict[str, list] = _dd(list)
+            for r in rows:
+                if visible_tier(r.tier_label, result["show_expansion"]):
+                    _imp_by_tier[r.tier_label].append(r)
+            scenario_rows = []
+            for tier_label, tier_rows in _imp_by_tier.items():
+                rng = _range_by_tier.get(tier_label)
+                custs = [float(r.incremental_customers) for r in tier_rows]
+                revs = [float(r.incremental_revenue) for r in tier_rows]
+                cpixs = [float(r.cpix) for r in tier_rows]
+                iroass = [float(r.iroas) for r in tier_rows]
+                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix and r.marginal_cpix > 0]
+                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas and r.marginal_iroas > 0]
+                if len(tier_rows) == 1:
+                    c = custs[0]
+                    cust_range = _range_str(c * (1 - _range_adj), c * (1 + _range_adj), _fmt_compact_k)
+                    rv = revs[0]
+                    rev_range = _range_str(rv * (1 - _range_adj), rv * (1 + _range_adj), _fmt_dollar_compact_m)
+                    cx = cpixs[0]
+                    cpix_range = _range_str(cx / (1 + _range_adj), cx / (1 - _range_adj), _fmt_dollar_0)
+                    ir = iroass[0]
+                    iroas_range = _range_str(ir * (1 - _range_adj), ir * (1 + _range_adj), _fmt_iroas)
+                    if mcpixs:
+                        mc = mcpixs[0]
+                        mcpix_range = _range_str(mc / (1 + _range_adj), mc / (1 - _range_adj), _fmt_dollar_0)
+                    else:
+                        mcpix_range = "—"
+                    if miroass:
+                        mi = miroass[0]
+                        miroas_range = _range_str(mi * (1 - _range_adj), mi * (1 + _range_adj), _fmt_iroas)
+                    else:
+                        miroas_range = "—"
+                else:
+                    cust_range = _range_str(min(custs), max(custs), _fmt_compact_k)
+                    rev_range = _range_str(min(revs), max(revs), _fmt_dollar_compact_m)
+                    cpix_range = _range_str(min(cpixs), max(cpixs), _fmt_dollar_0)
+                    iroas_range = _range_str(min(iroass), max(iroass), _fmt_iroas)
+                    mcpix_range = _range_str(min(mcpixs), max(mcpixs), _fmt_dollar_0) if mcpixs else "—"
+                    miroas_range = _range_str(min(miroass), max(miroass), _fmt_iroas) if miroass else "—"
+                if tier_label == _first_tier_label:
+                    mcpix_range = "—"
+                    miroas_range = "—"
+                scenario_rows.append({
+                    "Tier": tier_label,
+                    "Investment Tier": _fmt_dollar_commas(float(tier_rows[0].investment)),
+                    "Delivered Volume": f"{float(rng.delivered_volume):,.0f}" if rng else "—",
+                    "# of Prospects": f"{float(rng.prospects):,.0f}" if rng else "—",
+                    "Inc. Customers": cust_range,
+                    "Incremental Revenue": rev_range,
+                    "CPIx": cpix_range,
+                    "iROAS": iroas_range,
+                    "Marginal CPIx": mcpix_range,
+                    "Marginal iROAS": miroas_range,
+                    "Signal Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
+                })
+            if scenario_rows:
+                st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True)
+
+    if _is_quarterly_mode:
+        # Quarterly mode: improvement scenarios inline with simple headers
+        _render_improvement_scenarios(simple_headers=True)
+    else:
+        # Annual mode: show annual baseline + improvements inline (x4 multiplier)
+        st.subheader("Annual Projection")
+        annual_frame = pd.DataFrame([
+            {"Tier": row.tier_label,
+             "Investment": _fmt_dollar_commas(float(row.investment) * 4),
+             "Delivered": f"{float(row.delivered_volume) * 4:,.0f}",
+             "Prospects": f"{float(row.prospects) * 4:,.0f}",
+             "Inc. Cust": _range_str(
+                 float(row.incremental_customers.minimum) * 4,
+                 float(row.incremental_customers.maximum) * 4,
+                 _fmt_compact_k),
+             "Inc. Rev": _range_str(
+                 float(row.incremental_revenue.minimum) * 4,
+                 float(row.incremental_revenue.maximum) * 4,
+                 _fmt_dollar_compact_m),
+             "CPIx": _range_str(
+                 float(row.cpix.minimum), float(row.cpix.maximum), _fmt_dollar_0),
+             "iROAS": _range_str(
+                 float(row.iroas.minimum), float(row.iroas.maximum), _fmt_iroas),
+             "Marginal CPIx": _range_str(
+                 min(_marginal_cpix_values[row.tier_label]),
+                 max(_marginal_cpix_values[row.tier_label]),
+                 _fmt_dollar_0)
+                 if _marginal_cpix_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                 else "—",
+             "Marginal iROAS": _range_str(
+                 min(_marginal_iroas_values[row.tier_label]),
+                 max(_marginal_iroas_values[row.tier_label]),
+                 _fmt_iroas)
+                 if _marginal_iroas_values.get(row.tier_label) and row.tier_label != _first_tier_label
+                 else "—",
+             "% Utilization": f"{_sig_util_all.get(row.tier_label, 0):.0f}%"}
+            for row in visible_ranges
+        ])
+        st.dataframe(annual_frame, hide_index=True, use_container_width=True)
+
+        # Annual improvement scenarios
+        _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
+        for name, factor, rows in result["improvements"]:
+            st.subheader(f"+{float(factor)*100:.0f}% Improvement")
+            from collections import defaultdict as _dd_ann
+            _imp_by_tier_ann: dict[str, list] = _dd_ann(list)
+            for r in rows:
+                if visible_tier(r.tier_label, result["show_expansion"]):
+                    _imp_by_tier_ann[r.tier_label].append(r)
+            imp_rows = []
+            for tier_label, tier_rows in _imp_by_tier_ann.items():
+                rng = {r.tier_label: r for r in visible_ranges}.get(tier_label)
+                custs = [float(r.incremental_customers) * 4 for r in tier_rows]
+                revs = [float(r.incremental_revenue) * 4 for r in tier_rows]
+                cpixs = [float(r.cpix) for r in tier_rows]
+                iroass = [float(r.iroas) for r in tier_rows]
+                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix and r.marginal_cpix > 0]
+                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas and r.marginal_iroas > 0]
+                if len(tier_rows) == 1:
+                    c = custs[0]
+                    cust_range = _range_str(c * (1 - _range_adj_ann), c * (1 + _range_adj_ann), _fmt_compact_k)
+                    rv = revs[0]
+                    rev_range = _range_str(rv * (1 - _range_adj_ann), rv * (1 + _range_adj_ann), _fmt_dollar_compact_m)
+                    cx = cpixs[0]
+                    cpix_range = _range_str(cx / (1 + _range_adj_ann), cx / (1 - _range_adj_ann), _fmt_dollar_0)
+                    ir = iroass[0]
+                    iroas_range = _range_str(ir * (1 - _range_adj_ann), ir * (1 + _range_adj_ann), _fmt_iroas)
+                    mcpix_range = _range_str(mcpixs[0] / (1 + _range_adj_ann), mcpixs[0] / (1 - _range_adj_ann), _fmt_dollar_0) if mcpixs else "—"
+                    miroas_range = _range_str(miroass[0] * (1 - _range_adj_ann), miroass[0] * (1 + _range_adj_ann), _fmt_iroas) if miroass else "—"
+                else:
+                    cust_range = _range_str(min(custs), max(custs), _fmt_compact_k)
+                    rev_range = _range_str(min(revs), max(revs), _fmt_dollar_compact_m)
+                    cpix_range = _range_str(min(cpixs), max(cpixs), _fmt_dollar_0)
+                    iroas_range = _range_str(min(iroass), max(iroass), _fmt_iroas)
+                    mcpix_range = _range_str(min(mcpixs), max(mcpixs), _fmt_dollar_0) if mcpixs else "—"
+                    miroas_range = _range_str(min(miroass), max(miroass), _fmt_iroas) if miroass else "—"
+                if tier_label == _first_tier_label:
+                    mcpix_range = "—"
+                    miroas_range = "—"
+                imp_rows.append({
+                    "Tier": tier_label,
+                    "Investment": _fmt_dollar_commas(float(tier_rows[0].investment) * 4),
+                    "Delivered": f"{float(rng.delivered_volume) * 4:,.0f}" if rng else "—",
+                    "Prospects": f"{float(rng.prospects) * 4:,.0f}" if rng else "—",
+                    "Inc. Cust": cust_range,
+                    "Inc. Rev": rev_range,
+                    "CPIx": cpix_range,
+                    "iROAS": iroas_range,
+                    "Marginal CPIx": mcpix_range,
+                    "Marginal iROAS": miroas_range,
+                    "% Utilization": f"{_sig_util_all.get(tier_label, 0):.0f}%",
+                })
+            if imp_rows:
+                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
+
+        # Scenario selector for 3b/3c
+        st.markdown("---")
+        _scenario_options = ["Baseline"]
+        for name, factor, _rows in result["improvements"]:
+            _scenario_options.append(f"+{float(factor)*100:.0f}% Improvement")
+        st.session_state.setdefault("annual_scenario", "Baseline")
+        _selected_scenario = st.radio(
+            "Scenario for Quarterly & Monthly splits",
+            options=_scenario_options,
+            index=_scenario_options.index(st.session_state.get("annual_scenario", "Baseline"))
+                if st.session_state.get("annual_scenario", "Baseline") in _scenario_options else 0,
+            horizontal=True,
+            key="_widget_annual_scenario",
+            help="Select which scenario to use for the Quarterly Split and Monthly Split tabs.",
+        )
+        st.session_state.annual_scenario = _selected_scenario
+
+    workbook = build_workbook(st.session_state.source_account, st.session_state.historical_scope_label,
+        datetime.now(timezone.utc).isoformat(), visible_ranges, result["ranges"], st.session_state.selected_history)
+    safe_account = re.sub(r"[^a-z0-9]+", "-", st.session_state.source_account.lower()).strip("-") or "forecast"
+    st.download_button("Download Excel workbook", workbook, f"{safe_account}-forecast.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
     tab_nav_buttons(tab_names, 2)
 
 
 # =============================================================================
-# TAB 4: CHARTS (all tiers from Baseline to Maximum Scale)
+# TAB 3b: QUARTERLY SPLIT (annual mode only)
 # =============================================================================
-if st.session_state.forecast and active_tab == 3:
+if (st.session_state.forecast
+    and st.session_state.get("projection_mode", "Quarterly") != "Quarterly"
+    and active_tab == 3):
+    result = st.session_state.forecast
+    visible_ranges = [
+        row for row in result["ranges"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    visible_projections = [
+        row for row in result["projections"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    latest_quarter = max(
+        (row["campaign_quarter"] for row in st.session_state.selected_history),
+        key=quarter_value,
+    )
+    _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
+    from collections import defaultdict as _dd_qs
+    _marginal_cpix_values: dict[str, list[float]] = _dd_qs(list)
+    _marginal_iroas_values: dict[str, list[float]] = _dd_qs(list)
+    for row in visible_projections:
+        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+            _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
+        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+            _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
+    _sig_util_by_tier = {
+        row.tier_label: float(row.new_signal_utilization * 100)
+        for row in visible_projections
+        if row.historical_quarter == latest_quarter
+    }
+    _range_adj = st.session_state.get("range_percent_input", 10) / 100
+
+    st.header("Quarterly Split")
+    _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
+    _imp_factor_val = 0.0
+    for _name, _factor, _rows in result["improvements"]:
+        if f"+{float(_factor)*100:.0f}% Improvement" == _annual_scenario:
+            _imp_factor_val = float(_factor)
+            break
+    _imp_mult = 1 + _imp_factor_val
+    if _annual_scenario != "Baseline":
+        st.caption(f"Annual forecast ({_annual_scenario}) distributed across Q1–Q4 using seasonal indexes.")
+    else:
+        st.caption("Annual forecast distributed across Q1–Q4 using seasonal indexes.")
+
+    try:
+        session = get_session()
+        indexes = seasonal_indexes(
+            session,
+            st.session_state.selected_source,
+            attribution_window=st.session_state.get("attribution_window", 30),
+            account_name=st.session_state.get("source_account"),
+            sub_account=st.session_state.get("selected_sub_account"),
+            event=st.session_state.get("selected_event"),
+            channel=st.session_state.get("selected_channel"),
+        )
+        for q_num in range(1, 5):
+            q_key = f"Q{q_num}"
+            o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
+            i_pct = indexes["quarterly_incremental"].get(q_key, 0.25)
+            st.subheader(f"Qtr{q_num}")
+            qtr_rows = []
+            for r in visible_ranges:
+                label = r.tier_label
+                inv = float(r.investment) * 4 * o_pct
+                delivered = float(r.delivered_volume) * 4 * o_pct
+                prospects = float(r.prospects) * 4 * o_pct
+                cust_min = float(r.incremental_customers.minimum) * 4 * i_pct * _imp_mult
+                cust_max = float(r.incremental_customers.maximum) * 4 * i_pct * _imp_mult
+                rev_min = float(r.incremental_revenue.minimum) * 4 * i_pct * _imp_mult
+                rev_max = float(r.incremental_revenue.maximum) * 4 * i_pct * _imp_mult
+                cpix_min = inv / cust_max if cust_max > 0 else 0
+                cpix_max = inv / cust_min if cust_min > 0 else 0
+                iroas_min = rev_min / inv if inv > 0 else 0
+                iroas_max = rev_max / inv if inv > 0 else 0
+                qtr_rows.append({
+                    "Tiers": label,
+                    "Investment": _fmt_dollar_commas(inv),
+                    "Delivered": f"{delivered:,.0f}",
+                    "Prospects": f"{prospects:,.0f}",
+                    "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
+                    "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
+                    "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
+                    "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
+                    "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
+                })
+            st.dataframe(pd.DataFrame(qtr_rows), hide_index=True, use_container_width=True)
+    except Exception as exc:
+        st.warning(f"Could not compute quarterly split: {exc}")
+
+    tab_nav_buttons(tab_names, 3)
+
+
+# =============================================================================
+# TAB 3c: MONTHLY SPLIT (annual mode only)
+# =============================================================================
+if (st.session_state.forecast
+    and st.session_state.get("projection_mode", "Quarterly") != "Quarterly"
+    and active_tab == 4):
+    result = st.session_state.forecast
+    visible_ranges = [
+        row for row in result["ranges"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    visible_projections = [
+        row for row in result["projections"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    latest_quarter = max(
+        (row["campaign_quarter"] for row in st.session_state.selected_history),
+        key=quarter_value,
+    )
+    _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
+    from collections import defaultdict as _dd_ms2
+    _marginal_cpix_values: dict[str, list[float]] = _dd_ms2(list)
+    _marginal_iroas_values: dict[str, list[float]] = _dd_ms2(list)
+    for row in visible_projections:
+        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+            _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
+        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+            _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
+    _sig_util_by_tier = {
+        row.tier_label: float(row.new_signal_utilization * 100)
+        for row in visible_projections
+        if row.historical_quarter == latest_quarter
+    }
+    _range_adj = st.session_state.get("range_percent_input", 10) / 100
+
+    QUARTER_MONTHS_MAP = {
+        1: ["Jan", "Feb", "Mar"],
+        2: ["Apr", "May", "Jun"],
+        3: ["Jul", "Aug", "Sep"],
+        4: ["Oct", "Nov", "Dec"],
+    }
+
+    st.header("Monthly Split")
+    _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
+    _imp_factor_val = 0.0
+    for _name, _factor, _rows in result["improvements"]:
+        if f"+{float(_factor)*100:.0f}% Improvement" == _annual_scenario:
+            _imp_factor_val = float(_factor)
+            break
+    _imp_mult = 1 + _imp_factor_val
+    if _annual_scenario != "Baseline":
+        st.caption(f"Annual forecast ({_annual_scenario}) distributed across all 12 months using seasonal indexes.")
+    else:
+        st.caption("Annual forecast distributed across all 12 months using seasonal indexes.")
+
+    try:
+        session = get_session()
+        indexes = seasonal_indexes(
+            session,
+            st.session_state.selected_source,
+            attribution_window=st.session_state.get("attribution_window", 30),
+            account_name=st.session_state.get("source_account"),
+            sub_account=st.session_state.get("selected_sub_account"),
+            event=st.session_state.get("selected_event"),
+            channel=st.session_state.get("selected_channel"),
+        )
+
+        for q_num in range(1, 5):
+            months = QUARTER_MONTHS_MAP[q_num]
+            org_sum = sum(indexes["monthly_organic"].get(m, 1/12) for m in months)
+            inc_sum = sum(indexes["monthly_incremental"].get(m, 1/12) for m in months)
+            q_key = f"Q{q_num}"
+            q_org = indexes["quarterly_organic"].get(q_key, 0.25)
+            q_inc = indexes["quarterly_incremental"].get(q_key, 0.25)
+
+            for month in months:
+                org_pct = q_org * (indexes["monthly_organic"].get(month, 1/12) / org_sum) if org_sum else q_org / 3
+                inc_pct = q_inc * (indexes["monthly_incremental"].get(month, 1/12) / inc_sum) if inc_sum else q_inc / 3
+
+                st.subheader(f"{month}")
+                month_rows = []
+                for r in visible_ranges:
+                    label = r.tier_label
+                    inv = float(r.investment) * 4 * org_pct
+                    delivered = float(r.delivered_volume) * 4 * org_pct
+                    prospects = float(r.prospects) * 4 * org_pct
+                    cust_min = float(r.incremental_customers.minimum) * 4 * inc_pct * _imp_mult
+                    cust_max = float(r.incremental_customers.maximum) * 4 * inc_pct * _imp_mult
+                    rev_min = float(r.incremental_revenue.minimum) * 4 * inc_pct * _imp_mult
+                    rev_max = float(r.incremental_revenue.maximum) * 4 * inc_pct * _imp_mult
+                    cpix_min = inv / cust_max if cust_max > 0 else 0
+                    cpix_max = inv / cust_min if cust_min > 0 else 0
+                    iroas_min = rev_min / inv if inv > 0 else 0
+                    iroas_max = rev_max / inv if inv > 0 else 0
+                    month_rows.append({
+                        "Tiers": label,
+                        "Investment": _fmt_dollar_commas(inv),
+                        "Delivered": f"{delivered:,.0f}",
+                        "Prospects": f"{prospects:,.0f}",
+                        "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
+                        "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
+                        "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
+                        "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
+                        "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
+                    })
+                st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True)
+
+    except Exception as exc:
+        st.warning(f"Could not compute monthly split: {exc}")
+
+    tab_nav_buttons(tab_names, 4)
+
+
+# =============================================================================
+# TAB 3b: QUARTERLY MONTHLY SPLIT (only in quarterly mode)
+# =============================================================================
+if (st.session_state.forecast
+    and st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
+    and active_tab == 3):
+    result = st.session_state.forecast
+    visible_ranges = [
+        row for row in result["ranges"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    visible_projections = [
+        row for row in result["projections"]
+        if visible_tier(row.tier_label, result["show_expansion"])
+    ]
+    latest_quarter = max(
+        (row["campaign_quarter"] for row in st.session_state.selected_history),
+        key=quarter_value,
+    )
+    _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
+
+    # Marginal values
+    from collections import defaultdict as _dd_ms
+    _marginal_cpix_values: dict[str, list[float]] = _dd_ms(list)
+    _marginal_iroas_values: dict[str, list[float]] = _dd_ms(list)
+    for row in visible_projections:
+        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+            _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
+        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+            _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
+
+    # Signal utilization
+    _sig_util_by_tier = {
+        row.tier_label: float(row.new_signal_utilization * 100)
+        for row in visible_projections
+        if row.historical_quarter == latest_quarter
+    }
+
+    # Determine projection quarter months
+    _proj_q = st.session_state.get("projection_quarter", "")
+    import re as _re_ms
+    _pq_match = _re_ms.match(r"Q(\d)\s+(\d{4})", _proj_q)
+    if _pq_match:
+        _pq_num = int(_pq_match.group(1))
+    else:
+        _pq_num = 1
+    QUARTER_MONTHS_MAP = {
+        1: ["Jan", "Feb", "Mar"],
+        2: ["Apr", "May", "Jun"],
+        3: ["Jul", "Aug", "Sep"],
+        4: ["Oct", "Nov", "Dec"],
+    }
+    _proj_months = QUARTER_MONTHS_MAP[_pq_num]
+
+    st.header(f"Quarterly Monthly Split: {_proj_q}")
+    st.caption("Quarterly forecast distributed across the 3 months using seasonal indexes.")
+
+    try:
+        session = get_session()
+        indexes = seasonal_indexes(
+            session,
+            st.session_state.selected_source,
+            attribution_window=st.session_state.get("attribution_window", 30),
+            account_name=st.session_state.get("source_account"),
+            sub_account=st.session_state.get("selected_sub_account"),
+            event=st.session_state.get("selected_event"),
+            channel=st.session_state.get("selected_channel"),
+        )
+
+        # Compute monthly proportions within this quarter
+        org_sum = sum(indexes["monthly_organic"].get(m, 1/12) for m in _proj_months)
+        inc_sum = sum(indexes["monthly_incremental"].get(m, 1/12) for m in _proj_months)
+
+        _range_adj = st.session_state.get("range_percent_input", 10) / 100
+
+        for month in _proj_months:
+            org_pct = indexes["monthly_organic"].get(month, 1/12) / org_sum if org_sum else 1/3
+            inc_pct = indexes["monthly_incremental"].get(month, 1/12) / inc_sum if inc_sum else 1/3
+
+            st.subheader(f"{month} (Organic: {org_pct*100:.1f}%, Incremental: {inc_pct*100:.1f}%)")
+
+            month_rows = []
+            for r in visible_ranges:
+                label = r.tier_label
+                inv = float(r.investment) * org_pct
+                delivered = float(r.delivered_volume) * org_pct
+                prospects = float(r.prospects) * org_pct
+
+                cust_min = float(r.incremental_customers.minimum) * inc_pct
+                cust_max = float(r.incremental_customers.maximum) * inc_pct
+                rev_min = float(r.incremental_revenue.minimum) * inc_pct
+                rev_max = float(r.incremental_revenue.maximum) * inc_pct
+
+                cpix_min = inv / cust_max if cust_max > 0 else 0
+                cpix_max = inv / cust_min if cust_min > 0 else 0
+                iroas_min = rev_min / inv if inv > 0 else 0
+                iroas_max = rev_max / inv if inv > 0 else 0
+
+                mcpix_str = "—"
+                miroas_str = "—"
+                if label != _first_tier_label:
+                    if _marginal_cpix_values.get(label):
+                        mc_vals = _marginal_cpix_values[label]
+                        if len(mc_vals) == 1:
+                            mcpix_str = _range_str(mc_vals[0] / (1 + _range_adj), mc_vals[0] / (1 - _range_adj), _fmt_dollar_0)
+                        else:
+                            mcpix_str = _range_str(min(mc_vals), max(mc_vals), _fmt_dollar_0)
+                    if _marginal_iroas_values.get(label):
+                        mi_vals = _marginal_iroas_values[label]
+                        if len(mi_vals) == 1:
+                            miroas_str = _range_str(mi_vals[0] * (1 - _range_adj), mi_vals[0] * (1 + _range_adj), _fmt_iroas)
+                        else:
+                            miroas_str = _range_str(min(mi_vals), max(mi_vals), _fmt_iroas)
+
+                month_rows.append({
+                    "Tiers": label,
+                    "Investment": _fmt_dollar_commas(inv),
+                    "Delivered": f"{delivered:,.0f}",
+                    "Prospects": f"{prospects:,.0f}",
+                    "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
+                    "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
+                    "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
+                    "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
+                    "Marginal CPIx": mcpix_str,
+                    "Marginal iROAS": miroas_str,
+                    "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
+                })
+
+            st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True)
+
+    except Exception as exc:
+        st.warning(f"Could not compute monthly split: {exc}")
+
+    tab_nav_buttons(tab_names, 3)
+
+
+# =============================================================================
+# CHARTS TAB (all tiers from Baseline to Maximum Scale)
+# =============================================================================
+if st.session_state.forecast and active_tab == _charts_tab_idx:
     result = st.session_state.forecast
     # Use ALL tiers (standard + expansion) for charts
     all_ranges = sorted(result["ranges"], key=lambda r: float(r.investment))
@@ -2114,18 +2783,24 @@ if st.session_state.forecast and active_tab == 3:
 
     # --- Chart 1: CPIx across all tiers ---
     st.subheader("CPIx by Investment Tier")
+    _x_axis = alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=-25, labelAlign="right", labelLimit=200, labelOverlap=False))
+    # Vertical gridlines for line charts
+    _v_rules = alt.Chart(chart_df).mark_rule(color="#e0e0e0", strokeWidth=1).encode(
+        x=_x_axis,
+    )
+
     cpix_band = alt.Chart(chart_df).mark_area(opacity=0.25, color="#00d4aa").encode(
-        x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("CPIx Min:Q", title="CPIx ($)"),
+        x=_x_axis,
+        y=alt.Y("CPIx Min:Q", title="CPIx", axis=alt.Axis(format="$~s")),
         y2="CPIx Max:Q",
     )
     cpix_line = alt.Chart(chart_df).mark_line(point=True, color="#00d4aa", strokeWidth=2.5).encode(
-        x=alt.X("Tier:N", sort=tier_order, axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
-        y=alt.Y("CPIx Midpoint:Q", title="CPIx ($)"),
+        x=_x_axis,
+        y=alt.Y("CPIx Midpoint:Q", title="CPIx", axis=alt.Axis(format="$~s")),
         tooltip=["Tier", "CPIx Min", "CPIx Midpoint", "CPIx Max", "Investment"],
     )
     st.altair_chart(
-        (cpix_band + cpix_line).properties(title="CPIx increases as investment exceeds Sustainable Scale", height=380),
+        (_v_rules + cpix_band + cpix_line).properties(title="CPIx increases as investment exceeds Sustainable Scale", height=380),
         use_container_width=True,
     )
 
@@ -2135,16 +2810,17 @@ if st.session_state.forecast and active_tab == 3:
     st.subheader("iROAS by Investment Tier")
     iroas_band = alt.Chart(chart_df).mark_area(opacity=0.25, color="#4da6ff").encode(
         x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
+        x=_x_axis,
         y=alt.Y("iROAS Min:Q", title="iROAS"),
         y2="iROAS Max:Q",
     )
     iroas_line = alt.Chart(chart_df).mark_line(point=True, color="#4da6ff", strokeWidth=2.5).encode(
-        x=alt.X("Tier:N", sort=tier_order, axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
+        x=_x_axis,
         y=alt.Y("iROAS Midpoint:Q", title="iROAS"),
         tooltip=["Tier", "iROAS Min", "iROAS Midpoint", "iROAS Max", "Investment"],
     )
     st.altair_chart(
-        (iroas_band + iroas_line).properties(title="iROAS declines with diminishing returns at higher investment", height=380),
+        (_v_rules + iroas_band + iroas_line).properties(title="iROAS declines with diminishing returns at higher investment", height=380),
         use_container_width=True,
     )
 
@@ -2160,10 +2836,17 @@ if st.session_state.forecast and active_tab == 3:
     cust_line = alt.Chart(chart_df).mark_line(point=True, color="#10b981", strokeWidth=2.5).encode(
         x=alt.X("Tier:N", sort=tier_order, axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
         y=alt.Y("Customers Midpoint:Q", title="Incremental Customers"),
+        x=_x_axis,
+        y=alt.Y("Customers Min:Q", title="Incremental Customers", axis=alt.Axis(format="~s")),
+        y2="Customers Max:Q",
+    )
+    cust_line = alt.Chart(chart_df).mark_line(point=True, color="#10b981", strokeWidth=2.5).encode(
+        x=_x_axis,
+        y=alt.Y("Customers Midpoint:Q", title="Incremental Customers", axis=alt.Axis(format="~s")),
         tooltip=["Tier", "Customers Min", "Customers Midpoint", "Customers Max", "Investment"],
     )
     st.altair_chart(
-        (cust_band + cust_line).properties(title="Customer growth flattens beyond Sustainable Scale (decay curve effect)", height=380),
+        (_v_rules + cust_band + cust_line).properties(title="Customer growth flattens beyond Sustainable Scale (decay curve effect)", height=380),
         use_container_width=True,
     )
 
@@ -2182,7 +2865,7 @@ if st.session_state.forecast and active_tab == 3:
         tooltip=["Tier", "Revenue Min", "Revenue Midpoint", "Revenue Max", alt.Tooltip("Investment:Q", format="$,.0f")],
     )
     st.altair_chart(
-        (rev_band + rev_line).properties(title="Revenue growth mirrors customer decay at higher tiers", height=380),
+        (_v_rules + rev_band + rev_line).properties(title="Revenue growth mirrors customer decay at higher tiers", height=380),
         use_container_width=True,
     )
 
@@ -2194,6 +2877,8 @@ if st.session_state.forecast and active_tab == 3:
     vol_chart = alt.Chart(chart_df).mark_bar(color="#06b6d4", opacity=0.8).encode(
         x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
         y=alt.Y("Delivered:Q", title="Delivered Volume"),
+        x=_x_axis,
+        y=alt.Y("Delivered:Q", title="Delivered Volume", axis=alt.Axis(format="~s")),
         tooltip=["Tier", alt.Tooltip("Delivered:Q", format=",.0f"), alt.Tooltip("Investment:Q", format="$,.0f")],
     ).properties(title="Delivered Volume (scales linearly with investment)", height=350)
     vol_col.altair_chart(vol_chart, use_container_width=True)
@@ -2201,6 +2886,8 @@ if st.session_state.forecast and active_tab == 3:
     pros_chart = alt.Chart(chart_df).mark_bar(color="#f59e0b", opacity=0.8).encode(
         x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
         y=alt.Y("Prospects:Q", title="Prospects"),
+        x=_x_axis,
+        y=alt.Y("Prospects:Q", title="Prospects", axis=alt.Axis(format="~s")),
         tooltip=["Tier", alt.Tooltip("Prospects:Q", format=",.0f"), alt.Tooltip("Investment:Q", format="$,.0f")],
     ).properties(title="Prospects (scales linearly — not curve-affected)", height=350)
     pros_col.altair_chart(pros_chart, use_container_width=True)
@@ -2217,6 +2904,8 @@ if st.session_state.forecast and active_tab == 3:
     ).encode(
         x=alt.X("Tier:N", sort=tier_order, title="Tier", axis=alt.Axis(labelAngle=0, labelLimit=140, labelOverlap=False)),
         y=alt.Y("Investment:Q", title="Investment ($)"),
+        x=_x_axis,
+        y=alt.Y("Investment:Q", title="Investment", axis=alt.Axis(format="$~s")),
         color=alt.Color("Tier Type:N", scale=alt.Scale(
             domain=["Standard", "Extension"], range=["#3b82f6", "#f97316"]
         ), title="Type"),
