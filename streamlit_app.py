@@ -4,9 +4,6 @@
 from __future__ import annotations
 
 import re
-from io import BytesIO
-from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -38,37 +35,6 @@ from forecast_core import (
     monthly_projections,
 )
 from planning_source import planning_input, planning_quarters, PLANNING_INPUT_TABLE
-from workbook_export import build_workbook
-
-
-SOURCE_PACKAGE_FILES = (
-    "streamlit_app.py", "data_access.py", "forecast_core.py",
-    "workbook_export.py", "planning_source.py",
-    "signal_utilization_curve.json",
-    "pyproject.toml", "snowflake.yml", ".streamlit/config.toml",
-)
-
-
-def build_v3_source_zip() -> bytes:
-    """Package the deployable V3 source for teammate testing."""
-    root = Path(__file__).resolve().parent
-    result = BytesIO()
-    with ZipFile(result, "w", ZIP_DEFLATED) as archive:
-        for relative_name in SOURCE_PACKAGE_FILES:
-            source_file = root / relative_name
-            if source_file.is_file():
-                archive.write(
-                    source_file,
-                    arcname=f"forecastpro_snowflake_q2fix_v3/{relative_name}",
-                )
-        archive.writestr(
-            "forecastpro_snowflake_q2fix_v3/README.txt",
-            "ForecastPro Snowflake Q2 Fix V3\n\n"
-            "Upload this folder to a Snowflake Workspace and run streamlit_app.py.\n"
-            "Historical data requires the active Snowflake role to access "
-            "ZX.ANALYTICS.ZX_ATTRIBUTION_CUMULATIVE_WEEKLY_PERFORMANCE.\n",
-        )
-    return result.getvalue()
 
 
 st.set_page_config(page_title="ForecastPro AI", page_icon="📈", layout="wide")
@@ -655,16 +621,26 @@ def render_mailops_editor(session) -> None:
     with row1[1]:
         _mo_channel = st.selectbox("Marketing Channel", _mo_channels or ["(none)"], key="_mo_channel")
 
-    # Quarters come from the planning table for this account/sub/channel combo
+    # Quarters come from the planning table AND test table for this account/sub/channel combo
+    _MAILOPS_TEST_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS_TEST"
+    _mo_filter_params = [_mo_account, _mo_sub if _mo_sub != "(none)" else "", _mo_channel if _mo_channel != "(none)" else ""]
     _mo_quarters = sorted({
         str(r["QUARTER"]).strip()
         for r in session.sql(
-            f"""SELECT DISTINCT QUARTER FROM {PLANNING_INPUT_TABLE}
-                WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
-                  AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
-                  AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
-                  AND QUARTER IS NOT NULL""",
-            params=[_mo_account, _mo_sub if _mo_sub != "(none)" else "", _mo_channel if _mo_channel != "(none)" else ""],
+            f"""SELECT DISTINCT QUARTER FROM (
+                    SELECT QUARTER FROM {PLANNING_INPUT_TABLE}
+                    WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
+                      AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
+                      AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
+                      AND QUARTER IS NOT NULL
+                    UNION
+                    SELECT QUARTER FROM {_MAILOPS_TEST_TABLE}
+                    WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
+                      AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
+                      AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
+                      AND QUARTER IS NOT NULL
+                )""",
+            params=_mo_filter_params + _mo_filter_params,
         ).collect()
         if r["QUARTER"]
     })
@@ -709,7 +685,7 @@ def render_mailops_editor(session) -> None:
         st.info("Complete the filters above to load an existing row.")
         return
 
-    # --- Load the reference row from the planning table ---
+    # --- Load the reference row: TEST table first, then planning table fallback ---
     _ZERO_COLS = {"CAMPAIGN_BUDGET", "CPM", "IMPRESSIONS", "PLANNED_CAMPAIGN_REACH",
                   "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "SIGNAL_UTILIZATION", "FREQUENCY"}
     _EMPTY_ROW = {
@@ -720,6 +696,7 @@ def render_mailops_editor(session) -> None:
         "CAMPAIGN_BUDGET": 0.0, "KPI_GOAL": "", "KPI_TYPE": "", "KPI_TARGET_VALUE": 0.0,
         "CPM": 0.0, "IMPRESSIONS": 0.0, "PLANNED_CAMPAIGN_REACH": 0.0,
         "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE": 0.0, "SIGNAL_UTILIZATION": 0.0, "FREQUENCY": 0.0,
+        "SUBMITTED_BY": "",
     }
 
     if _is_new_quarter and _mo_quarters_sorted:
@@ -729,8 +706,30 @@ def render_mailops_editor(session) -> None:
     else:
         _ref_quarter = None
 
-    if _ref_quarter:
-        _mo_rows = session.sql(
+    _mo_row = None
+    _has_planning_row = False
+    _source_table = ""
+
+    # For non-new quarters, check the test table first
+    if _ref_quarter and not _is_new_quarter:
+        _test_rows = session.sql(
+            f"""SELECT * FROM {_MAILOPS_TEST_TABLE}
+                WHERE UPPER(TRIM(QUARTER))=UPPER(TRIM(?))
+                  AND UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
+                  AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
+                  AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
+                ORDER BY UPDATED_AT DESC NULLS LAST
+                LIMIT 1""",
+            params=[_ref_quarter, _mo_account, _mo_sub, _mo_channel],
+        ).collect()
+        if _test_rows:
+            _mo_row = _test_rows[0].as_dict()
+            _has_planning_row = True
+            _source_table = "test"
+
+    # Fall back to planning table
+    if _mo_row is None and _ref_quarter:
+        _plan_rows = session.sql(
             f"""SELECT * FROM {PLANNING_INPUT_TABLE}
                 WHERE UPPER(TRIM(QUARTER))=UPPER(TRIM(?))
                   AND UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
@@ -738,20 +737,18 @@ def render_mailops_editor(session) -> None:
                   AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))""",
             params=[_ref_quarter, _mo_account, _mo_sub, _mo_channel],
         ).collect()
-    else:
-        _mo_rows = []
+        if _plan_rows:
+            _mo_row = _plan_rows[0].as_dict()
+            if _is_new_quarter:
+                _mo_row["QUARTER"] = _mo_quarter_clean
+                for c in _ZERO_COLS:
+                    _mo_row[c] = 0.0
+            else:
+                _has_planning_row = True
+            _source_table = "planning"
 
-    if _mo_rows:
-        _mo_row = _mo_rows[0]
-        if _is_new_quarter:
-            _mo_row = _mo_row.as_dict()
-            _mo_row["QUARTER"] = _mo_quarter_clean
-            for c in _ZERO_COLS:
-                _mo_row[c] = 0.0
-        _has_planning_row = not _is_new_quarter
-    else:
+    if _mo_row is None:
         _mo_row = _EMPTY_ROW
-        _has_planning_row = False
     _ALL_COLS = [
         "QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL",
         "CAMPAIGN_BUDGET", "KPI_TYPE", "KPI_TARGET_VALUE",
@@ -798,6 +795,10 @@ def render_mailops_editor(session) -> None:
         st.caption("This client/campaign/channel combination has no planning data yet. Fill in the values below.")
     else:
         st.subheader("Current row — edit values below")
+        _submitted = _mo_row.get("SUBMITTED_BY", "") or ""
+        _updated = _mo_row.get("UPDATED_AT", "") or ""
+        if _submitted:
+            st.caption(f"Last saved by **{_submitted}**" + (f" at {_updated} UTC" if _updated else ""))
     _edited1 = st.data_editor(
         _df1,
         hide_index=True,
@@ -824,27 +825,27 @@ def render_mailops_editor(session) -> None:
         },
     )
 
-    _MAILOPS_TEST_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS_TEST"
     if st.button("Save as New Row", type="primary", key="_mo_save"):
         try:
             new1 = _edited1.iloc[0]
             new2 = _edited2.iloc[0]
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
             session.sql(
                 f"""INSERT INTO {_MAILOPS_TEST_TABLE}
                     (QUARTER, ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL,
                      CAMPAIGN_BUDGET, KPI_GOAL, KPI_TYPE, KPI_TARGET_VALUE,
                      CPM, IMPRESSIONS, PLANNED_CAMPAIGN_REACH,
                      MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE, SIGNAL_UTILIZATION, FREQUENCY,
-                     UPDATED_AT)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     UPDATED_AT, SUBMITTED_BY)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 params=[
                     str(new1["Quarter"]),
                     str(new1["Client Name"]),
                     str(new1["Campaign Name"]),
                     str(new1["Marketing Channel"]),
                     float(new1["Budget"]),
-                    str(_mo_row["KPI_GOAL"]) if _mo_row["KPI_GOAL"] is not None else "",
+                    str(_mo_row.get("KPI_GOAL", "") or ""),
                     str(new1["KPI Type"]),
                     float(new1["KPI Target"]),
                     float(new2["CPM"]),
@@ -854,11 +855,13 @@ def render_mailops_editor(session) -> None:
                     float(new2["Signal Util."]),
                     float(new2["Frequency"]),
                     now_utc,
+                    _current_user,
                 ],
             ).collect()
-            st.success(f"New row inserted into {_MAILOPS_TEST_TABLE} at {now_utc} UTC.")
+            st.success(f"Row saved by {_current_user} at {now_utc} UTC.")
+            st.rerun()
         except Exception as exc:
-            st.error(f"Insert failed: {exc}")
+            st.error(f"Save failed: {exc}")
 
 
 
@@ -1171,6 +1174,16 @@ def next_quarter(label: str) -> str:
     return f"Q1 {year + 1}" if quarter == 4 else f"Q{quarter + 1} {year}"
 
 
+def rolling_quarters(start_label: str) -> list[str]:
+    """Return 4 quarter labels starting from start_label (e.g. Q3 2026 -> Q3 2026, Q4 2026, Q1 2027, Q2 2027)."""
+    labels = [start_label]
+    cur = start_label
+    for _ in range(3):
+        cur = next_quarter(cur)
+        labels.append(cur)
+    return labels
+
+
 def visible_tier(label: str, show_expansion: bool) -> bool:
     if label.startswith("Extended Scale"):
         return False
@@ -1178,6 +1191,446 @@ def visible_tier(label: str, show_expansion: bool) -> bool:
         label.startswith("Incremental Reach")
         or label.startswith("Maximum Scale")
     )
+
+
+def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes]] | None = None) -> None:
+    """Build xlsx inline and render download button."""
+    import io as _io
+    import zipfile as _zf
+    from xml.sax.saxutils import escape as _esc
+    from collections import defaultdict as _dd
+
+    result = st.session_state.get("forecast")
+    if not result:
+        return
+    vis_ranges = [r for r in result["ranges"] if visible_tier(r.tier_label, result["show_expansion"])]
+    history = st.session_state.selected_history
+    improvements = result["improvements"]
+    indexes = st.session_state.get("_cached_indexes")
+    proj_mode = st.session_state.get("projection_mode", "Quarterly")
+    proj_quarter = st.session_state.get("projection_quarter", "")
+    account = st.session_state.source_account
+    first_tier = vis_ranges[0].tier_label if vis_ranges else ""
+    sig_util = st.session_state.get("_cached_sig_util", {})
+
+    def fmoney(v): return f"${v:,.0f}"
+    def fint(v): return f"{v:,.0f}"
+    def firoas(v): return f"${v:,.2f}"
+    def fk(v):
+        a = abs(v)
+        if a >= 1e6: return f"{v/1e6:.1f}M"
+        if a >= 1e3: return f"{v/1e3:.1f}K"
+        return f"{v:.0f}"
+    def fdk(v):
+        a = abs(v)
+        if a >= 1e6: return f"${v/1e6:.1f}M"
+        if a >= 1e3: return f"${v/1e3:.1f}K"
+        return f"${v:.0f}"
+    def rng(lo, hi, fmt):
+        if abs(lo - hi) < 0.005: return fmt(lo)
+        return f"{fmt(lo)} - {fmt(hi)}"
+
+    # --- Build sheets as list-of-lists (header + data rows) ---
+    sheets = {}
+
+    # Tab 1: Historical KPIs
+    h_header = ["Quarter", "Delivered", "Spend", "Avg Frequency", "Prospects",
+                "Inc Customers", "Inc Revenue", "Avg Inc Rev", "CPIx", "iROAS"]
+    h_rows = [h_header]
+    for r in history:
+        h_rows.append([r["campaign_quarter"], fint(float(r["delivered_volume"])),
+            fmoney(float(r["source_spend"])), f"{float(r['frequency']):.1f}",
+            fint(float(r["prospects"])), fint(float(r["incremental_customers"])),
+            fmoney(float(r["incremental_revenue"])), fmoney(float(r["average_incremental_revenue"])),
+            fmoney(float(r["cpix"])), firoas(float(r["iroas"]))])
+    if history:
+        n = len(history)
+        av = lambda f: sum(float(x[f]) for x in history) / n
+        h_rows.append(["Average", fint(av("delivered_volume")), fmoney(av("source_spend")),
+            f"{av('frequency'):.1f}", fint(av("prospects")), fint(av("incremental_customers")),
+            fmoney(av("incremental_revenue")), fmoney(av("average_incremental_revenue")),
+            fmoney(av("cpix")), firoas(av("iroas"))])
+    sheets["Historical KPIs"] = h_rows
+
+    # Tab 2: Forecast (matches 3a UI exactly)
+    f_header = ["Tier", "Investment Tier", "Delivered Volume", "# of Prospects",
+                "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS",
+                "Marginal CPIx", "Marginal iROAS", "Signal Utilization"]
+    nc = len(f_header)
+    is_annual = proj_mode != "Quarterly"
+    mult = 4 if is_annual else 1
+    label = "Annual" if is_annual else proj_quarter
+    forecast_sheet_name = "Annual Forecast" if is_annual else "Quarterly Forecast"
+    f_rows = [f_header]
+    f_rows.append([f"Baseline ({label})"] + [""] * (nc - 1))
+    for r in vis_ranges:
+        f_rows.append([
+            r.tier_label, fmoney(float(r.investment) * mult), fint(float(r.delivered_volume) * mult),
+            fint(float(r.prospects) * mult),
+            rng(float(r.incremental_customers.minimum) * mult, float(r.incremental_customers.maximum) * mult, fk),
+            rng(float(r.incremental_revenue.minimum) * mult, float(r.incremental_revenue.maximum) * mult, fdk),
+            rng(float(r.cpix.minimum), float(r.cpix.maximum), fmoney),
+            rng(float(r.iroas.minimum), float(r.iroas.maximum), firoas),
+            "", "", f"{sig_util.get(r.tier_label, 0):.1f}%"])
+    for name, factor, imp_rows in improvements:
+        f_rows.append([""] * nc)
+        f_rows.append([f"+{float(factor)*100:.0f}% Improvement ({name})"] + [""] * (nc - 1))
+        by_tier = _dd(list)
+        for ir in imp_rows:
+            by_tier[ir.tier_label].append(ir)
+        range_map = {r.tier_label: r for r in vis_ranges}
+        ra = 0.10
+        for tl, trows in by_tier.items():
+            rr = range_map.get(tl)
+            cs = [float(x.incremental_customers) for x in trows]
+            rs = [float(x.incremental_revenue) for x in trows]
+            cxs = [float(x.cpix) for x in trows]
+            irs = [float(x.iroas) for x in trows]
+            mcs = [float(x.marginal_cpix) for x in trows if x.marginal_cpix and x.marginal_cpix > 0]
+            mis = [float(x.marginal_iroas) for x in trows if x.marginal_iroas and x.marginal_iroas > 0]
+            if len(trows) == 1:
+                cr = rng(cs[0]*(1-ra), cs[0]*(1+ra), fk)
+                rvr = rng(rs[0]*(1-ra), rs[0]*(1+ra), fdk)
+                cxr = rng(cxs[0]/(1+ra), cxs[0]/(1-ra), fmoney)
+                irr = rng(irs[0]*(1-ra), irs[0]*(1+ra), firoas)
+                mcr = rng(mcs[0]/(1+ra), mcs[0]/(1-ra), fmoney) if mcs else "—"
+                mir = rng(mis[0]*(1-ra), mis[0]*(1+ra), firoas) if mis else "—"
+            else:
+                cr = rng(min(cs), max(cs), fk)
+                rvr = rng(min(rs), max(rs), fdk)
+                cxr = rng(min(cxs), max(cxs), fmoney)
+                irr = rng(min(irs), max(irs), firoas)
+                mcr = rng(min(mcs), max(mcs), fmoney) if mcs else "—"
+                mir = rng(min(mis), max(mis), firoas) if mis else "—"
+            if tl == first_tier:
+                mcr = "—"; mir = "—"
+            f_rows.append([tl, fmoney(float(trows[0].investment)),
+                fint(float(rr.delivered_volume)) if rr else "—",
+                fint(float(rr.prospects)) if rr else "—",
+                cr, rvr, cxr, irr, mcr, mir, f"{sig_util.get(tl, 0):.1f}%"])
+    sheets[forecast_sheet_name] = f_rows
+
+    # Tab 3+: Splits
+    QM = {1: ["Jan","Feb","Mar"], 2: ["Apr","May","Jun"], 3: ["Jul","Aug","Sep"], 4: ["Oct","Nov","Dec"]}
+    sp_header = ["Tier", "Investment", "Delivered", "Prospects", "Inc. Customers",
+                 "Inc. Revenue", "CPIx", "iROAS"]
+    snc = len(sp_header)
+
+    def split_rows(vr, op, ip, im=1.0, fac=4):
+        out = []
+        for r in vr:
+            inv = float(r.investment) * fac * op
+            cmn = float(r.incremental_customers.minimum) * fac * ip * im
+            cmx = float(r.incremental_customers.maximum) * fac * ip * im
+            rmn = float(r.incremental_revenue.minimum) * fac * ip * im
+            rmx = float(r.incremental_revenue.maximum) * fac * ip * im
+            out.append([r.tier_label, fmoney(inv),
+                fint(float(r.delivered_volume) * fac * op), fint(float(r.prospects) * fac * op),
+                rng(cmn, cmx, fk), rng(rmn, rmx, fdk),
+                rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fmoney),
+                rng(rmn/inv if inv > 0 else 0, rmx/inv if inv > 0 else 0, firoas)])
+        return out
+
+    def split_vals(vr, op, ip, im=1.0, fac=4):
+        """Like split_rows but returns only the 7 data columns (no tier label)."""
+        out = []
+        for r in vr:
+            inv = float(r.investment) * fac * op
+            cmn = float(r.incremental_customers.minimum) * fac * ip * im
+            cmx = float(r.incremental_customers.maximum) * fac * ip * im
+            rmn = float(r.incremental_revenue.minimum) * fac * ip * im
+            rmx = float(r.incremental_revenue.maximum) * fac * ip * im
+            out.append([fmoney(inv),
+                fint(float(r.delivered_volume) * fac * op), fint(float(r.prospects) * fac * op),
+                rng(cmn, cmx, fk), rng(rmn, rmx, fdk),
+                rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fmoney),
+                rng(rmn/inv if inv > 0 else 0, rmx/inv if inv > 0 else 0, firoas)])
+        return out
+
+    _data_cols = ["Investment", "Delivered", "Prospects", "Inc. Customers",
+                  "Inc. Revenue", "CPIx", "iROAS"]
+
+    if indexes and vis_ranges:
+        if proj_mode == "Quarterly":
+            import re as _re_sp
+            _m = _re_sp.match(r"Q(\d)\s+(\d{4})", proj_quarter)
+            qn = int(_m.group(1)) if _m else 1
+            months = QM[qn]
+            osum = sum(indexes["monthly_organic"].get(m, 1/12) for m in months)
+            isum = sum(indexes["monthly_incremental"].get(m, 1/12) for m in months)
+            ms_rows = [sp_header]
+            for mo in months:
+                op = indexes["monthly_organic"].get(mo, 1/12) / osum if osum else 1/3
+                ip = indexes["monthly_incremental"].get(mo, 1/12) / isum if isum else 1/3
+                ms_rows.append([mo] + [""] * (snc - 1))
+                ms_rows.extend(split_rows(vis_ranges, op, ip, fac=1))
+            sheets["Monthly Split"] = ms_rows
+        else:
+            # Build rolling quarter labels starting from projection quarter
+            _rq = rolling_quarters(proj_quarter) if proj_quarter else [f"Q{n}" for n in range(1, 5)]
+            # Map rolling quarter label -> seasonal index key (Q1-Q4)
+            def _q_key(ql):
+                m = re.match(r"Q(\d)", ql)
+                return f"Q{m.group(1)}" if m else "Q1"
+            # Map rolling quarter label -> month names
+            def _q_months(ql):
+                m = re.match(r"Q(\d)", ql)
+                return QM[int(m.group(1))] if m else QM[1]
+            # Extract year from quarter label
+            def _q_year(ql):
+                m = re.search(r"\d{4}", ql)
+                return m.group() if m else ""
+
+            if improvements:
+                # --- Annual Quarterly Split: side-by-side scenarios ---
+                scenario_row = [""] + ["Baseline"] + [""] * 6
+                for nm, fc, _ in improvements:
+                    scenario_row += ["", f"+{float(fc)*100:.0f}% ({nm})"] + [""] * 6
+                col_row = ["Tier"] + _data_cols
+                for _ in improvements:
+                    col_row += [""] + _data_cols
+
+                qs_rows = [scenario_row, col_row]
+                for ql in _rq:
+                    qk = _q_key(ql)
+                    o = indexes["quarterly_organic"].get(qk, 0.25)
+                    i = indexes["quarterly_incremental"].get(qk, 0.25)
+                    total_cols = len(col_row)
+                    # Section row: repeat quarter label above each scenario block
+                    sec = [ql] + [""] * 7
+                    for _ in improvements:
+                        sec += ["", ql] + [""] * 6
+                    qs_rows.append(sec)
+                    base = split_vals(vis_ranges, o, i)
+                    imp_data = []
+                    for nm, fc, _ in improvements:
+                        imp_data.append(split_vals(vis_ranges, o, i, 1 + float(fc)))
+                    for ti, r in enumerate(vis_ranges):
+                        row = [r.tier_label] + base[ti]
+                        for imp_v in imp_data:
+                            row += [""] + imp_v[ti]
+                        qs_rows.append(row)
+                sheets["Quarterly Split"] = qs_rows
+
+                # --- Annual Monthly Split: side-by-side scenarios ---
+                ms_rows = [scenario_row, col_row]
+                for ql in _rq:
+                    qk = _q_key(ql)
+                    mos = _q_months(ql)
+                    yr = _q_year(ql)
+                    qo = indexes["quarterly_organic"].get(qk, 0.25)
+                    qi = indexes["quarterly_incremental"].get(qk, 0.25)
+                    os2 = sum(indexes["monthly_organic"].get(m, 1/12) for m in mos)
+                    is2 = sum(indexes["monthly_incremental"].get(m, 1/12) for m in mos)
+                    for mo in mos:
+                        op = qo * (indexes["monthly_organic"].get(mo, 1/12) / os2) if os2 else qo / 3
+                        ip = qi * (indexes["monthly_incremental"].get(mo, 1/12) / is2) if is2 else qi / 3
+                        total_cols = len(col_row)
+                        mo_label = f"{mo} {yr}" if yr else mo
+                        # Section row: repeat month label above each scenario block
+                        sec = [mo_label] + [""] * 7
+                        for _ in improvements:
+                            sec += ["", mo_label] + [""] * 6
+                        ms_rows.append(sec)
+                        base = split_vals(vis_ranges, op, ip)
+                        imp_data = []
+                        for nm, fc, _ in improvements:
+                            imp_data.append(split_vals(vis_ranges, op, ip, 1 + float(fc)))
+                        for ti, r in enumerate(vis_ranges):
+                            row = [r.tier_label] + base[ti]
+                            for imp_v in imp_data:
+                                row += [""] + imp_v[ti]
+                            ms_rows.append(row)
+                sheets["Monthly Split"] = ms_rows
+            else:
+                # No improvements — simple stacked layout
+                qs_rows = [sp_header]
+                for ql in _rq:
+                    qk = _q_key(ql)
+                    o = indexes["quarterly_organic"].get(qk, 0.25)
+                    i = indexes["quarterly_incremental"].get(qk, 0.25)
+                    qs_rows.append([ql] + [""] * (snc - 1))
+                    qs_rows.extend(split_rows(vis_ranges, o, i))
+                sheets["Quarterly Split"] = qs_rows
+
+                ms_rows = [sp_header]
+                for ql in _rq:
+                    qk = _q_key(ql)
+                    mos = _q_months(ql)
+                    yr = _q_year(ql)
+                    qo = indexes["quarterly_organic"].get(qk, 0.25)
+                    qi = indexes["quarterly_incremental"].get(qk, 0.25)
+                    os2 = sum(indexes["monthly_organic"].get(m, 1/12) for m in mos)
+                    is2 = sum(indexes["monthly_incremental"].get(m, 1/12) for m in mos)
+                    for mo in mos:
+                        op = qo * (indexes["monthly_organic"].get(mo, 1/12) / os2) if os2 else qo / 3
+                        ip = qi * (indexes["monthly_incremental"].get(mo, 1/12) / is2) if is2 else qi / 3
+                        mo_label = f"{mo} {yr}" if yr else mo
+                        ms_rows.append([mo_label] + [""] * (snc - 1))
+                        ms_rows.extend(split_rows(vis_ranges, op, ip))
+                sheets["Monthly Split"] = ms_rows
+
+    # --- Build xlsx from raw XML with formatting ---
+    def col_letter(idx):
+        r = ""; i = idx
+        while i >= 0: r = chr(65 + i % 26) + r; i = i // 26 - 1
+        return r
+
+    def cell_xml(ref, val, s=0):
+        sa = f' s="{s}"'
+        if val is None or val == "": return f'<c r="{ref}"{sa}/>'
+        if isinstance(val, (int, float)): return f'<c r="{ref}"{sa} t="n"><v>{val}</v></c>'
+        return f'<c r="{ref}"{sa} t="inlineStr"><is><t>{_esc(str(val))}</t></is></c>'
+
+    # Styles: 0=normal-left, 1=header(white on dark navy, centered), 2=title(bold black, left),
+    #   3=section-label(bold navy, left), 4=data-right(grid), 5=data-left(grid),
+    #   6=section-label-right, 7=avg-left(bold navy, grid), 8=avg-right(bold navy, grid)
+    _STYLED_STYLES = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="5">'
+        '<font><sz val="10"/><color rgb="FF000000"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="12"/><color rgb="FF000000"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="10"/><color rgb="FF1F3864"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="10"/><color rgb="FF000000"/><name val="Calibri"/></font>'
+        '</fonts>'
+        '<fills count="3">'
+        '<fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill>'
+        '</fills>'
+        '<borders count="3">'
+        '<border><left/><right/><top/><bottom/><diagonal/></border>'
+        '<border>'
+          '<left style="thin"><color rgb="FFA6A6A6"/></left>'
+          '<right style="thin"><color rgb="FFA6A6A6"/></right>'
+          '<top style="thin"><color rgb="FFA6A6A6"/></top>'
+          '<bottom style="thin"><color rgb="FFA6A6A6"/></bottom>'
+          '<diagonal/>'
+        '</border>'
+        '<border><left/><right/><top/><bottom style="thin"><color rgb="FFA6A6A6"/></bottom><diagonal/></border>'
+        '</borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="9">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="4" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="4" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
+        '</cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>'
+    )
+
+    def sheet_xml(data_rows, sheet_title="", double_header=False):
+        ncols = len(data_rows[0]) if data_rows else 1
+        xml_rows = []
+        merges = []
+        rn = 1
+        # Title row (bold black text, no background)
+        if sheet_title:
+            me = col_letter(max(ncols - 1, 0))
+            xml_rows.append(f'<row r="{rn}" ht="24" customHeight="1">{cell_xml(f"A{rn}", sheet_title, 2)}</row>')
+            merges.append(f"A{rn}:{me}{rn}")
+            rn += 1
+            # spacer after title
+            xml_rows.append(f'<row r="{rn}" ht="6" customHeight="1"/>')
+            rn += 1
+        data_row_idx = 0
+        for row in data_rows:
+            is_header = (data_row_idx == 0) or (double_header and data_row_idx == 1)
+            _non_empty = [v for v in row if v != ""]
+            is_section = (not is_header and len(row) > 1 and len(_non_empty) >= 1
+                          and all(v == _non_empty[0] for v in _non_empty))
+            is_avg = (not is_header and row[0] == "Average")
+            if is_section:
+                # spacer before section
+                if data_row_idx > 1:
+                    xml_rows.append(f'<row r="{rn}" ht="14" customHeight="1"/>')
+                    rn += 1
+                # section label: bold navy text at each non-empty position, borderless elsewhere
+                cells = ""
+                for ci, v in enumerate(row):
+                    ref = f"{col_letter(ci)}{rn}"
+                    if v != "":
+                        cells += cell_xml(ref, v, 3)
+                    else:
+                        cells += cell_xml(ref, "", 0)
+                xml_rows.append(f'<row r="{rn}" ht="18" customHeight="1">{cells}</row>')
+                rn += 1
+                data_row_idx += 1
+                continue
+            if is_header:
+                # dark navy header row with white bold text; empty spacer cols get no style
+                cells = "".join(
+                    cell_xml(f"{col_letter(ci)}{rn}", v, 0 if v == "" and ci > 0 else 1)
+                    for ci, v in enumerate(row))
+                xml_rows.append(f'<row r="{rn}" ht="20" customHeight="1">{cells}</row>')
+                rn += 1
+                data_row_idx += 1
+                continue
+            # data or average row — white bg, grid borders; empty spacer cols get no border
+            cells = []
+            for ci, v in enumerate(row):
+                ref = f"{col_letter(ci)}{rn}"
+                if v == "" and ci > 0:
+                    cells.append(cell_xml(ref, "", 0))   # borderless spacer
+                elif is_avg:
+                    cells.append(cell_xml(ref, v, 7 if ci == 0 else 8))
+                elif ci == 0:
+                    cells.append(cell_xml(ref, v, 5))    # left-aligned
+                else:
+                    cells.append(cell_xml(ref, v, 4))    # right-aligned
+            xml_rows.append(f'<row r="{rn}" ht="16" customHeight="1">{"".join(cells)}</row>')
+            rn += 1
+            data_row_idx += 1
+        cw = f'<col min="1" max="1" width="24" customWidth="1"/>'
+        if ncols > 1:
+            cw += f'<col min="2" max="{ncols}" width="16" customWidth="1"/>'
+        merge_xml = ""
+        if merges:
+            mc = "".join(f'<mergeCell ref="{ref}"/>' for ref in merges)
+            merge_xml = f'<mergeCells count="{len(merges)}">{mc}</mergeCells>'
+        return (
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>'
+            f'<cols>{cw}</cols>'
+            f'<sheetData>{"".join(xml_rows)}</sheetData>'
+            f'{merge_xml}</worksheet>'
+        )
+
+    buf = _io.BytesIO()
+    snames = list(sheets.keys())
+    _sheet_titles = {
+        "Historical KPIs": f"ForecastPro AI — Historical KPIs  |  {account}",
+        "Quarterly Forecast": f"ForecastPro AI — Quarterly Forecast  |  {account}",
+        "Annual Forecast": f"ForecastPro AI — Annual Forecast  |  {account}",
+    }
+    _dbl_hdr_sheets = {"Quarterly Split", "Monthly Split"}
+    with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as z:
+        ov = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(snames)+1))
+        z.writestr("[Content_Types].xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>{ov}</Types>')
+        z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        ws = "".join(f'<sheet name="{_esc(n)}" sheetId="{i}" r:id="rId{i}"/>' for i, n in enumerate(snames, 1))
+        z.writestr("xl/workbook.xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{ws}</sheets></workbook>')
+        rl = "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(snames)+1))
+        z.writestr("xl/_rels/workbook.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rl}<Relationship Id="rIdS" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        z.writestr("xl/styles.xml", _STYLED_STYLES)
+        for i, n in enumerate(snames, 1):
+            t = _sheet_titles.get(n, f"ForecastPro AI — {n}  |  {account}")
+            dbl = (n in _dbl_hdr_sheets) and bool(improvements)
+            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl))
+
+    _safe = re.sub(r"[^a-z0-9]+", "-", account.lower()).strip("-") or "forecast"
+    st.download_button("Download Excel Workbook", buf.getvalue(), f"{_safe}-forecast.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary", key=f"dl_excel_{key_suffix}")
 
 
 def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
@@ -1708,7 +2161,7 @@ if st.session_state.preview and active_tab == 0:
             "Inc. customers": st.column_config.NumberColumn(format="%,.0f"),
             "Revenue": st.column_config.NumberColumn(format="$%,.0f"),
             "CPIx": st.column_config.NumberColumn(format="$%.2f"),
-            "iROAS": st.column_config.NumberColumn(format="%.3f"),
+            "iROAS": st.column_config.NumberColumn(format="$%.3f"),
         },
     )
     selected_quarters = set(edited.loc[edited["Use"], "Quarter"].tolist())
@@ -1778,43 +2231,34 @@ if st.session_state.confirmed and active_tab == 1:
 
     if st.session_state.show_historical_kpis:
         st.header("4. Historical Quarterly KPIs & Performance")
-        _kpi_fmt = {
-            "Delivered Volume": lambda v: f"{v:,.0f}",
-            "Spend": lambda v: f"${v:,.0f}",
-            "Historical Average Frequency": lambda v: f"{v:.1f}",
-            "Prospects": lambda v: f"{v:,.0f}",
-            "Incremental Customers": lambda v: f"{v:,.0f}",
-            "Incremental Revenue": lambda v: f"${v:,.0f}",
-            "Avg. Inc. Rev": lambda v: f"${v:,.0f}",
-            "CPIx": lambda v: f"${v:,.2f}",
-            "iROAS": lambda v: f"{v:.3f}",
-        }
-        metrics = [
-            ("Delivered Volume", "delivered_volume"),
-            ("Spend", "source_spend"),
-("Historical Average Frequency", "frequency"),
-            ("Prospects", "prospects"),
-            ("Incremental Customers", "incremental_customers"),
-            ("Incremental Revenue", "incremental_revenue"),
-            ("Avg. Inc. Rev", "average_incremental_revenue"),
-            ("CPIx", "cpix"),
-            ("iROAS", "iroas"),
-        ]
-        summary = []
-        for label, field in metrics:
-            values = [float(row[field]) for row in selected_history]
-            fmt = _kpi_fmt.get(label, lambda v: f"{v:,.2f}")
-            summary.append(
-                {
-                    "Metric": label,
-                    **{
-                        row["campaign_quarter"]: fmt(value)
-                        for row, value in zip(selected_history, values)
-                    },
-                    "Average": fmt(sum(values) / len(values)),
-                }
-            )
-        st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+        _kpi_rows = []
+        for row in selected_history:
+            _kpi_rows.append({
+                "Quarter": row["campaign_quarter"],
+                "Delivered": f"{float(row['delivered_volume']):,.0f}",
+                "Spend": f"${float(row['source_spend']):,.0f}",
+                "Avg. Frequency": f"{float(row['frequency']):.1f}",
+                "Prospects": f"{float(row['prospects']):,.0f}",
+                "Inc. Customers": f"{float(row['incremental_customers']):,.0f}",
+                "Inc. Revenue": f"${float(row['incremental_revenue']):,.0f}",
+                "Avg. Inc. Rev": f"${float(row['average_incremental_revenue']):,.0f}",
+                "CPIx": f"${float(row['cpix']):,.2f}",
+                "iROAS": f"${float(row['iroas']):.3f}",
+            })
+        _n = len(selected_history)
+        _kpi_rows.append({
+            "Quarter": "Average",
+            "Delivered": f"{sum(float(r['delivered_volume']) for r in selected_history) / _n:,.0f}",
+            "Spend": f"${sum(float(r['source_spend']) for r in selected_history) / _n:,.0f}",
+            "Avg. Frequency": f"{sum(float(r['frequency']) for r in selected_history) / _n:.1f}",
+            "Prospects": f"{sum(float(r['prospects']) for r in selected_history) / _n:,.0f}",
+            "Inc. Customers": f"{sum(float(r['incremental_customers']) for r in selected_history) / _n:,.0f}",
+            "Inc. Revenue": f"${sum(float(r['incremental_revenue']) for r in selected_history) / _n:,.0f}",
+            "Avg. Inc. Rev": f"${sum(float(r['average_incremental_revenue']) for r in selected_history) / _n:,.0f}",
+            "CPIx": f"${sum(float(r['cpix']) for r in selected_history) / _n:,.2f}",
+            "iROAS": f"${sum(float(r['iroas']) for r in selected_history) / _n:.3f}",
+        })
+        st.dataframe(pd.DataFrame(_kpi_rows), hide_index=True, use_container_width=True)
 
     historical_frequency = sum(
         float(row["frequency"]) for row in selected_history
@@ -2415,6 +2859,20 @@ if st.session_state.forecast and active_tab == 2:
         if row.historical_quarter == latest_quarter
     }
 
+    try:
+        _idx_session = get_session()
+        st.session_state["_cached_indexes"] = effective_monthly_indexes(seasonal_indexes(
+            _idx_session,
+            st.session_state.selected_source,
+            attribution_window=st.session_state.get("attribution_window", 30),
+            account_name=st.session_state.get("source_account"),
+            sub_account=st.session_state.get("selected_sub_account"),
+            event=st.session_state.get("selected_event"),
+            channel=st.session_state.get("selected_channel"),
+        ))
+    except Exception:
+        pass
+
     st.header("Forecast Output Ranges")
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
     _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
@@ -2433,6 +2891,7 @@ if st.session_state.forecast and active_tab == 2:
         for row in visible_projections
         if row.historical_quarter == latest_quarter
     }
+    st.session_state["_cached_sig_util"] = _sig_util_all
 
     if _is_quarterly_mode:
         # --- Quarterly mode: show one-quarter baseline table ---
@@ -2644,11 +3103,7 @@ if st.session_state.forecast and active_tab == 2:
             if imp_rows:
                 st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
 
-    workbook = build_workbook(st.session_state.source_account, st.session_state.historical_scope_label,
-        datetime.now(timezone.utc).isoformat(), visible_ranges, result["ranges"], st.session_state.selected_history)
-    safe_account = re.sub(r"[^a-z0-9]+", "-", st.session_state.source_account.lower()).strip("-") or "forecast"
-    st.download_button("Download Excel workbook", workbook, f"{safe_account}-forecast.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    _render_download_button("tab3a")
 
     tab_nav_buttons(tab_names, 2)
 
@@ -2714,6 +3169,10 @@ if (st.session_state.forecast
     else:
         st.caption("The annual forecast is distributed across Q1–Q4 using seasonal indexes.")
 
+    def _q_key_fn(ql):
+        _m = re.match(r"Q(\d)", ql)
+        return f"Q{_m.group(1)}" if _m else "Q1"
+
     try:
         session = get_session()
         indexes = effective_monthly_indexes(seasonal_indexes(
@@ -2725,11 +3184,12 @@ if (st.session_state.forecast
             event=st.session_state.get("selected_event"),
             channel=st.session_state.get("selected_channel"),
         ))
-        for q_num in range(1, 5):
-            q_key = f"Q{q_num}"
+        _rq_ui = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
+        for _rq_label in _rq_ui:
+            q_key = _q_key_fn(_rq_label)
             o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
             i_pct = indexes["quarterly_incremental"].get(q_key, 0.25)
-            st.subheader(f"Qtr{q_num}")
+            st.subheader(_rq_label)
             qtr_rows = []
             for r in visible_ranges:
                 label = r.tier_label
@@ -2759,6 +3219,7 @@ if (st.session_state.forecast
     except Exception as exc:
         st.warning(f"Could not compute quarterly split: {exc}")
 
+    _render_download_button("tab3b_qs")
     tab_nav_buttons(tab_names, 3)
 
 
@@ -2832,6 +3293,10 @@ if (st.session_state.forecast
 
     _am_view_mode = st.radio("Group by", ("Month", "Tier"), horizontal=True, key="_am_view_mode")
 
+    def _q_key_fn(ql):
+        _m = re.match(r"Q(\d)", ql)
+        return f"Q{_m.group(1)}" if _m else "Q1"
+
     try:
         session = get_session()
         indexes = effective_monthly_indexes(seasonal_indexes(
@@ -2849,13 +3314,17 @@ if (st.session_state.forecast
                 label = r.tier_label
                 st.subheader(f"{label} ({_fmt_dollar_commas(float(r.investment) * 4)})")
                 tier_month_rows = []
-                for q_num in range(1, 5):
+                _rq_ms = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
+                for _ql in _rq_ms:
+                    _qk = _q_key_fn(_ql)
+                    _qyr = re.search(r"\d{4}", _ql)
+                    _yr = _qyr.group() if _qyr else ""
+                    q_num = int(_qk[1])
                     months = QUARTER_MONTHS_MAP[q_num]
                     org_sum = sum(indexes["monthly_organic"].get(m, 1/12) for m in months)
                     inc_sum = sum(indexes["monthly_incremental"].get(m, 1/12) for m in months)
-                    q_key = f"Q{q_num}"
-                    q_org = indexes["quarterly_organic"].get(q_key, 0.25)
-                    q_inc = indexes["quarterly_incremental"].get(q_key, 0.25)
+                    q_org = indexes["quarterly_organic"].get(_qk, 0.25)
+                    q_inc = indexes["quarterly_incremental"].get(_qk, 0.25)
                     for month in months:
                         org_pct = q_org * (indexes["monthly_organic"].get(month, 1/12) / org_sum) if org_sum else q_org / 3
                         inc_pct = q_inc * (indexes["monthly_incremental"].get(month, 1/12) / inc_sum) if inc_sum else q_inc / 3
@@ -2871,7 +3340,7 @@ if (st.session_state.forecast
                         iroas_min = rev_min / inv if inv > 0 else 0
                         iroas_max = rev_max / inv if inv > 0 else 0
                         tier_month_rows.append({
-                            "Month": month,
+                            "Month": f"{month} {_yr}",
                             "Investment": _fmt_dollar_commas(inv),
                             "Delivered": f"{delivered:,.0f}",
                             "Prospects": f"{prospects:,.0f}",
@@ -2883,19 +3352,23 @@ if (st.session_state.forecast
                         })
                 st.dataframe(pd.DataFrame(tier_month_rows), hide_index=True, use_container_width=True)
         else:
-            for q_num in range(1, 5):
+            _rq_ms2 = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
+            for _ql2 in _rq_ms2:
+                _qk2 = _q_key_fn(_ql2)
+                _qyr2 = re.search(r"\d{4}", _ql2)
+                _yr2 = _qyr2.group() if _qyr2 else ""
+                q_num = int(_qk2[1])
                 months = QUARTER_MONTHS_MAP[q_num]
                 org_sum = sum(indexes["monthly_organic"].get(m, 1/12) for m in months)
                 inc_sum = sum(indexes["monthly_incremental"].get(m, 1/12) for m in months)
-                q_key = f"Q{q_num}"
-                q_org = indexes["quarterly_organic"].get(q_key, 0.25)
-                q_inc = indexes["quarterly_incremental"].get(q_key, 0.25)
+                q_org = indexes["quarterly_organic"].get(_qk2, 0.25)
+                q_inc = indexes["quarterly_incremental"].get(_qk2, 0.25)
 
                 for month in months:
                     org_pct = q_org * (indexes["monthly_organic"].get(month, 1/12) / org_sum) if org_sum else q_org / 3
                     inc_pct = q_inc * (indexes["monthly_incremental"].get(month, 1/12) / inc_sum) if inc_sum else q_inc / 3
 
-                    st.subheader(f"{month}")
+                    st.subheader(f"{month} {_yr2}")
                     month_rows = []
                     for r in visible_ranges:
                         label = r.tier_label
@@ -2926,6 +3399,7 @@ if (st.session_state.forecast
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
 
+    _render_download_button("tab3c_ms")
     tab_nav_buttons(tab_names, 4)
 
 
@@ -3096,6 +3570,7 @@ if (st.session_state.forecast
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
 
+    _render_download_button("tab3b_qm")
     tab_nav_buttons(tab_names, 3)
 
 
@@ -3259,4 +3734,29 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     ).properties(title="Investment tiers — standard (blue) vs extension (orange)", height=380)
     st.altair_chart(invest_chart, use_container_width=True)
 
-    tab_nav_buttons(tab_names, _charts_tab_idx)
+    # Export charts as PNG for the Excel workbook
+    _chart_images = []
+    _chart_defs = [
+        ("CPIx by Investment Tier", (_v_rules + cpix_band + cpix_line).properties(width=700, height=380)),
+        ("iROAS by Investment Tier", (_v_rules + iroas_band + iroas_line).properties(width=700, height=380)),
+        ("Incremental Customers", (_v_rules + cust_band + cust_line).properties(width=700, height=380)),
+        ("Incremental Revenue", (_v_rules + rev_band + rev_line).properties(width=700, height=380)),
+        ("Delivered Volume", vol_chart.properties(width=700, height=350)),
+        ("Prospects", pros_chart.properties(width=700, height=350)),
+        ("Investment by Tier", invest_chart.properties(width=700, height=380)),
+    ]
+    for _c_title, _c_obj in _chart_defs:
+        try:
+            _png = _c_obj.to_dict()
+            import json as _json_chart
+            from io import BytesIO as _BytesIO_chart
+            try:
+                import vl_convert as vlc
+                _png_bytes = vlc.vegalite_to_png(vl_spec=_json_chart.dumps(_png), scale=2)
+                _chart_images.append((_c_title, _png_bytes))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _render_download_button("charts", chart_images=_chart_images if _chart_images else None)
