@@ -11,6 +11,7 @@ from decimal import Decimal
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import importlib
 import data_access as _data_access
 _data_access = importlib.reload(_data_access)
@@ -50,13 +51,15 @@ st.markdown(
     color: #111111 !important;
   }
   .stApp { background: #FAFAFA !important; }
-  .block-container { padding-top: 0.6rem; max-width: 1600px; background: #FAFAFA !important; }
+  .block-container { padding-top: 0 !important; max-width: 1600px; background: #FAFAFA !important; }
 
   /* === TYPOGRAPHY — Strong hierarchy === */
   h1 { color: #111111 !important; font-family: 'DM Serif Display', serif !important; font-weight: 400 !important; font-size: 2.2rem !important; letter-spacing: -0.02em !important; line-height: 1.15 !important; margin: 0.15rem 0 0.3rem !important; }
   h2 { color: #111111 !important; font-family: 'Space Grotesk', sans-serif !important; font-weight: 600 !important; font-size: 1.5rem !important; letter-spacing: -0.02em !important; margin: 0.25rem 0 0.35rem !important; }
   h3 { color: #222222 !important; font-family: 'Space Grotesk', sans-serif !important; font-weight: 600 !important; font-size: 1.15rem !important; letter-spacing: -0.01em !important; margin: 0.2rem 0 0.3rem !important; }
   p, span, label, .stMarkdown, [data-testid="stMarkdownContainer"] { color: #333333 !important; }
+  .info-icon { display:inline-flex; align-items:center; justify-content:center; width:1rem; height:1rem; margin-left:0.24rem; border:1.4px solid #475569; border-radius:50%; background:#f8fafc; color:#334155 !important; font-family:Arial,sans-serif; font-size:0.68rem; font-weight:700; line-height:1; vertical-align:middle; cursor:help; }
+  .info-icon:hover { border-color:#0f766e; background:#ecfdf5; color:#0f766e !important; }
 
   /* === METRICS === */
   [data-testid="stMetric"] { background: transparent !important; border: none !important; padding: 0 !important; }
@@ -894,6 +897,7 @@ def initialize_state() -> None:
         "manual_monthly_organic": {},
         "manual_monthly_incremental": {},
         "monthly_index_signature": None,
+        "scroll_to_top": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1031,19 +1035,51 @@ def effective_monthly_indexes(automatic_indexes: dict) -> dict:
     indexes["monthly_incremental"] = {
         month: float(incremental[month]) for month in MONTH_NAMES
     }
-    indexes["quarterly_organic"] = {
-        quarter: sum(indexes["monthly_organic"][month] for month in months)
-        for quarter, months in QUARTER_MONTHS.items()
-    }
-    indexes["quarterly_incremental"] = {
-        quarter: sum(indexes["monthly_incremental"][month] for month in months)
-        for quarter, months in QUARTER_MONTHS.items()
-    }
+    expected_quarters = {f"Q{i}" for i in range(1, 5)}
+    manual_quarterly_organic = st.session_state.get("manual_quarterly_organic", {})
+    manual_quarterly_incremental = st.session_state.get("manual_quarterly_incremental", {})
+    if (
+        set(manual_quarterly_organic) == expected_quarters
+        and set(manual_quarterly_incremental) == expected_quarters
+    ):
+        indexes["quarterly_organic"] = {
+            quarter: float(manual_quarterly_organic[quarter])
+            for quarter in expected_quarters
+        }
+        indexes["quarterly_incremental"] = {
+            quarter: float(manual_quarterly_incremental[quarter])
+            for quarter in expected_quarters
+        }
+    else:
+        indexes["quarterly_organic"] = {
+            quarter: sum(indexes["monthly_organic"][month] for month in months)
+            for quarter, months in QUARTER_MONTHS.items()
+        }
+        indexes["quarterly_incremental"] = {
+            quarter: sum(indexes["monthly_incremental"][month] for month in months)
+            for quarter, months in QUARTER_MONTHS.items()
+        }
     return indexes
 
 
+def manual_seasonal_indexes_valid() -> bool:
+    """Manual seasonal allocations must total exactly 100% for every table."""
+    if st.session_state.get("monthly_index_mode", "Automatic") != "Manual":
+        return True
+    required = (
+        (st.session_state.get("manual_monthly_organic", {}), set(MONTH_NAMES)),
+        (st.session_state.get("manual_monthly_incremental", {}), set(MONTH_NAMES)),
+        (st.session_state.get("manual_quarterly_organic", {}), {f"Q{i}" for i in range(1, 5)}),
+        (st.session_state.get("manual_quarterly_incremental", {}), {f"Q{i}" for i in range(1, 5)}),
+    )
+    return all(
+        set(values) == expected and abs(sum(float(value) for value in values.values()) - 1.0) < 0.00001
+        for values, expected in required
+    )
+
+
 def render_monthly_index_section(automatic_indexes: dict) -> dict:
-    """Render automatic/manual monthly indexes and return the effective weights."""
+    """Render compact automatic/manual seasonal-index tables and return their weights."""
     signature = (
         st.session_state.get("source_account"),
         st.session_state.get("selected_sub_account"),
@@ -1055,9 +1091,12 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         st.session_state.monthly_index_mode = "Automatic"
         st.session_state.manual_monthly_organic = {}
         st.session_state.manual_monthly_incremental = {}
+        st.session_state.manual_quarterly_organic = {}
+        st.session_state.manual_quarterly_incremental = {}
         st.session_state.monthly_index_signature = signature
 
-    st.markdown("**Monthly Breakdown (Template Tables 3a & 3b)**")
+    st.markdown("### Seasonal Indexes: Quarterly & Monthly Conversions")
+    st.caption("Seasonal indexes reflect trends in gross client conversions and Zeta-influenced conversions.")
     mode_col, reset_col, _ = st.columns([2, 1.4, 5])
     def _reset_monthly_indexes():
         st.session_state.monthly_index_mode = "Automatic"
@@ -1068,10 +1107,11 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
 
     with mode_col:
         st.radio(
-            "Monthly index",
+            "Index mode",
             ("Automatic", "Manual"),
             horizontal=True,
             key="monthly_index_mode",
+            help="Automatic uses the calculated indexes. Manual lets you edit the same Quarterly and Monthly tables used by the forecast.",
         )
     with reset_col:
         st.button(
@@ -1081,6 +1121,7 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
             on_click=_reset_monthly_indexes,
         )
 
+    quarters = [f"Q{i}" for i in range(1, 5)]
     if st.session_state.monthly_index_mode == "Manual":
         if not st.session_state.manual_monthly_organic:
             st.session_state.manual_monthly_organic = {
@@ -1091,74 +1132,117 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
                 month: float(automatic_indexes["monthly_incremental"].get(month, 0.0))
                 for month in MONTH_NAMES
             }
-        manual_frame = pd.DataFrame(
-            {
-                "Month": MONTH_NAMES,
-                "Organic %": [
-                    st.session_state.manual_monthly_organic[month] * 100
-                    for month in MONTH_NAMES
-                ],
-                "Incremental %": [
-                    st.session_state.manual_monthly_incremental[month] * 100
-                    for month in MONTH_NAMES
-                ],
+        if not st.session_state.manual_quarterly_organic:
+            st.session_state.manual_quarterly_organic = {
+                quarter: float(automatic_indexes["quarterly_organic"].get(quarter, 0.0))
+                for quarter in quarters
             }
-        )
-        edited = st.data_editor(
-            manual_frame,
+            st.session_state.manual_quarterly_incremental = {
+                quarter: float(automatic_indexes["quarterly_incremental"].get(quarter, 0.0))
+                for quarter in quarters
+            }
+        quarterly_organic = st.session_state.manual_quarterly_organic
+        quarterly_incremental = st.session_state.manual_quarterly_incremental
+        monthly_organic = st.session_state.manual_monthly_organic
+        monthly_incremental = st.session_state.manual_monthly_incremental
+    else:
+        indexes = effective_monthly_indexes(automatic_indexes)
+        quarterly_organic = indexes["quarterly_organic"]
+        quarterly_incremental = indexes["quarterly_incremental"]
+        monthly_organic = indexes["monthly_organic"]
+        monthly_incremental = indexes["monthly_incremental"]
+
+    st.markdown("**Quarterly Seasonal Indexes**")
+    st.caption("Organic and Incremental values must each sum to 100%.")
+    quarterly_frame = pd.DataFrame(
+        {
+            "Quarter": quarters,
+            "Organic %": [quarterly_organic.get(quarter, 0.0) * 100 for quarter in quarters],
+            "Incremental %": [quarterly_incremental.get(quarter, 0.0) * 100 for quarter in quarters],
+        }
+    )
+    if st.session_state.monthly_index_mode == "Manual":
+        quarterly_edited = st.data_editor(
+            quarterly_frame,
             hide_index=True,
             use_container_width=True,
-            disabled=["Month"],
-            key="manual_monthly_index_editor",
+            disabled=["Quarter"],
+            key="quarterly_seasonal_index_editor",
             column_config={
                 "Organic %": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f%%"),
                 "Incremental %": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f%%"),
             },
         )
-        new_organic = {
-            row["Month"]: float(row["Organic %"]) / 100 for _, row in edited.iterrows()
+        new_quarterly_organic = {
+            row["Quarter"]: float(row["Organic %"]) / 100 for _, row in quarterly_edited.iterrows()
         }
-        new_incremental = {
-            row["Month"]: float(row["Incremental %"]) / 100 for _, row in edited.iterrows()
+        new_quarterly_incremental = {
+            row["Quarter"]: float(row["Incremental %"]) / 100 for _, row in quarterly_edited.iterrows()
         }
         if (
-            new_organic != st.session_state.manual_monthly_organic
-            or new_incremental != st.session_state.manual_monthly_incremental
+            new_quarterly_organic != st.session_state.manual_quarterly_organic
+            or new_quarterly_incremental != st.session_state.manual_quarterly_incremental
         ):
-            st.session_state.manual_monthly_organic = new_organic
-            st.session_state.manual_monthly_incremental = new_incremental
+            st.session_state.manual_quarterly_organic = new_quarterly_organic
+            st.session_state.manual_quarterly_incremental = new_quarterly_incremental
             st.session_state.forecast = None
-            st.session_state.message = "Monthly indexes changed. Create a new forecast draft to update results."
+            st.session_state.message = "Quarterly seasonal indexes changed. Create a new forecast draft to update results."
+    else:
+        st.dataframe(quarterly_frame, hide_index=True, use_container_width=True)
 
-    indexes = effective_monthly_indexes(automatic_indexes)
-    idx_col1, idx_col2 = st.columns(2)
-    with idx_col1:
-        st.markdown("**Quarterly indexes**")
-        st.dataframe(
-            pd.DataFrame(
-                {
-                    "Quarter": [f"Q{i}" for i in range(1, 5)],
-                    "Organic %": [f"{indexes['quarterly_organic'].get(f'Q{i}', 0.0) * 100:.1f}%" for i in range(1, 5)],
-                    "Incremental %": [f"{indexes['quarterly_incremental'].get(f'Q{i}', 0.0) * 100:.1f}%" for i in range(1, 5)],
-                }
-            ),
+    st.markdown("**Monthly Seasonal Indexes**")
+    st.caption("Organic and Incremental values must each sum to 100%.")
+    monthly_frame = pd.DataFrame(
+        [
+            {"Metric": "Organic %", **{month: monthly_organic.get(month, 0.0) * 100 for month in MONTH_NAMES},
+             "Total": sum(monthly_organic.values()) * 100},
+            {"Metric": "Incremental %", **{month: monthly_incremental.get(month, 0.0) * 100 for month in MONTH_NAMES},
+             "Total": sum(monthly_incremental.values()) * 100},
+        ]
+    )
+    monthly_columns = {
+        month: st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f%%")
+        for month in MONTH_NAMES
+    }
+    monthly_columns["Total"] = st.column_config.NumberColumn(format="%.1f%%")
+    if st.session_state.monthly_index_mode == "Manual":
+        monthly_edited = st.data_editor(
+            monthly_frame,
             hide_index=True,
             use_container_width=True,
+            disabled=["Metric", "Total"],
+            key="monthly_seasonal_index_editor",
+            column_config=monthly_columns,
         )
-    with idx_col2:
-        st.markdown("**Monthly indexes**")
-        st.dataframe(
-            pd.DataFrame(
-                {
-                    "Month": MONTH_NAMES,
-                    "Organic %": [f"{indexes['monthly_organic'].get(month, 0.0) * 100:.1f}%" for month in MONTH_NAMES],
-                    "Incremental %": [f"{indexes['monthly_incremental'].get(month, 0.0) * 100:.1f}%" for month in MONTH_NAMES],
-                }
-            ),
-            hide_index=True,
-            use_container_width=True,
-        )
-    return indexes
+        new_monthly_organic = {
+            month: float(monthly_edited.loc[monthly_edited["Metric"] == "Organic %", month].iloc[0]) / 100
+            for month in MONTH_NAMES
+        }
+        new_monthly_incremental = {
+            month: float(monthly_edited.loc[monthly_edited["Metric"] == "Incremental %", month].iloc[0]) / 100
+            for month in MONTH_NAMES
+        }
+        if (
+            new_monthly_organic != st.session_state.manual_monthly_organic
+            or new_monthly_incremental != st.session_state.manual_monthly_incremental
+        ):
+            st.session_state.manual_monthly_organic = new_monthly_organic
+            st.session_state.manual_monthly_incremental = new_monthly_incremental
+            st.session_state.forecast = None
+            st.session_state.message = "Monthly seasonal indexes changed. Create a new forecast draft to update results."
+        totals = {
+            "Quarterly organic": sum(st.session_state.manual_quarterly_organic.values()) * 100,
+            "Quarterly incremental": sum(st.session_state.manual_quarterly_incremental.values()) * 100,
+            "Monthly organic": sum(st.session_state.manual_monthly_organic.values()) * 100,
+            "Monthly incremental": sum(st.session_state.manual_monthly_incremental.values()) * 100,
+        }
+        st.caption(" | ".join(f"{label}: {total:.1f}%" for label, total in totals.items()))
+        if not manual_seasonal_indexes_valid():
+            st.error("Manual seasonal indexes must each total exactly 100% before you create a forecast.")
+    else:
+        st.dataframe(monthly_frame, hide_index=True, use_container_width=True, column_config=monthly_columns)
+
+    return effective_monthly_indexes(automatic_indexes)
 
 
 def quarter_value(label: str) -> int:
@@ -1188,8 +1272,33 @@ def visible_tier(label: str, show_expansion: bool) -> bool:
     if label.startswith("Extended Scale"):
         return False
     return show_expansion or not (
-        label.startswith("Incremental Reach")
-        or label.startswith("Maximum Scale")
+        label.startswith("Market Expansion")
+        or label.startswith("Strategic Scale")
+        or label.startswith("Optimal Scale")
+    )
+
+
+def scroll_page_to_top() -> None:
+    """Reset the Streamlit main viewport after tab navigation."""
+    components.html(
+        """
+        <script>
+        const scrollToTop = () => {
+          const main = window.parent.document.querySelector(
+            'section[data-testid="stMain"]'
+          );
+          if (main) {
+            main.scrollTop = 0;
+            main.scrollTo({top: 0, left: 0, behavior: 'auto'});
+          }
+        };
+        scrollToTop();
+        window.parent.setTimeout(scrollToTop, 50);
+        window.parent.setTimeout(scrollToTop, 250);
+        </script>
+        """,
+        height=0,
+        width=0,
     )
 
 
@@ -1645,6 +1754,7 @@ def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
                 use_container_width=True,
             ):
                 st.session_state.active_tab = current_index - 1
+                st.session_state.scroll_to_top = True
                 st.rerun()
     if current_index < len(tab_names) - 1:
         with cols[2]:
@@ -1654,10 +1764,13 @@ def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
                 use_container_width=True,
             ):
                 st.session_state.active_tab = current_index + 1
+                st.session_state.scroll_to_top = True
                 st.rerun()
 
 
 initialize_state()
+if st.session_state.pop("scroll_to_top", False):
+    scroll_page_to_top()
 
 # --- Get session (simple — no caching, no health checks) ---
 session = get_session()
@@ -1665,6 +1778,12 @@ session = get_session()
 
 def load_historical_slice() -> None:
     """Populate existing preview state from the four authoritative dimensions."""
+    using_data_quarter = st.session_state.get("selected_planning_quarter")
+    if using_data_quarter:
+        st.caption(
+            f"Performing projection for {projection_quarter_choice} using {using_data_quarter} universe and max reach."
+        )
+
     table_name = REFERENCE_HISTORICAL_TABLE
     filters = {
         "account_name": st.session_state.source_account,
@@ -1705,16 +1824,20 @@ def load_historical_slice() -> None:
     st.session_state.historical_scope_label = "Historical slice"
 
 # --- Common header ---
-st.markdown(
-    '<p class="hero-subtitle">'
-    'FORECASTPRO AI <span class="separator">·</span> '
-    '<span class="product-name">FORECASTING POD PRODUCT</span></p>',
-    unsafe_allow_html=True,
+brand_col, title_col, reset_col = st.columns(
+    [2.2, 4.6, 1.5],
+    vertical_alignment="center",
 )
-title_col, reset_col = st.columns([5, 1])
+with brand_col:
+    st.markdown(
+        '<p style="color:#777;font-size:0.7rem;font-weight:700;letter-spacing:0.12em;'
+        'text-transform:uppercase;margin:0;">FORECASTPRO AI</p>',
+        unsafe_allow_html=True,
+    )
 with title_col:
     st.markdown(
-        '<h1 class="hero-title">Forecasting Engine</h1>',
+        '<h1 style="font-family:Georgia,serif !important;font-weight:700 !important;'
+        'font-size:2.2rem !important;line-height:1.1;text-align:center;margin:0;">Forecast Engine</h1>',
         unsafe_allow_html=True,
     )
 mailops_col, reset_col = st.columns([1, 1])
@@ -1767,8 +1890,10 @@ if st.session_state.forecast:
         tab_names.append("3b Quarterly Split")
         tab_names.append("3c Monthly Split")
     tab_names.append("4 Charts")
+    tab_names.append("5 Projection Calculations (QA)")
 
-_charts_tab_idx = len(tab_names) - 1  # Charts is always the last tab
+_charts_tab_idx = len(tab_names) - 2
+_qa_tab_idx = len(tab_names) - 1
 
 # Initialize active_tab if not set or out of bounds
 if "active_tab" not in st.session_state or st.session_state.active_tab >= len(tab_names):
@@ -1781,17 +1906,27 @@ for i, name in enumerate(tab_names):
         if st.button(name, key=f"tab_btn_{i}", use_container_width=True,
                      type="primary" if i == st.session_state.active_tab else "secondary"):
             st.session_state.active_tab = i
+            st.session_state.scroll_to_top = True
             st.rerun()
 
 st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
 active_tab = st.session_state.active_tab
 
 
+def compact_field_label(title: str, instruction: str, tooltip: str) -> None:
+    """Keep input labels, guidance, and hover help consistent and compact."""
+    st.markdown(
+        f'<div style="margin:0 0 0.25rem;"><span style="font-weight:700;">{title} <span class="info-icon" title="{tooltip}" aria-label="More information">i</span></span><br><span style="color:#6b7280;font-size:0.82rem;">{instruction}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
 # =============================================================================
 # TAB 1: INPUTS & DISCOVERY
 # =============================================================================
 if active_tab == 0:
-    st.header("1. Select historical inputs")
+    st.header("1. Select Campaign")
+    st.caption("Select a campaign from the dropdown.")
     account_rows = session.sql(f"""
         SELECT DISTINCT ACCT_NAME
         FROM {REFERENCE_HISTORICAL_TABLE}
@@ -1824,11 +1959,12 @@ if active_tab == 0:
     ):
         st.session_state._widget_all_account = saved_account
 
+    if st.session_state.get("_widget_all_account") not in all_account_options:
+        st.session_state.pop("_widget_all_account", None)
+
     def _account_changed():
         account = st.session_state.get("_widget_all_account")
-        st.session_state.source_account = (
-            None if account == "(select an account)" else account
-        )
+        st.session_state.source_account = account or None
         st.session_state.selected_sub_account = None
         st.session_state.selected_event = None
         st.session_state.selected_channel = None
@@ -1904,15 +2040,23 @@ if active_tab == 0:
     primary_row = st.columns(2)
     secondary_row = st.columns(2)
     with primary_row[0]:
+        compact_field_label(
+            "Client Name",
+            "Select the relevant client before continuing.",
+            "Client values align with the reporting parameters in the Multi-Tenant Results data used for Insights Studio dashboards.",
+        )
         all_account_choice = st.selectbox(
-            "All Accounts",
-            ["(select an account)"] + all_account_options,
+            "Client Name",
+            all_account_options,
+            index=None,
+            placeholder="– select an account",
             key="_widget_all_account",
             on_change=_account_changed,
+            label_visibility="collapsed",
         )
 
     base_dimensions = []
-    if all_account_choice != "(select an account)":
+    if all_account_choice:
         try:
             base_dimensions = account_dimensions(session, all_account_choice)
         except Exception as exc:
@@ -1920,7 +2064,12 @@ if active_tab == 0:
     sub_options = sorted({
         str(row.get("SUB_ACCOUNT")).strip() for row in base_dimensions
         if row.get("SUB_ACCOUNT")
-    }) or ["(none found)"]
+    })
+    if (
+        st.session_state.get("_widget_sub_account")
+        and st.session_state.get("_widget_sub_account") not in sub_options
+    ):
+        st.session_state.pop("_widget_sub_account", None)
 
     saved_sub_account = st.session_state.get("selected_sub_account")
     if (
@@ -1929,32 +2078,54 @@ if active_tab == 0:
     ):
         st.session_state._widget_sub_account = saved_sub_account
     with secondary_row[0]:
+        compact_field_label(
+            "Campaign Name",
+            "Select the campaign you would like to project.",
+            "Identifies campaigns that were measured and reported as standalone campaigns.",
+        )
         sub_account_choice = st.selectbox(
-            "Sub Account",
-            sub_options,
+            "Campaign Name",
+            sub_options or [""],
+            index=None if sub_options else 0,
+            placeholder=" ",
             key="_widget_sub_account",
             on_change=_sub_account_changed,
+            label_visibility="collapsed",
+            disabled=not sub_options,
+            format_func=lambda value: value or "",
         )
 
     event_dimensions = []
-    if all_account_choice != "(select an account)" and sub_account_choice != "(none found)":
+    if all_account_choice and sub_account_choice:
         event_dimensions = account_dimensions(
             session, all_account_choice, sub_account=sub_account_choice
         )
     event_options = sorted({
         str(row.get("EVENT")).strip() for row in event_dimensions
         if row.get("EVENT")
-    }) or ["(none found)"]
+    })
+    if (
+        st.session_state.get("_widget_event")
+        and st.session_state.get("_widget_event") not in event_options
+    ):
+        st.session_state.pop("_widget_event", None)
     saved_event = st.session_state.get("selected_event")
     if "_widget_event" not in st.session_state and saved_event in event_options:
         st.session_state._widget_event = saved_event
     with primary_row[1]:
+        compact_field_label(
+            "Conversion Event",
+            "Select the conversion event you would like to project.",
+            "The projection uses historical performance for the selected conversion event and adjusts the projection accordingly.",
+        )
         event_choice = st.selectbox(
-            "Event", event_options, key="_widget_event", on_change=_event_changed
+            "Conversion Event", event_options or [""], index=None if event_options else 0, placeholder=" ",
+            key="_widget_event", on_change=_event_changed, label_visibility="collapsed",
+            disabled=not event_options, format_func=lambda value: value or "",
         )
 
     channel_dimensions = []
-    if sub_account_choice != "(none found)" and event_choice != "(none found)":
+    if all_account_choice and sub_account_choice and event_choice:
         channel_dimensions = account_dimensions(
             session, all_account_choice,
             sub_account=sub_account_choice, event=event_choice,
@@ -1962,19 +2133,29 @@ if active_tab == 0:
     channel_options = sorted({
         str(row.get("CHANNEL")).strip() for row in channel_dimensions
         if row.get("CHANNEL")
-    }) or ["(none found)"]
+    })
+    if (
+        st.session_state.get("_widget_channel")
+        and st.session_state.get("_widget_channel") not in channel_options
+    ):
+        st.session_state.pop("_widget_channel", None)
     saved_channel = st.session_state.get("selected_channel")
     if "_widget_channel" not in st.session_state and saved_channel in channel_options:
         st.session_state._widget_channel = saved_channel
     with secondary_row[1]:
+        compact_field_label(
+            "Marketing Channel",
+            "Select the marketing channel you would like to project.",
+            "Identifies the marketing channel used to deliver the campaign, such as email, display, or inbox advertising.",
+        )
         channel_choice = st.selectbox(
-            "Channel", channel_options, key="_widget_channel", on_change=_channel_changed
+            "Marketing Channel", channel_options or [""], index=None if channel_options else 0, placeholder=" ",
+            key="_widget_channel", on_change=_channel_changed, label_visibility="collapsed",
+            disabled=not channel_options, format_func=lambda value: value or "",
         )
 
-    planning_inputs_ready = (
-        all_account_choice != "(select an account)"
-        and sub_account_choice != "(none found)"
-        and channel_choice != "(none found)"
+    planning_inputs_ready = bool(
+        all_account_choice and sub_account_choice and event_choice and channel_choice
     )
     try:
         available_planning_quarters = (
@@ -2001,90 +2182,99 @@ if active_tab == 0:
         st.session_state.planning_quarter_scope = planning_quarter_scope
         st.session_state.pop("selected_planning_quarter", None)
         st.session_state.pop("applied_planning_key", None)
+        st.session_state.pop("_widget_projection_quarter", None)
+        st.session_state.pop("projection_quarter", None)
 
     if st.session_state.get("selected_planning_quarter") not in available_planning_quarters:
         st.session_state.pop("selected_planning_quarter", None)
 
-    def _planning_quarter_changed():
-        """Force every planning-dependent value to reload for the new quarter."""
-        st.session_state.pop("applied_planning_key", None)
-        st.session_state.forecast = None
-        st.session_state.tier_adjustments = {}
-        st.session_state.tier_overrides = {}
-        st.session_state.message = "Planning quarter changed. Loading its approved planning inputs."
+    def _quarter_sort_value(label: str) -> int:
+        match = re.fullmatch(r"Q([1-4])\s+(\d{4})", label.strip(), re.I)
+        return int(match.group(2)) * 4 + int(match.group(1)) if match else 0
 
-    # Default once to the newest available quarter.  After that, retain the
-    # analyst's selection; never overwrite Q3 with Q2 (or any other quarter)
-    # during a Streamlit rerun.
-    if available_planning_quarters:
-        if "selected_planning_quarter" not in st.session_state:
-            st.session_state.selected_planning_quarter = available_planning_quarters[0]
-        st.selectbox(
-            "Planning quarter",
-            available_planning_quarters,
-            key="selected_planning_quarter",
-            on_change=_planning_quarter_changed,
+    def _next_quarter_label(label: str) -> str | None:
+        match = re.fullmatch(r"Q([1-4])\s+(\d{4})", label.strip(), re.I)
+        if not match:
+            return None
+        quarter, year = int(match.group(1)), int(match.group(2))
+        return f"Q1 {year + 1}" if quarter == 4 else f"Q{quarter + 1} {year}"
+
+    # The analyst selects the projection target. Its source universe is always
+    # the immediately preceding approved planning quarter.
+    current_date = datetime.now(timezone.utc)
+    current_quarter = f"Q{((current_date.month - 1) // 3) + 1} {current_date.year}"
+    projection_to_source = {
+        projection: source
+        for source in available_planning_quarters
+        if (projection := _next_quarter_label(source))
+        and _quarter_sort_value(projection) >= _quarter_sort_value(current_quarter)
+    }
+    _projection_quarter_options = sorted(
+        projection_to_source,
+        key=_quarter_sort_value,
+    )
+
+    proj_row = st.columns(2)
+    quarter_selector_label = (
+        "Starting Quarter"
+        if st.session_state.get("_widget_projection_mode", "Quarterly") == "Annual"
+        else "Projection Quarter"
+    )
+    if _projection_quarter_options:
+        if st.session_state.get("_widget_projection_quarter") not in _projection_quarter_options:
+            st.session_state._widget_projection_quarter = _projection_quarter_options[0]
+        with proj_row[0]:
+            projection_quarter_choice = st.selectbox(
+                quarter_selector_label,
+                _projection_quarter_options,
+                key="_widget_projection_quarter",
+                help="Choose the quarter to forecast. The preceding approved quarter is used automatically as the source universe.",
+            )
+
+        using_data_quarter = projection_to_source[projection_quarter_choice]
+        if st.session_state.get("selected_planning_quarter") != using_data_quarter:
+            st.session_state.selected_planning_quarter = using_data_quarter
+            st.session_state.pop("applied_planning_key", None)
+            st.session_state.forecast = None
+            st.session_state.tier_adjustments = {}
+            st.session_state.tier_overrides = {}
+
+        st.markdown(
+            f'<div style="margin:0.7rem 0 0.2rem;"><strong>Using Data From:</strong> <code>{using_data_quarter}</code></div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Performing projection for {projection_quarter_choice} using {using_data_quarter} universe max reach."
         )
     else:
+        projection_quarter_choice = None
+        using_data_quarter = None
         st.session_state.pop("selected_planning_quarter", None)
-        if planning_inputs_ready:
-            st.caption("No approved planning quarter is available for this account, sub account, and channel.")
+        with proj_row[0]:
+            st.caption(
+                "No current or future projection quarter has an approved preceding source-data quarter."
+            )
 
-    # --- Projection quarter & mode (side by side) ---
-    def _build_projection_quarters() -> list[str]:
-        from datetime import date as _date
-        today = _date.today()
-        current_q = (today.month - 1) // 3 + 1
-        current_y = today.year
-        quarters = []
-        for offset in range(0, 9):
-            idx = current_y * 4 + (current_q - 1) - offset
-            y = idx // 4
-            q = idx % 4 + 1
-            quarters.append(f"Q{q} {y}")
-        return quarters
-
-    _projection_quarter_options = _build_projection_quarters()
-    proj_row = st.columns(2)
-    with proj_row[0]:
-        projection_quarter_choice = st.selectbox(
-            "Projection quarter",
-            _projection_quarter_options,
-            index=0,
-            key="_widget_projection_quarter",
-            help="Quarter to forecast for. Historical quarters before this will be available as reference inputs.",
-        )
     with proj_row[1]:
         projection_mode = st.radio(
-            "Projection mode",
+            "Projection Mode",
             options=["Quarterly", "Annual"],
             index=0,
             horizontal=True,
             key="_widget_projection_mode",
-            help="Quarterly projects a single quarter; Annual multiplies by 4.",
+            help="Quarterly generates projections for the selected quarter. Annual scales the quarterly projection by 4× and applies seasonal indexes to provide a full-year projection by quarter.",
         )
 
     table_name = REFERENCE_HISTORICAL_TABLE
     if st.button("Load Historical Data", type="primary"):
         try:
-            if (
-                all_account_choice == "(select an account)"
-                or sub_account_choice == "(none found)"
-                or event_choice == "(none found)"
-                or channel_choice == "(none found)"
-            ):
-                raise ValueError("Select an account, sub account, event, and channel first.")
+            if not (all_account_choice and sub_account_choice and event_choice and channel_choice):
+                raise ValueError("Select a client, campaign, conversion event, and marketing channel first.")
             reset_after_source()
             st.session_state.source_account = all_account_choice
-            st.session_state.selected_sub_account = (
-                None if sub_account_choice == "(none found)" else sub_account_choice
-            )
-            st.session_state.selected_event = (
-                None if event_choice == "(none found)" else event_choice
-            )
-            st.session_state.selected_channel = (
-                None if channel_choice == "(none found)" else channel_choice
-            )
+            st.session_state.selected_sub_account = sub_account_choice or None
+            st.session_state.selected_event = event_choice or None
+            st.session_state.selected_channel = channel_choice or None
             st.session_state.projection_mode = projection_mode
             st.session_state.projection_quarter = projection_quarter_choice
             st.session_state.sources = [{"DERIVED_WEEKLY_TABLE": table_name}]
@@ -2101,7 +2291,13 @@ if active_tab == 0:
 # HISTORICAL QUARTER REVIEW — remains on the Inputs tab
 # =============================================================================
 if st.session_state.preview and active_tab == 0:
-    st.subheader("Historical quarter data — review and approve")
+    st.markdown(
+        '<h3 style="margin:0.2rem 0 0.3rem;">Historical Quarterly Performance '
+        '<span title="Results come directly from Multi-Tenant Results data and should align with reported quarterly performance." '
+        'class="info-icon" aria-label="More information">i</span></h3>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Review and approve the historical performance data before proceeding to the next step.")
 
     # Filter to quarters before the projection quarter, sorted most recent first
     def _quarter_sort_value(label: str) -> int:
@@ -2171,8 +2367,15 @@ if st.session_state.preview and active_tab == 0:
         if row["campaign_quarter"] in selected_quarters
     ]
 
+    incomplete = [row for row in selected_history if not row["is_complete"]]
+    partial_approved = False
+    if incomplete:
+        partial_approved = st.checkbox(
+            "I reviewed and approve the selected partial quarter(s)."
+        )
+
     # Keep the seasonal-index review with the historical selection, before the
-    # user confirms it.  Automatic values use the existing calculation; manual
+    # user confirms it. Automatic values use the existing calculation; manual
     # values are an explicit analyst override.
     try:
         automatic_indexes = seasonal_indexes(
@@ -2187,13 +2390,6 @@ if st.session_state.preview and active_tab == 0:
         render_monthly_index_section(automatic_indexes)
     except Exception as exc:
         st.warning(f"Could not load monthly breakdown: {exc}")
-
-    incomplete = [row for row in selected_history if not row["is_complete"]]
-    partial_approved = False
-    if incomplete:
-        partial_approved = st.checkbox(
-            "I reviewed and approve the selected partial quarter(s)."
-        )
     can_confirm = (
         bool(selected_history)
         and (not incomplete or partial_approved)
@@ -2208,6 +2404,7 @@ if st.session_state.preview and active_tab == 0:
             "Historical inputs confirmed. Configure the planning and forecast inputs."
         )
         st.session_state.active_tab = 1
+        st.session_state.scroll_to_top = True
         st.rerun()
 
 
@@ -2367,10 +2564,7 @@ if st.session_state.confirmed and active_tab == 1:
             ),
         )
         st.session_state.frequency_at_max = float(frequency_at_max)
-        st.caption(
-            f"Historic Prospect Frequency = {historical_frequency:.1f}x"
-        #     f"Recommended frequency: {recommended_frequency:.1f}x to maintain Sustainable Scale."
-        )
+        st.caption(f"Historic Prospect Frequency = {historical_frequency:.1f}x")
 
     with range_col:
         range_percent = st.number_input(
@@ -2393,11 +2587,15 @@ if st.session_state.confirmed and active_tab == 1:
     maximum_scale = (max_reach * 1.25) * frequency_at_max / 1000 * cpm
     extended_scale = (max_reach * 1.50) * frequency_at_max / 1000 * cpm
 
-    def kpi_card(col, label, value, hint="", accent=False):
+    def kpi_card(col, label, value, hint="", tooltip="", accent=False):
         val_class = "kpi-value-accent" if accent else "kpi-value"
+        info_html = (
+            f' <span class="info-icon" title="{tooltip}" aria-label="More information">i</span>'
+            if tooltip else ""
+        )
         hint_html = f'<div class="kpi-hint">{hint}</div>' if hint else ""
         col.markdown(
-            f'<div class="kpi-card"><div class="kpi-label">{label}</div>'
+            f'<div class="kpi-card"><div class="kpi-label">{label}{info_html}</div>'
             f'<div class="{val_class}">{value}</div>{hint_html}</div>',
             unsafe_allow_html=True,
         )
@@ -2405,27 +2603,52 @@ if st.session_state.confirmed and active_tab == 1:
     # Eight evenly sized cards: four columns on desktop, with Streamlit's
     # built-in responsive stacking on smaller screens.
     row1 = st.columns(4)
-    kpi_card(row1[0], "Current Budget", money(current_budget))
-    kpi_card(row1[1], "Forecast CPM", f"${float(cpm):,.2f}")
-    kpi_card(row1[2], "Planned Reach", number(planned_reach))
-    kpi_card(row1[3], "Current Signal Utilization", f"{int(signal_utilization * 100)}%")
+    kpi_card(
+        row1[0], "Current Quarterly Investment", money(current_budget),
+        "Based on the most recent media plan.",
+        "The investment is based on the most recent available media planning documentation.",
+    )
+    kpi_card(
+        row1[1], "Current Quarter CPM", f"${float(cpm):,.2f}",
+        "Based on the most recent media plan.",
+        "The CPM is based on the most recent available media planning documentation.",
+    )
+    kpi_card(
+        row1[2], "Current Quarter Planned Reach", number(planned_reach),
+        "Expected prospects reached this quarter.",
+        "The number of prospects expected to receive media at the current investment level and CPM.",
+    )
+    kpi_card(
+        row1[3], "Current Quarter Signal Utilization", f"{signal_utilization * 100:.0f}%",
+        "Share of intent-signal prospects used.",
+        "The percentage of intent-signal prospects expected to be used by campaign end. For example, 75% utilization of 5M prospects uses 3.75M prospects and leaves about 25% opportunity to scale.",
+    )
 
     row2 = st.columns(4)
-    kpi_card(row2[0], "Max Reach to Maintain Performance", number(max_reach))
+    kpi_card(
+        row2[0], "Max Reach to Maintain Performance", number(max_reach),
+        "Reach available before 100% utilization.",
+        "Prospects that can be reached before 100% signal utilization while expecting similar historical performance. This does not mean every prospect has an intent signal.",
+    )
     max_volume_max_signal = max_reach * frequency_at_max
     kpi_card(
-        row2[1],
-        "Max Volume with Max Signal Utilization",
-        number(max_volume_max_signal),
+        row2[1], "Max Media Impressions at 100%", number(max_volume_max_signal),
+        "Expected volume at selected frequency.",
+        "Expected media volume at the selected frequency and 100% signal utilization while maintaining consistent performance.",
         accent=True,
     )
     kpi_card(
-        row2[2],
-        "Max Investment with Max Signal Utilization",
-        money(max_investment),
+        row2[2], "Max Investment at 100%", money(max_investment),
+        "Investment required at maximum volume.",
+        "Maximum investment required to deliver the maximum media volume and achieve 100% signal utilization.",
         accent=True,
     )
-    kpi_card(row2[3], "Maximum Scale (1.25x)", money(maximum_scale), accent=True)
+    kpi_card(
+        row2[3], "Max-Max Scale", money(maximum_scale),
+        "25% additional reach beyond 100%.",
+        "Represents 25% additional reach beyond 100% signal utilization. Scaling beyond 100% uses signals at rest, so marginal performance can decline quickly.",
+        accent=True,
+    )
 
     st.divider()
 
@@ -2434,22 +2657,23 @@ if st.session_state.confirmed and active_tab == 1:
     high_utilization = float(signal_utilization) >= 0.90
     at_full_utilization = float(signal_utilization) >= 1.0
     labels = [
-        "Baseline",
-        "Steady Growth",
-        "Core Growth",
-        "Accelerated Growth",
-        "Breakout Growth",
-        "Sustainable Scale",
+        "Current Investment",
+        "Growth Momentum",
+        "Strategic Growth",
+        "Market Expansion",
+        "Strategic Scale",
+        "Optimal Scale",
     ]
 
     if at_full_utilization:
-        # Current Budget is already Sustainable at 100% utilization.
-        labels = ["Sustainable Scale"]
-        calculated_tier_values = [current_budget]
+        # Keep Current Budget as the initial tier; derive Optimal Scale from
+        # Max Reach × Frequency ÷ 1,000 × CPM, matching Excel.
+        labels = ["Current Investment", "Optimal Scale"]
+        calculated_tier_values = [current_budget, max_investment]
         minimum_tier_gap = 0.01
     elif high_utilization:
         midpoint = (current_budget + max_investment) / 2
-        labels = ["Baseline", "Core Growth", "Sustainable Scale"]
+        labels = ["Current Investment", "Strategic Scale", "Optimal Scale"]
         calculated_tier_values = [current_budget, midpoint, max_investment]
         minimum_tier_gap = 0.01
     else:
@@ -2533,8 +2757,8 @@ if st.session_state.confirmed and active_tab == 1:
     with mode_col:
         if at_full_utilization:
             st.caption(
-                "At 100% utilization, Current Budget is the fixed Sustainable Scale. "
-                "Only the extension tiers are forecast."
+                "At 100% utilization, Current Budget is the Baseline. "
+                "Sustainable Scale is calculated from Max Reach and frequency."
             )
             st.session_state.manual_tier_mode = False
         elif st.session_state.manual_tier_mode:
@@ -2705,7 +2929,13 @@ if st.session_state.confirmed and active_tab == 1:
     num_scenarios = st.session_state.num_scenarios
     scenario_heading_col, scenario_add_col, scenario_remove_col = st.columns([6, 1.35, 1.15])
     with scenario_heading_col:
-        st.subheader("Improvement scenarios")
+        st.markdown(
+            '<h3 style="margin:0.2rem 0 0.3rem;">Forecasting Adjustment Scenarios '
+            '<span title="Test the effect of one or more improvement assumptions on the forecast. '
+            'Scenario factors preserve decimal precision in inputs, results, and charts." '
+            'class="info-icon" aria-label="More information">i</span></h3>',
+            unsafe_allow_html=True,
+        )
     with scenario_add_col:
         if num_scenarios < 10:
             st.button("+ Add", key="add_scenario_heading", on_click=_add_scenario)
@@ -2755,10 +2985,12 @@ if st.session_state.confirmed and active_tab == 1:
         or st.session_state.manual_tier_mode
         or has_tier_headroom
     )
+    seasonal_indexes_are_valid = manual_seasonal_indexes_valid()
     forecast_ready = (
         max_investment >= current_budget
         and tiers_strictly_increasing
         and calculated_tiers_available
+        and seasonal_indexes_are_valid
     )
     if not forecast_ready:
         if not calculated_tiers_available:
@@ -2766,6 +2998,11 @@ if st.session_state.confirmed and active_tab == 1:
                 "Forecast is paused: there is no calculated headroom above Current "
                 "Budget. Use the recommended frequency or enter strictly increasing "
                 "manual tiers."
+            )
+        elif not seasonal_indexes_are_valid:
+            st.error(
+                "Forecast is paused because each Manual seasonal-index table must "
+                "total exactly 100%."
             )
         else:
             st.error(
@@ -2828,6 +3065,7 @@ if st.session_state.confirmed and active_tab == 1:
             }
             st.session_state.message = "Forecast draft created."
             st.session_state.active_tab = 2
+            st.session_state.scroll_to_top = True
             st.rerun()
         except Exception as exc:
             st.error(f"Forecast calculation failed: {exc}")
@@ -3103,7 +3341,307 @@ if st.session_state.forecast and active_tab == 2:
             if imp_rows:
                 st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
 
-    _render_download_button("tab3a")
+        # Scenario selector for 3b/3c
+        st.markdown("---")
+        _scenario_options = ["Baseline"]
+        for name, factor, _rows in result["improvements"]:
+            _scenario_options.append(f"+{float(factor)*100:.0f}% Improvement")
+        st.session_state.setdefault("annual_scenario", "Baseline")
+        _selected_scenario = st.radio(
+            "Scenario for Quarterly & Monthly splits",
+            options=_scenario_options,
+            index=_scenario_options.index(st.session_state.get("annual_scenario", "Baseline"))
+                if st.session_state.get("annual_scenario", "Baseline") in _scenario_options else 0,
+            horizontal=True,
+            key="_widget_annual_scenario",
+            help="Select which scenario to use for the Quarterly Split and Monthly Split tabs.",
+        )
+        st.session_state.annual_scenario = _selected_scenario
+
+    def _export_float(value):
+        return float(value) if value is not None else None
+
+    def _export_projection_rows(rows):
+        return [
+            [
+                row.historical_quarter,
+                row.tier_label,
+                _export_float(row.investment),
+                _export_float(row.delivered_volume),
+                _export_float(row.prospects),
+                _export_float(row.incremental_customers),
+                _export_float(row.incremental_revenue),
+                _export_float(row.cpix),
+                _export_float(row.iroas),
+                _export_float(row.marginal_cpix),
+                _export_float(row.marginal_iroas),
+                _export_float(row.new_signal_utilization) * 100 if row.new_signal_utilization is not None else None,
+            ]
+            for row in sorted(
+                rows,
+                key=lambda item: (quarter_value(item.historical_quarter), float(item.investment)),
+            )
+        ]
+
+    def _export_range_rows(rows, annual_multiplier=1.0):
+        return [
+            [
+                row.tier_label,
+                _export_float(row.investment) * annual_multiplier,
+                _export_float(row.delivered_volume) * annual_multiplier,
+                _export_float(row.prospects) * annual_multiplier,
+                _export_float(row.incremental_customers.minimum) * annual_multiplier,
+                _export_float(row.incremental_customers.maximum) * annual_multiplier,
+                _export_float(row.incremental_revenue.minimum) * annual_multiplier,
+                _export_float(row.incremental_revenue.maximum) * annual_multiplier,
+                _export_float(row.cpix.minimum),
+                _export_float(row.cpix.maximum),
+                _export_float(row.iroas.minimum),
+                _export_float(row.iroas.maximum),
+            ]
+            for row in rows
+        ]
+
+    def _export_kpi_bounds(bound):
+        metric_fields = [
+            ("Investment", "investment"),
+            ("Delivered Volume", "delivered_volume"),
+            ("Prospects", "prospects"),
+            ("Inc. Customers", "incremental_customers"),
+            ("Incremental Revenue", "incremental_revenue"),
+            ("CPIx", "cpix"),
+            ("iROAS", "iroas"),
+            ("Marginal CPIx", "marginal_cpix"),
+            ("Marginal iROAS", "marginal_iroas"),
+        ]
+        by_tier = {}
+        for projection in result["projections"]:
+            by_tier.setdefault(projection.tier_label, []).append(projection)
+        output = []
+        for tier, projections_for_tier in sorted(
+            by_tier.items(), key=lambda item: float(item[1][0].investment)
+        ):
+            values = [tier]
+            for _, field in metric_fields:
+                candidates = [
+                    _export_float(getattr(projection, field))
+                    for projection in projections_for_tier
+                    if getattr(projection, field) is not None
+                ]
+                values.append(bound(candidates) if candidates else None)
+            output.append(values)
+        return output
+
+    export_sheets = [
+        {
+            "name": "Run Summary",
+            "title": "ForecastPro AI Run Summary",
+            "subtitle": "Selections used for this downloaded forecast",
+            "headers": ["Input", "Value"],
+            "rows": [
+                ["Client Name", st.session_state.get("source_account")],
+                ["Conversion Event", st.session_state.get("selected_event")],
+                ["Campaign Name", st.session_state.get("selected_sub_account")],
+                ["Marketing Channel", st.session_state.get("selected_channel")],
+                ["Using Data From", st.session_state.get("selected_planning_quarter")],
+                ["Projection Quarter", st.session_state.get("projection_quarter")],
+                ["Projection Mode", st.session_state.get("projection_mode")],
+                ["Attribution Window (days)", st.session_state.get("attribution_window")],
+                ["Selected Historical Quarters", ", ".join(row["campaign_quarter"] for row in st.session_state.selected_history)],
+            ],
+            "widths": [34, 56],
+        },
+        {
+            "name": "Planning Inputs",
+            "title": "Historical Quarterly Performance and KPIs",
+            "subtitle": "Planning values used by the current forecast run",
+            "headers": ["Input", "Value"],
+            "rows": [
+                ["Current Quarterly Investment", _export_float(st.session_state.get("current_budget"))],
+                ["Current Quarter CPM", _export_float(st.session_state.get("cpm"))],
+                ["Current Quarter Planned Reach", _export_float(st.session_state.get("planned_reach"))],
+                ["Current Quarter Signal Utilization (%)", _export_float(st.session_state.get("signal_utilization")) * 100],
+                ["Max Reach to Maintain Performance", _export_float(st.session_state.get("max_reach"))],
+                ["Frequency at Max Reach", _export_float(st.session_state.get("frequency_at_max"))],
+            ],
+            "widths": [42, 22],
+            "formats": {1: "decimal"},
+        },
+        {
+            "name": "Investment Tiers",
+            "title": "Calculated Investment Tiers",
+            "subtitle": "Investment and scale used by the forecast",
+            "headers": ["Tier", "Investment", "Delivered Volume", "Prospects"],
+            "rows": [
+                [
+                    row.tier_label,
+                    _export_float(row.investment),
+                    _export_float(row.delivered_volume),
+                    _export_float(row.prospects),
+                ]
+                for row in result["ranges"]
+            ],
+            "widths": [30, 18, 20, 18],
+            "formats": {1: "money", 2: "integer", 3: "integer"},
+        },
+        {
+            "name": "Forecast Ranges",
+            "title": "Forecast Output Ranges",
+            "subtitle": f"{st.session_state.get('projection_mode')} projection for {st.session_state.get('projection_quarter')}",
+            "headers": [
+                "Tier", "Investment", "Delivered Volume", "Prospects",
+                "Inc. Customers Min", "Inc. Customers Max",
+                "Incremental Revenue Min", "Incremental Revenue Max",
+                "CPIx Min", "CPIx Max", "iROAS Min", "iROAS Max",
+            ],
+            "rows": _export_range_rows(result["ranges"]),
+            "widths": [30, 18, 20, 18, 18, 18, 22, 22, 14, 14, 14, 14],
+            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
+        },
+        {
+            "name": "QA Projections",
+            "title": "Projection Calculations",
+            "subtitle": "Tier-level calculations used to create KPI bounds and final ranges",
+            "headers": [
+                "Historical Quarter", "Tier", "Investment", "Delivered Volume", "Prospects",
+                "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS",
+                "Marginal CPIx", "Marginal iROAS", "Signal Utilization (%)",
+            ],
+            "rows": _export_projection_rows(result["projections"]),
+            "widths": [18, 30, 18, 20, 18, 18, 22, 14, 14, 16, 16, 20],
+            "formats": {2: "money", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
+        },
+        {
+            "name": "KPI Minimums",
+            "title": "KPI Minimums",
+            "subtitle": "Minimum value by metric across selected historical-quarter projection tables",
+            "headers": ["Tier", "Investment", "Delivered Volume", "Prospects", "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS", "Marginal CPIx", "Marginal iROAS"],
+            "rows": _export_kpi_bounds(min),
+            "widths": [30, 18, 20, 18, 18, 22, 14, 14, 16, 16],
+            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "money", 6: "money", 7: "money", 8: "decimal", 9: "decimal"},
+        },
+        {
+            "name": "KPI Maximums",
+            "title": "KPI Maximums",
+            "subtitle": "Maximum value by metric across selected historical-quarter projection tables",
+            "headers": ["Tier", "Investment", "Delivered Volume", "Prospects", "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS", "Marginal CPIx", "Marginal iROAS"],
+            "rows": _export_kpi_bounds(max),
+            "widths": [30, 18, 20, 18, 18, 22, 14, 14, 16, 16],
+            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "money", 6: "money", 7: "money", 8: "decimal", 9: "decimal"},
+        },
+        {
+            "name": "Final Ranges QA",
+            "title": "Final Ranges",
+            "subtitle": "Final forecast range values used in the results view",
+            "headers": [
+                "Tier", "Investment", "Delivered Volume", "Prospects",
+                "Inc. Customers Min", "Inc. Customers Max",
+                "Incremental Revenue Min", "Incremental Revenue Max",
+                "CPIx Min", "CPIx Max", "iROAS Min", "iROAS Max",
+            ],
+            "rows": _export_range_rows(result["ranges"]),
+            "widths": [30, 18, 20, 18, 18, 18, 22, 22, 14, 14, 14, 14],
+            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
+        },
+    ]
+
+    try:
+        export_indexes = effective_monthly_indexes(
+            seasonal_indexes(
+                session,
+                st.session_state.selected_source,
+                attribution_window=st.session_state.get("attribution_window", 30),
+                account_name=st.session_state.get("source_account"),
+                sub_account=st.session_state.get("selected_sub_account"),
+                event=st.session_state.get("selected_event"),
+                channel=st.session_state.get("selected_channel"),
+            )
+        )
+        export_sheets.append(
+            {
+                "name": "Seasonal Indexes",
+                "title": "Seasonal Indexes",
+                "subtitle": f"{st.session_state.get('monthly_index_mode', 'Automatic')} values used by this forecast",
+                "headers": ["Period", "Organic (%)", "Incremental (%)"],
+                "rows": [
+                    *[
+                        [quarter, export_indexes["quarterly_organic"].get(quarter, 0.0) * 100, export_indexes["quarterly_incremental"].get(quarter, 0.0) * 100]
+                        for quarter in ("Q1", "Q2", "Q3", "Q4")
+                    ],
+                    *[
+                        [month, export_indexes["monthly_organic"].get(month, 0.0) * 100, export_indexes["monthly_incremental"].get(month, 0.0) * 100]
+                        for month in MONTH_NAMES
+                    ],
+                ],
+                "widths": [18, 18, 20],
+                "formats": {1: "decimal", 2: "decimal"},
+            }
+        )
+    except Exception:
+        pass
+
+    scenario_rows = []
+    for scenario_name, improvement_factor, scenario_projections in result.get("improvements", []):
+        for row in sorted(
+            scenario_projections,
+            key=lambda item: (quarter_value(item.historical_quarter), float(item.investment)),
+        ):
+            scenario_rows.append(
+                [
+                    scenario_name,
+                    _export_float(improvement_factor) * 100,
+                    row.historical_quarter,
+                    row.tier_label,
+                    _export_float(row.investment),
+                    _export_float(row.incremental_customers),
+                    _export_float(row.incremental_revenue),
+                    _export_float(row.cpix),
+                    _export_float(row.iroas),
+                ]
+            )
+
+    if scenario_rows:
+        export_sheets.append(
+            {
+                "name": "Scenario Results",
+                "title": "Improvement Scenario Results",
+                "subtitle": "Scenario calculations using the same selected historical quarters",
+                "headers": ["Scenario", "Improvement Factor (%)", "Historical Quarter", "Tier", "Investment", "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS"],
+                "rows": scenario_rows,
+                "widths": [24, 22, 18, 30, 18, 18, 22, 14, 14],
+                "formats": {1: "decimal", 4: "money", 5: "integer", 6: "money", 7: "money", 8: "decimal"},
+            }
+        )
+
+    if st.session_state.get("projection_mode", "Quarterly") != "Quarterly":
+        export_sheets.append(
+            {
+                "name": "Annual Forecast",
+                "title": "Annual Forecast Results",
+                "subtitle": f"Annualized forecast beginning {st.session_state.get('projection_quarter')}",
+                "headers": [
+                    "Tier", "Investment", "Delivered Volume", "Prospects",
+                    "Inc. Customers Min", "Inc. Customers Max",
+                    "Incremental Revenue Min", "Incremental Revenue Max",
+                    "CPIx Min", "CPIx Max", "iROAS Min", "iROAS Max",
+                ],
+                "rows": _export_range_rows(result["ranges"], annual_multiplier=4.0),
+                "widths": [30, 18, 20, 18, 18, 18, 22, 22, 14, 14, 14, 14],
+                "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
+            }
+        )
+
+    workbook = build_workbook(
+        st.session_state.source_account,
+        st.session_state.historical_scope_label,
+        datetime.now(timezone.utc).isoformat(),
+        visible_ranges,
+        result["ranges"],
+        st.session_state.selected_history,
+    )
+    safe_account = re.sub(r"[^a-z0-9]+", "-", st.session_state.source_account.lower()).strip("-") or "forecast"
+    st.download_button("Download Excel workbook", workbook, f"{safe_account}-forecast.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
     tab_nav_buttons(tab_names, 2)
 
@@ -3760,3 +4298,195 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
             pass
 
     _render_download_button("charts", chart_images=_chart_images if _chart_images else None)
+    tab_nav_buttons(tab_names, _charts_tab_idx)
+
+
+
+# =============================================================================
+# TEMPORARY QA TAB — PROJECTION CALCULATIONS
+# Read-only display of the same in-memory projections used to create forecast
+# ranges. This is intentionally a presentation layer only.
+# =============================================================================
+if st.session_state.forecast and active_tab == _qa_tab_idx:
+    result = st.session_state.forecast
+    # QA mirrors the Excel Projection Calculations sheet: show Sustainable
+    # Scale plus every extension tier through Maximum Scale (+25%).
+    qa_visible_projections = list(result["projections"])
+    qa_history = sorted(
+        st.session_state.selected_history,
+        key=lambda row: quarter_value(row["campaign_quarter"]),
+    )
+    qa_history_by_quarter = {
+        row["campaign_quarter"]: row for row in qa_history
+    }
+    qa_quarters = sorted(
+        {row.historical_quarter for row in qa_visible_projections},
+        key=quarter_value,
+    )
+
+    def _qa_float(value):
+        return float(value) if value is not None else None
+
+    def _qa_actual_frame(rows):
+        return pd.DataFrame([
+            {
+                "Tier": row.tier_label,
+                "Investment": _qa_float(row.investment),
+                "Delivered Volume": _qa_float(row.delivered_volume),
+                "Prospects": _qa_float(row.prospects),
+                "Inc. Customers": _qa_float(row.incremental_customers),
+                "Incremental Revenue": _qa_float(row.incremental_revenue),
+                "CPIx": _qa_float(row.cpix),
+                "iROAS": _qa_float(row.iroas),
+                "Marginal CPIx": _qa_float(row.marginal_cpix),
+                "Marginal iROAS": _qa_float(row.marginal_iroas),
+                "New Signal Utilization": _qa_float(row.new_signal_utilization),
+                "Adjustment Factor": _qa_float(row.adjustment_factor),
+                "Marginal Inc. Customers": _qa_float(row.marginal_incremental_customers),
+            }
+            for row in sorted(rows, key=lambda item: float(item.investment))
+        ])
+
+    def _qa_scenario_frame(rows):
+        return pd.DataFrame([
+            {
+                "Tier": row.tier_label,
+                "Investment": _qa_float(row.investment),
+                "Inc. Customers": _qa_float(row.incremental_customers),
+                "Incremental Revenue": _qa_float(row.incremental_revenue),
+                "CPIx": _qa_float(row.cpix),
+                "iROAS": _qa_float(row.iroas),
+                "Marginal CPIx": _qa_float(row.marginal_cpix),
+                "Marginal iROAS": _qa_float(row.marginal_iroas),
+            }
+            for row in sorted(rows, key=lambda item: float(item.investment))
+        ])
+
+    st.header("Projection Calculations (QA)")
+    st.caption(
+        "Temporary, read-only QA view. These tables use the exact in-memory "
+        "projections that create the forecast ranges; they do not recalculate "
+        "or change the forecast."
+    )
+
+    qa_input_rows = [
+        {"Input": "Using Data From", "Value": st.session_state.get("selected_planning_quarter", "—")},
+        {"Input": "Projection Quarter", "Value": st.session_state.get("projection_quarter", "—")},
+        {"Input": "Projection Mode", "Value": st.session_state.get("projection_mode", "Quarterly")},
+        {"Input": "Selected Historical Quarters", "Value": ", ".join(qa_quarters)},
+        {"Input": "Current Budget", "Value": _qa_float(st.session_state.get("current_budget"))},
+        {"Input": "Forecast CPM", "Value": _qa_float(st.session_state.get("cpm"))},
+        {"Input": "Historical Prospect Frequency", "Value": sum(float(row["frequency"]) for row in qa_history) / len(qa_history) if qa_history else None},
+        {"Input": "Current Signal Utilization", "Value": _qa_float(st.session_state.get("signal_utilization"))},
+        {"Input": "Max Reach", "Value": _qa_float(st.session_state.get("max_reach"))},
+        {"Input": "Frequency at Max Reach", "Value": _qa_float(st.session_state.get("frequency_at_max"))},
+        {"Input": "One-Quarter Range Adjustment (%)", "Value": _qa_float(st.session_state.get("range_percent_input", 10))},
+        {"Input": "Range Method", "Value": result.get("method", "—")},
+    ]
+    st.dataframe(pd.DataFrame(qa_input_rows), hide_index=True, use_container_width=True)
+
+    qa_tabs = st.tabs([*qa_quarters, "KPI Minimums", "KPI Maximums", "Final Ranges"])
+    for qa_tab, quarter in zip(qa_tabs[:len(qa_quarters)], qa_quarters):
+        with qa_tab:
+            historical_row = qa_history_by_quarter.get(quarter, {})
+            st.caption(
+                f"Historical CPIx: {money(historical_row.get('cpix', 0))} | "
+                f"Average incremental revenue per customer: "
+                f"{money(historical_row.get('average_incremental_revenue', 0))}"
+            )
+            quarter_rows = [
+                row for row in qa_visible_projections
+                if row.historical_quarter == quarter
+            ]
+            actual_tab, *scenario_tabs = st.tabs(
+                ["Actual Historical Performance"] + [
+                    name for name, _, _ in result.get("improvements", [])
+                ]
+            )
+            with actual_tab:
+                st.dataframe(_qa_actual_frame(quarter_rows), hide_index=True, use_container_width=True)
+            for scenario_tab, (scenario_name, scenario_factor, scenario_rows) in zip(
+                scenario_tabs, result.get("improvements", [])
+            ):
+                with scenario_tab:
+                    st.caption(f"Improvement factor: {float(scenario_factor) * 100:.1f}%")
+                    st.dataframe(
+                        _qa_scenario_frame([
+                            row for row in scenario_rows
+                            if row.historical_quarter == quarter
+                        ]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+    qa_metric_fields = [
+        ("Investment", "investment"),
+        ("Delivered Volume", "delivered_volume"),
+        ("Prospects", "prospects"),
+        ("Inc. Customers", "incremental_customers"),
+        ("Incremental Revenue", "incremental_revenue"),
+        ("CPIx", "cpix"),
+        ("iROAS", "iroas"),
+        ("Marginal CPIx", "marginal_cpix"),
+        ("Marginal iROAS", "marginal_iroas"),
+        ("Marginal Inc. Customers", "marginal_incremental_customers"),
+    ]
+    qa_by_tier = {}
+    for row in qa_visible_projections:
+        qa_by_tier.setdefault(row.tier_label, []).append(row)
+
+    def _qa_bound_frame(bound):
+        output_rows = []
+        for label, tier_rows in sorted(
+            qa_by_tier.items(),
+            key=lambda item: float(item[1][0].investment),
+        ):
+            output_row = {"Tier": label}
+            for display_name, field in qa_metric_fields:
+                values = [
+                    _qa_float(getattr(row, field))
+                    for row in tier_rows
+                    if getattr(row, field) is not None
+                ]
+                output_row[display_name] = bound(values) if values else None
+            output_rows.append(output_row)
+        return pd.DataFrame(output_rows)
+
+    with qa_tabs[-3]:
+        st.caption("Metric-by-metric minimum across the selected historical-quarter projection tables.")
+        st.dataframe(_qa_bound_frame(min), hide_index=True, use_container_width=True)
+    with qa_tabs[-2]:
+        st.caption("Metric-by-metric maximum across the selected historical-quarter projection tables.")
+        st.dataframe(_qa_bound_frame(max), hide_index=True, use_container_width=True)
+    with qa_tabs[-1]:
+        if result.get("method") == "single-quarter-exact":
+            st.caption(
+                "One historical quarter is selected, so Final Ranges equal the KPI "
+                "Minimums and KPI Maximums for that quarter."
+            )
+        else:
+            st.caption(
+                "Final ranges are produced from the selected historical-quarter projections."
+            )
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Tier": row.tier_label,
+                    "Investment": _qa_float(row.investment),
+                    "Delivered Volume": _qa_float(row.delivered_volume),
+                    "Prospects": _qa_float(row.prospects),
+                    "Inc. Customers Min": _qa_float(row.incremental_customers.minimum),
+                    "Inc. Customers Max": _qa_float(row.incremental_customers.maximum),
+                    "Incremental Revenue Min": _qa_float(row.incremental_revenue.minimum),
+                    "Incremental Revenue Max": _qa_float(row.incremental_revenue.maximum),
+                    "CPIx Min": _qa_float(row.cpix.minimum),
+                    "CPIx Max": _qa_float(row.cpix.maximum),
+                    "iROAS Min": _qa_float(row.iroas.minimum),
+                    "iROAS Max": _qa_float(row.iroas.maximum),
+                }
+                for row in result["ranges"]            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    tab_nav_buttons(tab_names, _qa_tab_idx)
