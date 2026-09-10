@@ -31,34 +31,6 @@ def normalize_identifier(value: str, default_schema: str = "ZX.ANALYTICS") -> st
     return f"{default_schema}.{cleaned}" if "." not in cleaned else cleaned
 
 
-def discover_sources(
-    session: Any, account_name: str, campaign_year: int
-) -> list[dict[str, Any]]:
-    query = """
-        SELECT DISTINCT ACCT_NAME, SUB_ACCOUNT, CHANNEL, EVENT, CAMPAIGN_YEAR, CAMPAIGN_QTR,
-          GLOBAL_VAR_SETTINGS:"DERIVED_WEEKLY_TABLE"::STRING AS DERIVED_WEEKLY_TABLE
-        FROM ZX.ANALYTICS.ATTRIBUTION_CONFIG_OBJECTS
-        WHERE ACCT_NAME ILIKE ? AND CAMPAIGN_YEAR = ?
-        ORDER BY ACCT_NAME, SUB_ACCOUNT
-    """
-    rows = _rows(
-        session.sql(query, params=[f"%{account_name}%", int(campaign_year)]).collect()
-    )
-    unique: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if row.get("DERIVED_WEEKLY_TABLE"):
-            table = normalize_identifier(str(row["DERIVED_WEEKLY_TABLE"]))
-            unique[table] = {**row, "DERIVED_WEEKLY_TABLE": table}
-    unique.setdefault(
-        REFERENCE_HISTORICAL_TABLE,
-        {
-            "ACCT_NAME": account_name,
-            "CAMPAIGN_YEAR": campaign_year,
-            "DERIVED_WEEKLY_TABLE": REFERENCE_HISTORICAL_TABLE,
-        },
-    )
-    return list(unique.values())
-
 
 
 def account_dimensions(
@@ -483,30 +455,6 @@ def seasonal_indexes(
     }
 
 
-def _daily_organic_quarters(
-    session: Any,
-    account_name: str | None = None,
-    sub_account: str | None = None,
-    event: str | None = None,
-    channel: str | None = None,
-) -> list[dict[str, Any]]:
-    """Aggregate authoritative daily organic conversions by calendar quarter."""
-    where_clause, params = _dimension_filters(
-        account_name, sub_account, event, channel
-    )
-    query = f"""
-        SELECT CONCAT(
-                   'Q', DATE_PART('QUARTER', CONVERSION_DATE), ' ',
-                   DATE_PART('YEAR', CONVERSION_DATE)
-               ) AS CAMPAIGN_QUARTER,
-               SUM(COALESCE(RELEVANT_ORGANIC_CONVERSIONS, 0)) AS ORGANIC
-        FROM {ORGANIC_DAILY_TABLE}
-        WHERE {where_clause}
-          AND CONVERSION_DATE IS NOT NULL
-        GROUP BY 1
-        ORDER BY 1
-    """
-    return _rows(session.sql(query, params=params).collect())
 
 
 def _daily_organic_months(
@@ -532,45 +480,6 @@ def _daily_organic_months(
     return _rows(session.sql(query, params=params).collect())
 
 
-def _try_monthly_from_derived(
-    session: Any,
-    table: str,
-    attribution_window: int,
-    account_name: str | None = None,
-    sub_account: str | None = None,
-    event: str | None = None,
-    channel: str | None = None,
-) -> list[dict[str, Any]]:
-    """Try to get monthly data from the selected four-dimension slice."""
-    try:
-        where_clause, params = _slice_filters(
-            attribution_window,
-            account_name,
-            sub_account,
-            event,
-            channel,
-        )
-        query = f"""
-            WITH latest AS (
-                SELECT DERIVED_MONTH,
-                       SUM(COALESCE(MONTHLY_TRT_CONVERSIONS, 0)) + SUM(COALESCE(MONTHLY_CTR_CONVERSIONS, 0)) AS ORGANIC,
-                       SUM(COALESCE(MONTHLY_INC_NEW_SALES, 0)) AS INCREMENTAL,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY DERIVED_MONTH
-                           ORDER BY DELIVERY_WEEK DESC
-                       ) AS rn
-                FROM {table}
-                WHERE {where_clause}
-                  AND DERIVED_MONTH IS NOT NULL
-                GROUP BY DERIVED_MONTH, DELIVERY_WEEK
-            )
-            SELECT DERIVED_MONTH AS MONTH, ORGANIC, INCREMENTAL
-            FROM latest WHERE rn = 1
-            ORDER BY DERIVED_MONTH
-        """
-        return _rows(session.sql(query, params=params).collect())
-    except Exception:
-        return []
 
 
 def _try_monthly_from_cumulative(

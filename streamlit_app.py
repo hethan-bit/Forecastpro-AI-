@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -28,12 +27,10 @@ from forecast_core import (
     ForecastScenarioInput,
     HistoricalPerformance,
     InvestmentTier,
-    MonthlyProjection,
     apply_improvement_factor,
     calculate_standard_projections,
     forecast_ranges,
     load_curve,
-    monthly_projections,
 )
 from planning_source import planning_input, planning_quarters, PLANNING_INPUT_TABLE
 
@@ -885,7 +882,6 @@ def initialize_state() -> None:
         "max_reach": 10_000_000.0,
         "frequency_at_max": 18.0,
         "selected_source": None,
-        "selected_campaign": None,
         "historical_scope_label": "Historical slice",
         "selected_sub_account": None,
         "selected_event": None,
@@ -1850,21 +1846,6 @@ with reset_col:
         reset_for_new_account()
         st.rerun()
 
-# st.markdown(
-#     '<div class="workflow">'
-#     '<span style="color:#16a34a;font-weight:700;">✓ Source</span>'
-#     '&nbsp;&nbsp;→&nbsp;&nbsp;'
-#     '<span style="color:#16a34a;font-weight:700;">✓ Reconcile</span>'
-#     '&nbsp;&nbsp;→&nbsp;&nbsp;'
-#     '<span style="color:#16a34a;font-weight:700;">✓ Review</span>'
-#     '&nbsp;&nbsp;→&nbsp;&nbsp;'
-#     '<span style="background:linear-gradient(135deg,#0ea65f,#06b6d4,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:700;">● Forecast</span>'
-#     '&nbsp;&nbsp;→&nbsp;&nbsp;'
-#     '<span style="color:#bbb;font-weight:500;">○ Annual</span>'
-#     '</div>',
-#     unsafe_allow_html=True,
-# )
-
 # =============================================================================
 # MAILOPS EDITOR — full-page mode, hides the forecast UI
 # =============================================================================
@@ -2470,26 +2451,11 @@ if st.session_state.confirmed and active_tab == 1:
     minimum_viable_frequency = (
         current_budget * 1000 / (max_reach * cpm)
     )
-    historical_signal_frequency = (
-        historical_frequency / max(signal_utilization, 0.01)
-    )
-    # recommended_frequency = max(
-    #     minimum_viable_frequency, historical_signal_frequency
-    #)
     frequency_widget_key = "_widget_frequency_at_max"
     if frequency_widget_key not in st.session_state:
         st.session_state[frequency_widget_key] = float(
             st.session_state.frequency_at_max
         )
-
-    frequency_auto_adjusted = False
-    if st.session_state.frequency_at_max < minimum_viable_frequency:
-        previous_frequency = st.session_state.frequency_at_max
-        # adjusted_frequency = round(recommended_frequency, 2)
-        # st.session_state.frequency_at_max = adjusted_frequency
-        st.session_state[frequency_widget_key] = adjusted_frequency
-        st.session_state.tier_adjustments = {}
-        frequency_auto_adjusted = True
 
     def _frequency_changed():
         st.session_state.frequency_at_max = float(
@@ -2575,17 +2541,10 @@ if st.session_state.confirmed and active_tab == 1:
             key="range_percent_input",
         )
 
-    if frequency_auto_adjusted:
-        st.info(
-            f"Frequency was automatically raised from {previous_frequency:.2f} "
-            f"to {frequency_at_max:.2f} because the selected planning value would place "
-            "Sustainable Scale below Current Budget."
-        )
 
     # Calculated values retained for the existing tier and forecast methodology.
     max_investment = max_reach * frequency_at_max * cpm / 1000
     maximum_scale = (max_reach * 1.25) * frequency_at_max / 1000 * cpm
-    extended_scale = (max_reach * 1.50) * frequency_at_max / 1000 * cpm
 
     def kpi_card(col, label, value, hint="", tooltip="", accent=False):
         val_class = "kpi-value-accent" if accent else "kpi-value"
@@ -3113,6 +3072,22 @@ if st.session_state.forecast and active_tab == 2:
 
     st.header("Forecast Output Ranges")
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
+
+    if not _is_quarterly_mode:
+        _scenario_options = ["Baseline"]
+        for _sn, _sf, _sr in result["improvements"]:
+            _scenario_options.append(f"+{float(_sf)*100:.0f}% Improvement")
+        st.session_state.setdefault("annual_scenario", "Baseline")
+        _selected_scenario = st.radio(
+            "Scenario for Quarterly & Monthly Splits",
+            options=_scenario_options,
+            index=_scenario_options.index(st.session_state.get("annual_scenario", "Baseline"))
+                if st.session_state.get("annual_scenario", "Baseline") in _scenario_options else 0,
+            horizontal=True,
+            key="_widget_annual_scenario",
+            help="This selection applies to the Quarterly Split and Monthly Split tabs as well.",
+        )
+        st.session_state.annual_scenario = _selected_scenario
     _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
     # Build marginal ranges from projections across all historical quarters
     from collections import defaultdict as _defaultdict
@@ -3341,307 +3316,8 @@ if st.session_state.forecast and active_tab == 2:
             if imp_rows:
                 st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
 
-        # Scenario selector for 3b/3c
-        st.markdown("---")
-        _scenario_options = ["Baseline"]
-        for name, factor, _rows in result["improvements"]:
-            _scenario_options.append(f"+{float(factor)*100:.0f}% Improvement")
-        st.session_state.setdefault("annual_scenario", "Baseline")
-        _selected_scenario = st.radio(
-            "Scenario for Quarterly & Monthly splits",
-            options=_scenario_options,
-            index=_scenario_options.index(st.session_state.get("annual_scenario", "Baseline"))
-                if st.session_state.get("annual_scenario", "Baseline") in _scenario_options else 0,
-            horizontal=True,
-            key="_widget_annual_scenario",
-            help="Select which scenario to use for the Quarterly Split and Monthly Split tabs.",
-        )
-        st.session_state.annual_scenario = _selected_scenario
 
-    def _export_float(value):
-        return float(value) if value is not None else None
-
-    def _export_projection_rows(rows):
-        return [
-            [
-                row.historical_quarter,
-                row.tier_label,
-                _export_float(row.investment),
-                _export_float(row.delivered_volume),
-                _export_float(row.prospects),
-                _export_float(row.incremental_customers),
-                _export_float(row.incremental_revenue),
-                _export_float(row.cpix),
-                _export_float(row.iroas),
-                _export_float(row.marginal_cpix),
-                _export_float(row.marginal_iroas),
-                _export_float(row.new_signal_utilization) * 100 if row.new_signal_utilization is not None else None,
-            ]
-            for row in sorted(
-                rows,
-                key=lambda item: (quarter_value(item.historical_quarter), float(item.investment)),
-            )
-        ]
-
-    def _export_range_rows(rows, annual_multiplier=1.0):
-        return [
-            [
-                row.tier_label,
-                _export_float(row.investment) * annual_multiplier,
-                _export_float(row.delivered_volume) * annual_multiplier,
-                _export_float(row.prospects) * annual_multiplier,
-                _export_float(row.incremental_customers.minimum) * annual_multiplier,
-                _export_float(row.incremental_customers.maximum) * annual_multiplier,
-                _export_float(row.incremental_revenue.minimum) * annual_multiplier,
-                _export_float(row.incremental_revenue.maximum) * annual_multiplier,
-                _export_float(row.cpix.minimum),
-                _export_float(row.cpix.maximum),
-                _export_float(row.iroas.minimum),
-                _export_float(row.iroas.maximum),
-            ]
-            for row in rows
-        ]
-
-    def _export_kpi_bounds(bound):
-        metric_fields = [
-            ("Investment", "investment"),
-            ("Delivered Volume", "delivered_volume"),
-            ("Prospects", "prospects"),
-            ("Inc. Customers", "incremental_customers"),
-            ("Incremental Revenue", "incremental_revenue"),
-            ("CPIx", "cpix"),
-            ("iROAS", "iroas"),
-            ("Marginal CPIx", "marginal_cpix"),
-            ("Marginal iROAS", "marginal_iroas"),
-        ]
-        by_tier = {}
-        for projection in result["projections"]:
-            by_tier.setdefault(projection.tier_label, []).append(projection)
-        output = []
-        for tier, projections_for_tier in sorted(
-            by_tier.items(), key=lambda item: float(item[1][0].investment)
-        ):
-            values = [tier]
-            for _, field in metric_fields:
-                candidates = [
-                    _export_float(getattr(projection, field))
-                    for projection in projections_for_tier
-                    if getattr(projection, field) is not None
-                ]
-                values.append(bound(candidates) if candidates else None)
-            output.append(values)
-        return output
-
-    export_sheets = [
-        {
-            "name": "Run Summary",
-            "title": "ForecastPro AI Run Summary",
-            "subtitle": "Selections used for this downloaded forecast",
-            "headers": ["Input", "Value"],
-            "rows": [
-                ["Client Name", st.session_state.get("source_account")],
-                ["Conversion Event", st.session_state.get("selected_event")],
-                ["Campaign Name", st.session_state.get("selected_sub_account")],
-                ["Marketing Channel", st.session_state.get("selected_channel")],
-                ["Using Data From", st.session_state.get("selected_planning_quarter")],
-                ["Projection Quarter", st.session_state.get("projection_quarter")],
-                ["Projection Mode", st.session_state.get("projection_mode")],
-                ["Attribution Window (days)", st.session_state.get("attribution_window")],
-                ["Selected Historical Quarters", ", ".join(row["campaign_quarter"] for row in st.session_state.selected_history)],
-            ],
-            "widths": [34, 56],
-        },
-        {
-            "name": "Planning Inputs",
-            "title": "Historical Quarterly Performance and KPIs",
-            "subtitle": "Planning values used by the current forecast run",
-            "headers": ["Input", "Value"],
-            "rows": [
-                ["Current Quarterly Investment", _export_float(st.session_state.get("current_budget"))],
-                ["Current Quarter CPM", _export_float(st.session_state.get("cpm"))],
-                ["Current Quarter Planned Reach", _export_float(st.session_state.get("planned_reach"))],
-                ["Current Quarter Signal Utilization (%)", _export_float(st.session_state.get("signal_utilization")) * 100],
-                ["Max Reach to Maintain Performance", _export_float(st.session_state.get("max_reach"))],
-                ["Frequency at Max Reach", _export_float(st.session_state.get("frequency_at_max"))],
-            ],
-            "widths": [42, 22],
-            "formats": {1: "decimal"},
-        },
-        {
-            "name": "Investment Tiers",
-            "title": "Calculated Investment Tiers",
-            "subtitle": "Investment and scale used by the forecast",
-            "headers": ["Tier", "Investment", "Delivered Volume", "Prospects"],
-            "rows": [
-                [
-                    row.tier_label,
-                    _export_float(row.investment),
-                    _export_float(row.delivered_volume),
-                    _export_float(row.prospects),
-                ]
-                for row in result["ranges"]
-            ],
-            "widths": [30, 18, 20, 18],
-            "formats": {1: "money", 2: "integer", 3: "integer"},
-        },
-        {
-            "name": "Forecast Ranges",
-            "title": "Forecast Output Ranges",
-            "subtitle": f"{st.session_state.get('projection_mode')} projection for {st.session_state.get('projection_quarter')}",
-            "headers": [
-                "Tier", "Investment", "Delivered Volume", "Prospects",
-                "Inc. Customers Min", "Inc. Customers Max",
-                "Incremental Revenue Min", "Incremental Revenue Max",
-                "CPIx Min", "CPIx Max", "iROAS Min", "iROAS Max",
-            ],
-            "rows": _export_range_rows(result["ranges"]),
-            "widths": [30, 18, 20, 18, 18, 18, 22, 22, 14, 14, 14, 14],
-            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
-        },
-        {
-            "name": "QA Projections",
-            "title": "Projection Calculations",
-            "subtitle": "Tier-level calculations used to create KPI bounds and final ranges",
-            "headers": [
-                "Historical Quarter", "Tier", "Investment", "Delivered Volume", "Prospects",
-                "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS",
-                "Marginal CPIx", "Marginal iROAS", "Signal Utilization (%)",
-            ],
-            "rows": _export_projection_rows(result["projections"]),
-            "widths": [18, 30, 18, 20, 18, 18, 22, 14, 14, 16, 16, 20],
-            "formats": {2: "money", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
-        },
-        {
-            "name": "KPI Minimums",
-            "title": "KPI Minimums",
-            "subtitle": "Minimum value by metric across selected historical-quarter projection tables",
-            "headers": ["Tier", "Investment", "Delivered Volume", "Prospects", "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS", "Marginal CPIx", "Marginal iROAS"],
-            "rows": _export_kpi_bounds(min),
-            "widths": [30, 18, 20, 18, 18, 22, 14, 14, 16, 16],
-            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "money", 6: "money", 7: "money", 8: "decimal", 9: "decimal"},
-        },
-        {
-            "name": "KPI Maximums",
-            "title": "KPI Maximums",
-            "subtitle": "Maximum value by metric across selected historical-quarter projection tables",
-            "headers": ["Tier", "Investment", "Delivered Volume", "Prospects", "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS", "Marginal CPIx", "Marginal iROAS"],
-            "rows": _export_kpi_bounds(max),
-            "widths": [30, 18, 20, 18, 18, 22, 14, 14, 16, 16],
-            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "money", 6: "money", 7: "money", 8: "decimal", 9: "decimal"},
-        },
-        {
-            "name": "Final Ranges QA",
-            "title": "Final Ranges",
-            "subtitle": "Final forecast range values used in the results view",
-            "headers": [
-                "Tier", "Investment", "Delivered Volume", "Prospects",
-                "Inc. Customers Min", "Inc. Customers Max",
-                "Incremental Revenue Min", "Incremental Revenue Max",
-                "CPIx Min", "CPIx Max", "iROAS Min", "iROAS Max",
-            ],
-            "rows": _export_range_rows(result["ranges"]),
-            "widths": [30, 18, 20, 18, 18, 18, 22, 22, 14, 14, 14, 14],
-            "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
-        },
-    ]
-
-    try:
-        export_indexes = effective_monthly_indexes(
-            seasonal_indexes(
-                session,
-                st.session_state.selected_source,
-                attribution_window=st.session_state.get("attribution_window", 30),
-                account_name=st.session_state.get("source_account"),
-                sub_account=st.session_state.get("selected_sub_account"),
-                event=st.session_state.get("selected_event"),
-                channel=st.session_state.get("selected_channel"),
-            )
-        )
-        export_sheets.append(
-            {
-                "name": "Seasonal Indexes",
-                "title": "Seasonal Indexes",
-                "subtitle": f"{st.session_state.get('monthly_index_mode', 'Automatic')} values used by this forecast",
-                "headers": ["Period", "Organic (%)", "Incremental (%)"],
-                "rows": [
-                    *[
-                        [quarter, export_indexes["quarterly_organic"].get(quarter, 0.0) * 100, export_indexes["quarterly_incremental"].get(quarter, 0.0) * 100]
-                        for quarter in ("Q1", "Q2", "Q3", "Q4")
-                    ],
-                    *[
-                        [month, export_indexes["monthly_organic"].get(month, 0.0) * 100, export_indexes["monthly_incremental"].get(month, 0.0) * 100]
-                        for month in MONTH_NAMES
-                    ],
-                ],
-                "widths": [18, 18, 20],
-                "formats": {1: "decimal", 2: "decimal"},
-            }
-        )
-    except Exception:
-        pass
-
-    scenario_rows = []
-    for scenario_name, improvement_factor, scenario_projections in result.get("improvements", []):
-        for row in sorted(
-            scenario_projections,
-            key=lambda item: (quarter_value(item.historical_quarter), float(item.investment)),
-        ):
-            scenario_rows.append(
-                [
-                    scenario_name,
-                    _export_float(improvement_factor) * 100,
-                    row.historical_quarter,
-                    row.tier_label,
-                    _export_float(row.investment),
-                    _export_float(row.incremental_customers),
-                    _export_float(row.incremental_revenue),
-                    _export_float(row.cpix),
-                    _export_float(row.iroas),
-                ]
-            )
-
-    if scenario_rows:
-        export_sheets.append(
-            {
-                "name": "Scenario Results",
-                "title": "Improvement Scenario Results",
-                "subtitle": "Scenario calculations using the same selected historical quarters",
-                "headers": ["Scenario", "Improvement Factor (%)", "Historical Quarter", "Tier", "Investment", "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS"],
-                "rows": scenario_rows,
-                "widths": [24, 22, 18, 30, 18, 18, 22, 14, 14],
-                "formats": {1: "decimal", 4: "money", 5: "integer", 6: "money", 7: "money", 8: "decimal"},
-            }
-        )
-
-    if st.session_state.get("projection_mode", "Quarterly") != "Quarterly":
-        export_sheets.append(
-            {
-                "name": "Annual Forecast",
-                "title": "Annual Forecast Results",
-                "subtitle": f"Annualized forecast beginning {st.session_state.get('projection_quarter')}",
-                "headers": [
-                    "Tier", "Investment", "Delivered Volume", "Prospects",
-                    "Inc. Customers Min", "Inc. Customers Max",
-                    "Incremental Revenue Min", "Incremental Revenue Max",
-                    "CPIx Min", "CPIx Max", "iROAS Min", "iROAS Max",
-                ],
-                "rows": _export_range_rows(result["ranges"], annual_multiplier=4.0),
-                "widths": [30, 18, 20, 18, 18, 18, 22, 22, 14, 14, 14, 14],
-                "formats": {1: "money", 2: "integer", 3: "integer", 4: "integer", 5: "integer", 6: "money", 7: "money", 8: "money", 9: "money", 10: "decimal", 11: "decimal"},
-            }
-        )
-
-    workbook = build_workbook(
-        st.session_state.source_account,
-        st.session_state.historical_scope_label,
-        datetime.now(timezone.utc).isoformat(),
-        visible_ranges,
-        result["ranges"],
-        st.session_state.selected_history,
-    )
-    safe_account = re.sub(r"[^a-z0-9]+", "-", st.session_state.source_account.lower()).strip("-") or "forecast"
-    st.download_button("Download Excel workbook", workbook, f"{safe_account}-forecast.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    _render_download_button("tab3a")
 
     tab_nav_buttons(tab_names, 2)
 
@@ -3682,19 +3358,6 @@ if (st.session_state.forecast
     _range_adj = st.session_state.get("range_percent_input", 10) / 100
 
     st.header("Quarterly Split")
-    _qs_scenario_options = ["Baseline"]
-    for _sn, _sf, _sr in result["improvements"]:
-        _qs_scenario_options.append(f"+{float(_sf)*100:.0f}% Improvement")
-    st.session_state.setdefault("annual_scenario", "Baseline")
-    _qs_selected = st.radio(
-        "Scenario",
-        options=_qs_scenario_options,
-        index=_qs_scenario_options.index(st.session_state.get("annual_scenario", "Baseline"))
-            if st.session_state.get("annual_scenario", "Baseline") in _qs_scenario_options else 0,
-        horizontal=True,
-        key="_widget_annual_scenario_qs",
-    )
-    st.session_state.annual_scenario = _qs_selected
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
@@ -3703,9 +3366,9 @@ if (st.session_state.forecast
             break
     _imp_mult = 1 + _imp_factor_val
     if _annual_scenario != "Baseline":
-        st.caption(f"Annual forecast ({_annual_scenario}) distributed across Q1–Q4 using seasonal indexes.")
+        st.caption(f"Annual forecast ({_annual_scenario}) distributed across Q1-Q4 using seasonal indexes.")
     else:
-        st.caption("The annual forecast is distributed across Q1–Q4 using seasonal indexes.")
+        st.caption("The annual forecast is distributed across Q1-Q4 using seasonal indexes.")
 
     def _q_key_fn(ql):
         _m = re.match(r"Q(\d)", ql)
@@ -3804,19 +3467,6 @@ if (st.session_state.forecast
     }
 
     st.header("Monthly Split")
-    _ms_scenario_options = ["Baseline"]
-    for _sn, _sf, _sr in result["improvements"]:
-        _ms_scenario_options.append(f"+{float(_sf)*100:.0f}% Improvement")
-    st.session_state.setdefault("annual_scenario", "Baseline")
-    _ms_selected = st.radio(
-        "Scenario",
-        options=_ms_scenario_options,
-        index=_ms_scenario_options.index(st.session_state.get("annual_scenario", "Baseline"))
-            if st.session_state.get("annual_scenario", "Baseline") in _ms_scenario_options else 0,
-        horizontal=True,
-        key="_widget_annual_scenario_ms",
-    )
-    st.session_state.annual_scenario = _ms_selected
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
@@ -4466,8 +4116,12 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
             )
         else:
             st.caption(
-                "Final ranges are produced from the selected historical-quarter projections."
+                "Multiple historical quarters are selected. Final Ranges use the "
+                "minimum and maximum across all quarter projections."
             )
+        st.caption(
+            f"Historic Prospect Frequency = {historical_frequency:.1f}x"
+        )
         st.dataframe(
             pd.DataFrame([
                 {
