@@ -1840,7 +1840,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                 z.writestr(f"xl/media/chart{idx}.png", png)
         for i, n in enumerate(snames, 1):
             t = _sheet_titles.get(n, f"◆ ZETA | ForecastPro AI — {n}  |  {account}")
-            dbl = n in _dbl_hdr_actual
+            dbl = (n in _dbl_hdr_sheets) and bool(improvements)
             z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl, with_drawing=bool(logo_bytes)))
 
     _safe = re.sub(r"[^a-z0-9]+", "-", account.lower()).strip("-") or "forecast"
