@@ -1467,6 +1467,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     sheets[forecast_sheet_name] = f_rows
 
     # Tab 3+: Splits
+    _dbl_hdr_actual = set()
     QM = {1: ["Jan","Feb","Mar"], 2: ["Apr","May","Jun"], 3: ["Jul","Aug","Sep"], 4: ["Oct","Nov","Dec"]}
     sp_header = ["Tier", "Investment", "Delivered", "Prospects", "Inc. Customers",
                  "Inc. Revenue", "CPIx", "iROAS"]
@@ -1567,6 +1568,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                             row += [""] + imp_v[ti]
                         qs_rows.append(row)
                 sheets["Quarterly Split"] = qs_rows
+                _dbl_hdr_actual.add("Quarterly Split")
 
                 # --- Annual Monthly Split: side-by-side scenarios ---
                 ms_rows = [scenario_row, col_row]
@@ -1598,6 +1600,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                                 row += [""] + imp_v[ti]
                             ms_rows.append(row)
                 sheets["Monthly Split"] = ms_rows
+                _dbl_hdr_actual.add("Monthly Split")
             else:
                 # No improvements — simple stacked layout
                 qs_rows = [sp_header]
@@ -1808,7 +1811,6 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
         "Quarterly Forecast": f"◆ ZETA | ForecastPro AI — Quarterly Forecast  |  {account}",
         "Annual Forecast": f"◆ ZETA | ForecastPro AI — Annual Forecast  |  {account}",
     }
-    _dbl_hdr_sheets = {"Quarterly Split", "Monthly Split"}
     with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as z:
         ov = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(snames)+1))
         drawing_overrides = "".join(
@@ -4354,7 +4356,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
             _save_monthly_chk = st.checkbox("Monthly Split (Tab 3b)", value=True, key="_save_m_chk")
         if _save_monthly_chk:
             with _m_right:
-                st.caption("Uses the same scenarios selected for Quarterly Forecast.")
+                st.caption("Always uses the baseline scenario. For different scenarios, use Annual projection")
             _monthly_scenarios = list(_quarterly_scenarios)
     else:
         # --- Annual Forecast ---
@@ -4386,6 +4388,8 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     _can_export = _any_output
 
     if st.button("Export to Snowflake", type="primary", key="_btn_export_sf", disabled=not _can_export):
+        _export_status = st.empty()
+        _export_status.info("Saving...")
         try:
             session = get_session()
             forecast_tag = _uuid_save.uuid4().hex[:12]
@@ -4627,8 +4631,19 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     ).collect()
                                     rows_saved += 1
 
-            st.success(f"Saved {rows_saved} rows to Snowflake. Forecast tag: `{forecast_tag}`")
+            _tables_written = ["`ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE`"]
+            if _save_annual_chk and not _is_quarterly_save and _annual_scenarios:
+                _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY`")
+            if _save_quarterly_chk and _quarterly_scenarios:
+                _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY`")
+            if _save_monthly_chk and _monthly_scenarios:
+                _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY`")
+            _export_status.success(
+                f"Saved {rows_saved} rows to Snowflake.\n\n"
+                f"**Forecast Tag (unique ID):** `{forecast_tag}`\n\n"
+                f"**Tables written to:** {', '.join(_tables_written)}"
+            )
         except Exception as exc:
-            st.error(f"Export failed: {exc}")
+            _export_status.error(f"Export failed: {exc}")
 
     tab_nav_buttons(tab_names, _save_tab_idx)
