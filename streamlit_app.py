@@ -1011,7 +1011,7 @@ QUARTER_MONTHS = {
 
 
 def effective_monthly_indexes(automatic_indexes: dict) -> dict:
-    """Use manual monthly weights only after the analyst opts into Manual mode."""
+    """Use automatic values unless an analyst has chosen manual monthly values."""
     indexes = {
         **automatic_indexes,
         "monthly_organic": dict(automatic_indexes["monthly_organic"]),
@@ -1019,63 +1019,45 @@ def effective_monthly_indexes(automatic_indexes: dict) -> dict:
         "quarterly_organic": dict(automatic_indexes["quarterly_organic"]),
         "quarterly_incremental": dict(automatic_indexes["quarterly_incremental"]),
     }
-    if st.session_state.get("monthly_index_mode", "Automatic") != "Manual":
-        return indexes
+    if st.session_state.get("monthly_index_mode", "Automatic") == "Manual":
+        organic = st.session_state.get("manual_monthly_organic", {})
+        incremental = st.session_state.get("manual_monthly_incremental", {})
+        if set(organic) == set(MONTH_NAMES) and set(incremental) == set(MONTH_NAMES):
+            indexes["monthly_organic"] = {
+                month: float(organic[month]) for month in MONTH_NAMES
+            }
+            indexes["monthly_incremental"] = {
+                month: float(incremental[month]) for month in MONTH_NAMES
+            }
 
-    organic = st.session_state.get("manual_monthly_organic", {})
-    incremental = st.session_state.get("manual_monthly_incremental", {})
-    if set(organic) != set(MONTH_NAMES) or set(incremental) != set(MONTH_NAMES):
-        return indexes
-
-    indexes["monthly_organic"] = {month: float(organic[month]) for month in MONTH_NAMES}
-    indexes["monthly_incremental"] = {
-        month: float(incremental[month]) for month in MONTH_NAMES
+    indexes["quarterly_organic"] = {
+        quarter: sum(indexes["monthly_organic"][month] for month in months)
+        for quarter, months in QUARTER_MONTHS.items()
     }
-    expected_quarters = {f"Q{i}" for i in range(1, 5)}
-    manual_quarterly_organic = st.session_state.get("manual_quarterly_organic", {})
-    manual_quarterly_incremental = st.session_state.get("manual_quarterly_incremental", {})
-    if (
-        set(manual_quarterly_organic) == expected_quarters
-        and set(manual_quarterly_incremental) == expected_quarters
-    ):
-        indexes["quarterly_organic"] = {
-            quarter: float(manual_quarterly_organic[quarter])
-            for quarter in expected_quarters
-        }
-        indexes["quarterly_incremental"] = {
-            quarter: float(manual_quarterly_incremental[quarter])
-            for quarter in expected_quarters
-        }
-    else:
-        indexes["quarterly_organic"] = {
-            quarter: sum(indexes["monthly_organic"][month] for month in months)
-            for quarter, months in QUARTER_MONTHS.items()
-        }
-        indexes["quarterly_incremental"] = {
-            quarter: sum(indexes["monthly_incremental"][month] for month in months)
-            for quarter, months in QUARTER_MONTHS.items()
-        }
+    indexes["quarterly_incremental"] = {
+        quarter: sum(indexes["monthly_incremental"][month] for month in months)
+        for quarter, months in QUARTER_MONTHS.items()
+    }
     return indexes
 
 
 def manual_seasonal_indexes_valid() -> bool:
-    """Manual seasonal allocations must total exactly 100% for every table."""
+    """Manual monthly Organic and Incremental allocations must each total 100%."""
     if st.session_state.get("monthly_index_mode", "Automatic") != "Manual":
         return True
     required = (
         (st.session_state.get("manual_monthly_organic", {}), set(MONTH_NAMES)),
         (st.session_state.get("manual_monthly_incremental", {}), set(MONTH_NAMES)),
-        (st.session_state.get("manual_quarterly_organic", {}), {f"Q{i}" for i in range(1, 5)}),
-        (st.session_state.get("manual_quarterly_incremental", {}), {f"Q{i}" for i in range(1, 5)}),
     )
     return all(
-        set(values) == expected and abs(sum(float(value) for value in values.values()) - 1.0) < 0.00001
+        set(values) == expected
+        and abs(sum(float(value) for value in values.values()) - 1.0) < 0.00001
         for values, expected in required
     )
 
 
 def render_monthly_index_section(automatic_indexes: dict) -> dict:
-    """Render compact automatic/manual seasonal-index tables and return their weights."""
+    """Render a transposed monthly seasonal-index table with calculated totals."""
     signature = (
         st.session_state.get("source_account"),
         st.session_state.get("selected_sub_account"),
@@ -1092,22 +1074,30 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         st.session_state.monthly_index_signature = signature
 
     st.markdown("### Seasonal Indexes: Quarterly & Monthly Conversions")
-    st.caption("Seasonal indexes reflect trends in gross client conversions and Zeta-influenced conversions.")
-    mode_col, reset_col, _ = st.columns([2, 1.4, 5])
+    st.caption("Monthly indexes drive the forecast. Quarter totals are calculated from the three preceding months.")
+
     def _reset_monthly_indexes():
         st.session_state.monthly_index_mode = "Automatic"
         st.session_state.manual_monthly_organic = {}
         st.session_state.manual_monthly_incremental = {}
+        st.session_state.manual_quarterly_organic = {}
+        st.session_state.manual_quarterly_incremental = {}
         st.session_state.forecast = None
-        st.session_state.message = "Monthly indexes reset to their automatic values."
+        st.session_state.message = "Seasonal indexes reset to their automatic values."
 
+    def _index_mode_changed():
+        if st.session_state.monthly_index_mode == "Automatic":
+            _reset_monthly_indexes()
+
+    mode_col, reset_col, _ = st.columns([2, 1.4, 5])
     with mode_col:
         st.radio(
             "Index mode",
             ("Automatic", "Manual"),
             horizontal=True,
             key="monthly_index_mode",
-            help="Automatic uses the calculated indexes. Manual lets you edit the same Quarterly and Monthly tables used by the forecast.",
+            on_change=_index_mode_changed,
+            help="Automatic uses calculated values. Manual lets you edit the twelve months; all quarter and overall totals remain calculated.",
         )
     with reset_col:
         st.button(
@@ -1117,98 +1107,75 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
             on_click=_reset_monthly_indexes,
         )
 
-    quarters = [f"Q{i}" for i in range(1, 5)]
-    if st.session_state.monthly_index_mode == "Manual":
-        if not st.session_state.manual_monthly_organic:
-            st.session_state.manual_monthly_organic = {
-                month: float(automatic_indexes["monthly_organic"].get(month, 0.0))
-                for month in MONTH_NAMES
-            }
-            st.session_state.manual_monthly_incremental = {
-                month: float(automatic_indexes["monthly_incremental"].get(month, 0.0))
-                for month in MONTH_NAMES
-            }
-        if not st.session_state.manual_quarterly_organic:
-            st.session_state.manual_quarterly_organic = {
-                quarter: float(automatic_indexes["quarterly_organic"].get(quarter, 0.0))
-                for quarter in quarters
-            }
-            st.session_state.manual_quarterly_incremental = {
-                quarter: float(automatic_indexes["quarterly_incremental"].get(quarter, 0.0))
-                for quarter in quarters
-            }
-        quarterly_organic = st.session_state.manual_quarterly_organic
-        quarterly_incremental = st.session_state.manual_quarterly_incremental
-        monthly_organic = st.session_state.manual_monthly_organic
-        monthly_incremental = st.session_state.manual_monthly_incremental
-    else:
-        indexes = effective_monthly_indexes(automatic_indexes)
-        quarterly_organic = indexes["quarterly_organic"]
-        quarterly_incremental = indexes["quarterly_incremental"]
-        monthly_organic = indexes["monthly_organic"]
-        monthly_incremental = indexes["monthly_incremental"]
+    if st.session_state.monthly_index_mode == "Manual" and not st.session_state.manual_monthly_organic:
+        st.session_state.manual_monthly_organic = {
+            month: float(automatic_indexes["monthly_organic"].get(month, 0.0))
+            for month in MONTH_NAMES
+        }
+        st.session_state.manual_monthly_incremental = {
+            month: float(automatic_indexes["monthly_incremental"].get(month, 0.0))
+            for month in MONTH_NAMES
+        }
 
-    st.markdown("**Quarterly Seasonal Indexes**")
-    st.caption("Organic and Incremental values must each sum to 100%.")
-    quarterly_frame = pd.DataFrame(
-        {
-            "Quarter": quarters,
-            "Organic %": [quarterly_organic.get(quarter, 0.0) * 100 for quarter in quarters],
-            "Incremental %": [quarterly_incremental.get(quarter, 0.0) * 100 for quarter in quarters],
-        }
-    )
-    if st.session_state.monthly_index_mode == "Manual":
-        quarterly_edited = st.data_editor(
-            quarterly_frame,
-            hide_index=True,
-            use_container_width=True,
-            disabled=["Quarter"],
-            key="quarterly_seasonal_index_editor",
-            column_config={
-                "Organic %": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f%%"),
-                "Incremental %": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f%%"),
+    indexes = effective_monthly_indexes(automatic_indexes)
+    monthly_organic = indexes["monthly_organic"]
+    monthly_incremental = indexes["monthly_incremental"]
+    quarterly_organic = indexes["quarterly_organic"]
+    quarterly_incremental = indexes["quarterly_incremental"]
+
+    ordered_columns = []
+    for quarter, months in QUARTER_MONTHS.items():
+        ordered_columns.extend(months)
+        ordered_columns.append(f"{quarter} Total")
+    ordered_columns.append("Overall Total")
+
+    transposed_frame = pd.DataFrame(
+        [
+            {
+                "Metric": "Organic %",
+                **{month: monthly_organic.get(month, 0.0) * 100 for month in MONTH_NAMES},
+                **{f"{quarter} Total": quarterly_organic.get(quarter, 0.0) * 100 for quarter in QUARTER_MONTHS},
+                "Overall Total": sum(monthly_organic.values()) * 100,
             },
-        )
-        new_quarterly_organic = {
-            row["Quarter"]: float(row["Organic %"]) / 100 for _, row in quarterly_edited.iterrows()
-        }
-        new_quarterly_incremental = {
-            row["Quarter"]: float(row["Incremental %"]) / 100 for _, row in quarterly_edited.iterrows()
-        }
-        if (
-            new_quarterly_organic != st.session_state.manual_quarterly_organic
-            or new_quarterly_incremental != st.session_state.manual_quarterly_incremental
-        ):
-            st.session_state.manual_quarterly_organic = new_quarterly_organic
-            st.session_state.manual_quarterly_incremental = new_quarterly_incremental
-            st.session_state.forecast = None
-            st.session_state.message = "Quarterly seasonal indexes changed. Create a new forecast draft to update results."
-    else:
-        st.dataframe(quarterly_frame, hide_index=True, use_container_width=True)
+            {
+                "Metric": "Incremental %",
+                **{month: monthly_incremental.get(month, 0.0) * 100 for month in MONTH_NAMES},
+                **{f"{quarter} Total": quarterly_incremental.get(quarter, 0.0) * 100 for quarter in QUARTER_MONTHS},
+                "Overall Total": sum(monthly_incremental.values()) * 100,
+            },
+        ]
+    )[["Metric", *ordered_columns]]
+
+    seasonal_columns = {
+        "Metric": st.column_config.TextColumn("Metric", width="medium"),
+        **{
+            month: st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f%%")
+            for month in MONTH_NAMES
+        },
+        **{
+            f"{quarter} Total": st.column_config.NumberColumn(format="%.1f%%")
+            for quarter in QUARTER_MONTHS
+        },
+        "Overall Total": st.column_config.NumberColumn(format="%.1f%%"),
+    }
+
+    def _total_column_shading(column):
+        if column.name == "Overall Total":
+            return ["background-color: #DDEBF7; font-weight: 700"] * len(column)
+        if str(column.name).endswith(" Total"):
+            return ["background-color: #E2F0D9; font-weight: 700"] * len(column)
+        return [""] * len(column)
 
     st.markdown("**Monthly Seasonal Indexes**")
-    st.caption("Organic and Incremental values must each sum to 100%.")
-    monthly_frame = pd.DataFrame(
-        [
-            {"Metric": "Organic %", **{month: monthly_organic.get(month, 0.0) * 100 for month in MONTH_NAMES},
-             "Total": sum(monthly_organic.values()) * 100},
-            {"Metric": "Incremental %", **{month: monthly_incremental.get(month, 0.0) * 100 for month in MONTH_NAMES},
-             "Total": sum(monthly_incremental.values()) * 100},
-        ]
-    )
-    monthly_columns = {
-        month: st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.1f%%")
-        for month in MONTH_NAMES
-    }
-    monthly_columns["Total"] = st.column_config.NumberColumn(format="%.1f%%")
+    st.caption("Organic and Incremental values must each sum to 100%. Light green columns are quarter totals; light blue is the overall total.")
     if st.session_state.monthly_index_mode == "Manual":
         monthly_edited = st.data_editor(
-            monthly_frame,
+            transposed_frame,
             hide_index=True,
             use_container_width=True,
-            disabled=["Metric", "Total"],
+            disabled=["Metric", *[f"{quarter} Total" for quarter in QUARTER_MONTHS], "Overall Total"],
             key="monthly_seasonal_index_editor",
-            column_config=monthly_columns,
+            column_config=seasonal_columns,
         )
         new_monthly_organic = {
             month: float(monthly_edited.loc[monthly_edited["Metric"] == "Organic %", month].iloc[0]) / 100
@@ -1226,20 +1193,21 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
             st.session_state.manual_monthly_incremental = new_monthly_incremental
             st.session_state.forecast = None
             st.session_state.message = "Monthly seasonal indexes changed. Create a new forecast draft to update results."
-        totals = {
-            "Quarterly organic": sum(st.session_state.manual_quarterly_organic.values()) * 100,
-            "Quarterly incremental": sum(st.session_state.manual_quarterly_incremental.values()) * 100,
-            "Monthly organic": sum(st.session_state.manual_monthly_organic.values()) * 100,
-            "Monthly incremental": sum(st.session_state.manual_monthly_incremental.values()) * 100,
-        }
-        st.caption(" | ".join(f"{label}: {total:.1f}%" for label, total in totals.items()))
+        st.caption(
+            f"Overall organic: {sum(st.session_state.manual_monthly_organic.values()) * 100:.1f}%"
+            f" | Overall incremental: {sum(st.session_state.manual_monthly_incremental.values()) * 100:.1f}%"
+        )
         if not manual_seasonal_indexes_valid():
-            st.error("Manual seasonal indexes must each total exactly 100% before you create a forecast.")
+            st.error("Manual monthly Organic and Incremental indexes must each total exactly 100% before you create a forecast.")
     else:
-        st.dataframe(monthly_frame, hide_index=True, use_container_width=True, column_config=monthly_columns)
+        st.dataframe(
+            transposed_frame.style.apply(_total_column_shading, axis=0),
+            hide_index=True,
+            use_container_width=True,
+            column_config=seasonal_columns,
+        )
 
     return effective_monthly_indexes(automatic_indexes)
-
 
 def quarter_value(label: str) -> int:
     match = re.fullmatch(r"Q([1-4])\s+(\d{4})", label.strip(), re.I)
@@ -1298,16 +1266,92 @@ def scroll_page_to_top() -> None:
     )
 
 
+def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
+    """Create the same labeled, color-coded forecast charts for every export."""
+    try:
+        import json as _export_json
+        import vl_convert as _export_vlc
+        all_ranges = sorted(result["ranges"], key=lambda row: float(row.investment))
+        if not all_ranges:
+            return []
+        export_df = pd.DataFrame([
+            {
+                "Tier": _fmt_dollar_commas(float(row.investment)),
+                "Investment": float(row.investment),
+                "CPIx Min": float(row.cpix.minimum),
+                "CPIx Max": float(row.cpix.maximum),
+                "CPIx Midpoint": float((row.cpix.minimum + row.cpix.maximum) / 2),
+                "iROAS Min": float(row.iroas.minimum),
+                "iROAS Max": float(row.iroas.maximum),
+                "iROAS Midpoint": float((row.iroas.minimum + row.iroas.maximum) / 2),
+                "Customers Min": float(row.incremental_customers.minimum),
+                "Customers Max": float(row.incremental_customers.maximum),
+                "Customers Midpoint": float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2),
+                "Revenue Min": float(row.incremental_revenue.minimum),
+                "Revenue Max": float(row.incremental_revenue.maximum),
+                "Revenue Midpoint": float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2),
+                "Delivered": float(row.delivered_volume),
+                "Prospects": float(row.prospects),
+                "Tier Type": "Extension" if ("Incremental" in row.tier_label or "Maximum" in row.tier_label) else "Standard",
+            }
+            for row in all_ranges
+        ])
+        tier_order = export_df["Tier"].tolist()
+        x_axis = alt.X(
+            "Tier:N", sort=tier_order, title="Investment Tier",
+            axis=alt.Axis(labelAngle=0, labelLimit=115, labelOverlap=False),
+        )
+        def range_chart(title, min_field, max_field, midpoint_field, color, y_title, y_format=None):
+            y = alt.Y(min_field + ":Q", title=y_title, axis=alt.Axis(format=y_format) if y_format else alt.Axis())
+            band = alt.Chart(export_df).mark_area(opacity=0.25, color=color).encode(x=x_axis, y=y, y2=max_field + ":Q")
+            line = alt.Chart(export_df).mark_line(point=True, color=color, strokeWidth=2.5).encode(
+                x=x_axis, y=alt.Y(midpoint_field + ":Q", title=y_title, axis=alt.Axis(format=y_format) if y_format else alt.Axis()),
+                tooltip=["Tier", min_field, midpoint_field, max_field, "Investment"],
+            )
+            return (band + line).properties(title=title, width=700, height=360)
+
+        definitions = [
+            ("CPIx by Investment Tier", range_chart("CPIx by Investment Tier", "CPIx Min", "CPIx Max", "CPIx Midpoint", "#00d4aa", "CPIx", "$~s")),
+            ("iROAS by Investment Tier", range_chart("iROAS by Investment Tier", "iROAS Min", "iROAS Max", "iROAS Midpoint", "#4da6ff", "iROAS")),
+            ("Incremental Customers", range_chart("Incremental Customers by Investment Tier", "Customers Min", "Customers Max", "Customers Midpoint", "#10b981", "Incremental Customers", "~s")),
+            ("Incremental Revenue", range_chart("Incremental Revenue by Investment Tier", "Revenue Min", "Revenue Max", "Revenue Midpoint", "#8b5cf6", "Incremental Revenue", "$~s")),
+            ("Delivered Volume", alt.Chart(export_df).mark_bar(color="#06b6d4", opacity=0.85).encode(x=x_axis, y=alt.Y("Delivered:Q", title="Delivered Volume", axis=alt.Axis(format="~s")), tooltip=["Tier", "Delivered", "Investment"]).properties(title="Delivered Volume by Investment Tier", width=700, height=340)),
+            ("Prospects", alt.Chart(export_df).mark_bar(color="#f59e0b", opacity=0.85).encode(x=x_axis, y=alt.Y("Prospects:Q", title="Prospects", axis=alt.Axis(format="~s")), tooltip=["Tier", "Prospects", "Investment"]).properties(title="Prospects by Investment Tier", width=700, height=340)),
+            ("Investment by Tier", alt.Chart(export_df).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(x=x_axis, y=alt.Y("Investment:Q", title="Investment", axis=alt.Axis(format="$~s")), color=alt.Color("Tier Type:N", scale=alt.Scale(domain=["Standard", "Extension"], range=["#3b82f6", "#f97316"]), title="Type"), tooltip=["Tier", "Investment", "Tier Type"]).properties(title="Investment Tiers", width=700, height=360)),
+        ]
+        return [
+            (title, _export_vlc.vegalite_to_png(vl_spec=_export_json.dumps(chart.to_dict()), scale=2))
+            for title, chart in definitions
+        ]
+    except Exception:
+        return []
+
+
 def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes]] | None = None) -> None:
     """Build xlsx inline and render download button."""
     import io as _io
     import zipfile as _zf
     from xml.sax.saxutils import escape as _esc
     from collections import defaultdict as _dd
+    from pathlib import Path as _Path
 
     result = st.session_state.get("forecast")
     if not result:
         return
+    try:
+        logo_bytes = _Path(__file__).with_name("zeta logo.jpg").read_bytes()
+    except OSError:
+        logo_bytes = b""
+    _export_cache_key = id(result)
+    _cached_export_charts = st.session_state.get("_forecast_export_charts", [])
+    if chart_images:
+        st.session_state["_forecast_export_charts"] = chart_images
+        st.session_state["_forecast_export_charts_key"] = _export_cache_key
+    elif st.session_state.get("_forecast_export_charts_key") != _export_cache_key:
+        _cached_export_charts = _build_export_chart_images(result)
+        st.session_state["_forecast_export_charts"] = _cached_export_charts
+        st.session_state["_forecast_export_charts_key"] = _export_cache_key
+    export_charts = chart_images or _cached_export_charts or st.session_state.get("_forecast_export_charts", [])
     vis_ranges = [r for r in result["ranges"] if visible_tier(r.tier_label, result["show_expansion"])]
     history = st.session_state.selected_history
     improvements = result["improvements"]
@@ -1575,6 +1619,12 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                         ms_rows.extend(split_rows(vis_ranges, op, ip))
                 sheets["Monthly Split"] = ms_rows
 
+    if export_charts:
+        sheets["Charts"] = [
+            ["Forecast charts"],
+            ["Charts mirror the colors, labels, and metrics shown in ForecastPro AI."],
+        ]
+
     # --- Build xlsx from raw XML with formatting ---
     def col_letter(idx):
         r = ""; i = idx
@@ -1632,16 +1682,17 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
         '</styleSheet>'
     )
 
-    def sheet_xml(data_rows, sheet_title="", double_header=False):
+    def sheet_xml(data_rows, sheet_title="", double_header=False, with_drawing=False):
         ncols = len(data_rows[0]) if data_rows else 1
         xml_rows = []
         merges = []
         rn = 1
         # Title row (bold black text, no background)
         if sheet_title:
-            me = col_letter(max(ncols - 1, 0))
-            xml_rows.append(f'<row r="{rn}" ht="24" customHeight="1">{cell_xml(f"A{rn}", sheet_title, 2)}</row>')
-            merges.append(f"A{rn}:{me}{rn}")
+            title_start = 3
+            me = col_letter(max(ncols - 1, title_start))
+            xml_rows.append(f'<row r="{rn}" ht="24" customHeight="1">{cell_xml(f"D{rn}", sheet_title, 2)}</row>')
+            merges.append(f"D{rn}:{me}{rn}")
             rn += 1
             # spacer after title
             xml_rows.append(f'<row r="{rn}" ht="6" customHeight="1"/>')
@@ -1701,36 +1752,87 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
         if merges:
             mc = "".join(f'<mergeCell ref="{ref}"/>' for ref in merges)
             merge_xml = f'<mergeCells count="{len(merges)}">{mc}</mergeCells>'
+        drawing_xml = '<drawing r:id="rId1"/>' if with_drawing else ""
         return (
             f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            f'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
             f'<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>'
             f'<cols>{cw}</cols>'
             f'<sheetData>{"".join(xml_rows)}</sheetData>'
-            f'{merge_xml}</worksheet>'
+            f'{merge_xml}{drawing_xml}</worksheet>'
+        )
+
+    def worksheet_drawing_xml(images):
+        anchors = [
+            '<xdr:twoCellAnchor editAs="oneCell">'
+            '<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+            '<xdr:to><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+            '<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="1" name="ZETA logo"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+            '<xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+            '<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>'
+            '<xdr:clientData/></xdr:twoCellAnchor>'
+        ]
+        for idx, (_title, _png) in enumerate(images, 2):
+            chart_index = idx - 2
+            col = 0 if chart_index % 2 == 0 else 8
+            row = 4 + (chart_index // 2) * 20
+            anchors.append(
+                f'<xdr:twoCellAnchor editAs="oneCell">'
+                f'<xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+                f'<xdr:to><xdr:col>{col + 7}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row + 17}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+                f'<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{idx}" name="Forecast chart {chart_index + 1}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+                f'<xdr:blipFill><a:blip r:embed="rId{idx}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+                f'<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>'
+                f'<xdr:clientData/></xdr:twoCellAnchor>'
+            )
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            + "".join(anchors) + '</xdr:wsDr>'
         )
 
     buf = _io.BytesIO()
     snames = list(sheets.keys())
+    chart_sheet_no = snames.index("Charts") + 1 if "Charts" in snames else None
     _sheet_titles = {
-        "Historical KPIs": f"ForecastPro AI — Historical KPIs  |  {account}",
-        "Quarterly Forecast": f"ForecastPro AI — Quarterly Forecast  |  {account}",
-        "Annual Forecast": f"ForecastPro AI — Annual Forecast  |  {account}",
+        "Historical KPIs": f"◆ ZETA | ForecastPro AI — Historical KPIs  |  {account}",
+        "Quarterly Forecast": f"◆ ZETA | ForecastPro AI — Quarterly Forecast  |  {account}",
+        "Annual Forecast": f"◆ ZETA | ForecastPro AI — Annual Forecast  |  {account}",
     }
     _dbl_hdr_sheets = {"Quarterly Split", "Monthly Split"}
     with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as z:
         ov = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(snames)+1))
-        z.writestr("[Content_Types].xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>{ov}</Types>')
+        drawing_overrides = "".join(
+            f'<Override PartName="/xl/drawings/drawing{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+            for i in range(1, len(snames) + 1)
+        ) if logo_bytes else ""
+        z.writestr("[Content_Types].xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>{ov}{drawing_overrides}</Types>')
         z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
         ws = "".join(f'<sheet name="{_esc(n)}" sheetId="{i}" r:id="rId{i}"/>' for i, n in enumerate(snames, 1))
         z.writestr("xl/workbook.xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{ws}</sheets></workbook>')
         rl = "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(snames)+1))
         z.writestr("xl/_rels/workbook.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rl}<Relationship Id="rIdS" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
         z.writestr("xl/styles.xml", _STYLED_STYLES)
+        if logo_bytes:
+            z.writestr("xl/media/zeta_logo.jpg", logo_bytes)
+            for i, n in enumerate(snames, 1):
+                sheet_images = export_charts if i == chart_sheet_no else []
+                z.writestr(f"xl/drawings/drawing{i}.xml", worksheet_drawing_xml(sheet_images))
+                image_rels = '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/zeta_logo.jpg"/>'
+                image_rels += "".join(
+                    f'<Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/chart{idx - 1}.png"/>'
+                    for idx, (_title, _png) in enumerate(sheet_images, 2)
+                )
+                z.writestr(f"xl/drawings/_rels/drawing{i}.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{image_rels}</Relationships>')
+                z.writestr(f"xl/worksheets/_rels/sheet{i}.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{i}.xml"/></Relationships>')
+            for idx, (_title, png) in enumerate(export_charts, 1):
+                z.writestr(f"xl/media/chart{idx}.png", png)
         for i, n in enumerate(snames, 1):
-            t = _sheet_titles.get(n, f"ForecastPro AI — {n}  |  {account}")
+            t = _sheet_titles.get(n, f"◆ ZETA | ForecastPro AI — {n}  |  {account}")
             dbl = (n in _dbl_hdr_sheets) and bool(improvements)
-            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl))
+            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl, with_drawing=bool(logo_bytes)))
 
     _safe = re.sub(r"[^a-z0-9]+", "-", account.lower()).strip("-") or "forecast"
     st.download_button("Download Excel Workbook", buf.getvalue(), f"{_safe}-forecast.xlsx",
@@ -2164,6 +2266,8 @@ if active_tab == 0:
         st.session_state.pop("selected_planning_quarter", None)
         st.session_state.pop("applied_planning_key", None)
         st.session_state.pop("_widget_projection_quarter", None)
+        st.session_state.pop("_widget_using_data_from", None)
+        st.session_state.pop("_source_dropdown_projection", None)
         st.session_state.pop("projection_quarter", None)
 
     if st.session_state.get("selected_planning_quarter") not in available_planning_quarters:
@@ -2195,7 +2299,7 @@ if active_tab == 0:
         key=_quarter_sort_value,
     )
 
-    proj_row = st.columns(2)
+    proj_row = st.columns(3)
     quarter_selector_label = (
         "Starting Quarter"
         if st.session_state.get("_widget_projection_mode", "Quarterly") == "Annual"
@@ -2209,10 +2313,35 @@ if active_tab == 0:
                 quarter_selector_label,
                 _projection_quarter_options,
                 key="_widget_projection_quarter",
-                help="Choose the quarter to forecast. The preceding approved quarter is used automatically as the source universe.",
+                help="Choose the quarter to forecast.",
             )
 
-        using_data_quarter = projection_to_source[projection_quarter_choice]
+        default_source_quarter = projection_to_source[projection_quarter_choice]
+        source_options = [
+            quarter for quarter in sorted(available_planning_quarters, key=_quarter_sort_value)
+            if _quarter_sort_value(quarter) < _quarter_sort_value(projection_quarter_choice)
+        ]
+        if default_source_quarter not in source_options:
+            source_options.append(default_source_quarter)
+            source_options.sort(key=_quarter_sort_value)
+
+        # A target-quarter change restores the immediately preceding approved
+        # quarter as the default source. The analyst may then select any earlier
+        # approved source quarter from the visible dropdown.
+        if st.session_state.get("_source_dropdown_projection") != projection_quarter_choice:
+            st.session_state._source_dropdown_projection = projection_quarter_choice
+            st.session_state._widget_using_data_from = default_source_quarter
+        if st.session_state.get("_widget_using_data_from") not in source_options:
+            st.session_state._widget_using_data_from = default_source_quarter
+
+        with proj_row[1]:
+            using_data_quarter = st.selectbox(
+                "Using Data From",
+                source_options,
+                key="_widget_using_data_from",
+                help="Select the approved planning quarter whose universe and planning inputs are used for this projection.",
+            )
+
         if st.session_state.get("selected_planning_quarter") != using_data_quarter:
             st.session_state.selected_planning_quarter = using_data_quarter
             st.session_state.pop("applied_planning_key", None)
@@ -2220,10 +2349,6 @@ if active_tab == 0:
             st.session_state.tier_adjustments = {}
             st.session_state.tier_overrides = {}
 
-        st.markdown(
-            f'<div style="margin:0.7rem 0 0.2rem;"><strong>Using Data From:</strong> <code>{using_data_quarter}</code></div>',
-            unsafe_allow_html=True,
-        )
         st.caption(
             f"Performing projection for {projection_quarter_choice} using {using_data_quarter} universe max reach."
         )
@@ -2236,7 +2361,7 @@ if active_tab == 0:
                 "No current or future projection quarter has an approved preceding source-data quarter."
             )
 
-    with proj_row[1]:
+    with proj_row[2]:
         projection_mode = st.radio(
             "Projection Mode",
             options=["Quarterly", "Annual"],
@@ -2578,7 +2703,7 @@ if st.session_state.confirmed and active_tab == 1:
         "The number of prospects expected to receive media at the current investment level and CPM.",
     )
     kpi_card(
-        row1[3], "Current Quarter Signal Utilization", f"{signal_utilization * 100:.0f}%",
+        row1[3], "Current Quarter Signal Utilization", f"{signal_utilization * 100:.0f}% Signal Utilization",
         "Share of intent-signal prospects used.",
         "The percentage of intent-signal prospects expected to be used by campaign end. For example, 75% utilization of 5M prospects uses 3.75M prospects and leaves about 25% opportunity to scale.",
     )
@@ -2712,8 +2837,8 @@ if st.session_state.confirmed and active_tab == 1:
             values.append(float(calculated_tier_values[-1]))
         return values
 
-    mode_col, step_col = st.columns([3, 1])
-    with mode_col:
+    control_edit, control_reset, control_step, _ = st.columns([1.45, 1.0, 1.25, 4.3])
+    with control_edit:
         if at_full_utilization:
             st.caption(
                 "At 100% utilization, Current Budget is the Baseline. "
@@ -2721,9 +2846,6 @@ if st.session_state.confirmed and active_tab == 1:
             )
             st.session_state.manual_tier_mode = False
         elif st.session_state.manual_tier_mode:
-            st.caption(
-                "Manual tier mode is active. Enter the displayed investment values directly."
-            )
             if st.button("Use calculated tiers", key="use_calculated_tiers"):
                 st.session_state.manual_tier_mode = False
                 st.session_state.manual_tier_values = {}
@@ -2732,8 +2854,7 @@ if st.session_state.confirmed and active_tab == 1:
                 )
                 st.rerun()
         else:
-            edit_col, reset_col = st.columns([1, 1])
-            if edit_col.button("Edit tiers manually", key="edit_tiers_manually"):
+            if st.button("Edit tiers manually", key="edit_tiers_manually"):
                 current_values = _calculated_values_with_adjustments()
                 st.session_state.manual_tier_mode = True
                 st.session_state.manual_tier_values = {
@@ -2746,15 +2867,21 @@ if st.session_state.confirmed and active_tab == 1:
                     "Manual tier mode is active. Create a new forecast draft after editing values."
                 )
                 st.rerun()
-            reset_col.button(
-                "↺ Reset",
-                key="reset_calculated_tiers",
-                on_click=_reset_calculated_tiers,
-                disabled=not bool(st.session_state.tier_adjustments),
-                help="Restore the original automatically calculated tier values.",
-            )
 
-    with step_col:
+    with control_reset:
+        st.button(
+            "↺ Reset",
+            key="reset_calculated_tiers",
+            on_click=_reset_calculated_tiers,
+            disabled=(
+                at_full_utilization
+                or st.session_state.manual_tier_mode
+                or not bool(st.session_state.tier_adjustments)
+            ),
+            help="Restore the original automatically calculated tier values.",
+        )
+
+    with control_step:
         adjustment_step = st.number_input(
             "Adjustment step",
             min_value=1000,
