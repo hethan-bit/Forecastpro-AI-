@@ -3,9 +3,11 @@
 # Co-authored with CoCo
 from __future__ import annotations
 
+import base64
 import re
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
@@ -904,6 +906,13 @@ def get_session():
     return active_session()
 
 
+def sql_literal(value) -> str:
+    """Wrap a value as a SQL string literal with single-quote escaping."""
+    if value is None:
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def reset_for_new_account() -> None:
     """Clear all app state so user can start fresh with a new account."""
     keys_to_clear = [
@@ -932,6 +941,7 @@ def reset_after_source() -> None:
     st.session_state.monthly_history = []
     st.session_state.confirmed = False
     st.session_state.forecast = None
+    st.session_state.pop("applied_planning_key", None)
     for key in (
         "_widget_frequency_at_max",
         "tier_adjustments",
@@ -1031,11 +1041,11 @@ def effective_monthly_indexes(automatic_indexes: dict) -> dict:
             }
 
     indexes["quarterly_organic"] = {
-        quarter: sum(indexes["monthly_organic"][month] for month in months)
+        quarter: sum(indexes["monthly_organic"].get(month, 0.0) for month in months)
         for quarter, months in QUARTER_MONTHS.items()
     }
     indexes["quarterly_incremental"] = {
-        quarter: sum(indexes["monthly_incremental"][month] for month in months)
+        quarter: sum(indexes["monthly_incremental"].get(month, 0.0) for month in months)
         for quarter, months in QUARTER_MONTHS.items()
     }
     return indexes
@@ -1073,7 +1083,11 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         st.session_state.manual_quarterly_incremental = {}
         st.session_state.monthly_index_signature = signature
 
-    st.markdown("### Seasonal Indexes: Quarterly & Monthly Conversions")
+    st.markdown(
+        '### Seasonal Indexes: Quarterly & Monthly Conversions '
+        '<span class="info-icon" title="Seasonal indexes distribute the forecast across the year. Organic indexes reflect gross client conversions and Incremental indexes reflect Zeta-influenced conversions. Automatic uses the available historical data; Manual lets you adjust monthly allocations, which must each total 100%." aria-label="More information">i</span>',
+        unsafe_allow_html=True,
+    )
     st.caption("Monthly indexes drive the forecast. Quarter totals are calculated from the three preceding months.")
 
     def _reset_monthly_indexes():
@@ -1153,10 +1167,16 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
             for month in MONTH_NAMES
         },
         **{
-            f"{quarter} Total": st.column_config.NumberColumn(format="%.1f%%")
+            f"{quarter} Total": st.column_config.NumberColumn(
+                label=f"𝗤{quarter[-1]} 𝗧𝗼𝘁𝗮𝗹",
+                format="%.1f%%",
+            )
             for quarter in QUARTER_MONTHS
         },
-        "Overall Total": st.column_config.NumberColumn(format="%.1f%%"),
+        "Overall Total": st.column_config.NumberColumn(
+            label="𝗢𝘃𝗲𝗿𝗮𝗹𝗹 𝗧𝗼𝘁𝗮𝗹",
+            format="%.1f%%",
+        ),
     }
 
     def _total_column_shading(column):
@@ -1266,66 +1286,128 @@ def scroll_page_to_top() -> None:
     )
 
 
-def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
-    """Create the same labeled, color-coded forecast charts for every export."""
-    try:
-        import json as _export_json
-        import vl_convert as _export_vlc
-        all_ranges = sorted(result["ranges"], key=lambda row: float(row.investment))
-        if not all_ranges:
-            return []
-        export_df = pd.DataFrame([
-            {
-                "Tier": _fmt_dollar_commas(float(row.investment)),
-                "Investment": float(row.investment),
-                "CPIx Min": float(row.cpix.minimum),
-                "CPIx Max": float(row.cpix.maximum),
-                "CPIx Midpoint": float((row.cpix.minimum + row.cpix.maximum) / 2),
-                "iROAS Min": float(row.iroas.minimum),
-                "iROAS Max": float(row.iroas.maximum),
-                "iROAS Midpoint": float((row.iroas.minimum + row.iroas.maximum) / 2),
-                "Customers Min": float(row.incremental_customers.minimum),
-                "Customers Max": float(row.incremental_customers.maximum),
-                "Customers Midpoint": float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2),
-                "Revenue Min": float(row.incremental_revenue.minimum),
-                "Revenue Max": float(row.incremental_revenue.maximum),
-                "Revenue Midpoint": float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2),
-                "Delivered": float(row.delivered_volume),
-                "Prospects": float(row.prospects),
-                "Tier Type": "Extension" if ("Incremental" in row.tier_label or "Maximum" in row.tier_label) else "Standard",
-            }
-            for row in all_ranges
-        ])
-        tier_order = export_df["Tier"].tolist()
-        x_axis = alt.X(
-            "Tier:N", sort=tier_order, title="Investment Tier",
-            axis=alt.Axis(labelAngle=0, labelLimit=115, labelOverlap=False),
-        )
-        def range_chart(title, min_field, max_field, midpoint_field, color, y_title, y_format=None):
-            y = alt.Y(min_field + ":Q", title=y_title, axis=alt.Axis(format=y_format) if y_format else alt.Axis())
-            band = alt.Chart(export_df).mark_area(opacity=0.25, color=color).encode(x=x_axis, y=y, y2=max_field + ":Q")
-            line = alt.Chart(export_df).mark_line(point=True, color=color, strokeWidth=2.5).encode(
-                x=x_axis, y=alt.Y(midpoint_field + ":Q", title=y_title, axis=alt.Axis(format=y_format) if y_format else alt.Axis()),
-                tooltip=["Tier", min_field, midpoint_field, max_field, "Investment"],
-            )
-            return (band + line).properties(title=title, width=700, height=360)
+def export_tier_label(tier_label: str) -> str:
+    """Use current product-facing names for legacy forecast rows."""
+    return {
+        "Baseline": "Current Investment",
+        "Sustainable Scale": "Optimal Scale",
+    }.get(tier_label, tier_label)
 
-        definitions = [
-            ("CPIx by Investment Tier", range_chart("CPIx by Investment Tier", "CPIx Min", "CPIx Max", "CPIx Midpoint", "#00d4aa", "CPIx", "$~s")),
-            ("iROAS by Investment Tier", range_chart("iROAS by Investment Tier", "iROAS Min", "iROAS Max", "iROAS Midpoint", "#4da6ff", "iROAS")),
-            ("Incremental Customers", range_chart("Incremental Customers by Investment Tier", "Customers Min", "Customers Max", "Customers Midpoint", "#10b981", "Incremental Customers", "~s")),
-            ("Incremental Revenue", range_chart("Incremental Revenue by Investment Tier", "Revenue Min", "Revenue Max", "Revenue Midpoint", "#8b5cf6", "Incremental Revenue", "$~s")),
-            ("Delivered Volume", alt.Chart(export_df).mark_bar(color="#06b6d4", opacity=0.85).encode(x=x_axis, y=alt.Y("Delivered:Q", title="Delivered Volume", axis=alt.Axis(format="~s")), tooltip=["Tier", "Delivered", "Investment"]).properties(title="Delivered Volume by Investment Tier", width=700, height=340)),
-            ("Prospects", alt.Chart(export_df).mark_bar(color="#f59e0b", opacity=0.85).encode(x=x_axis, y=alt.Y("Prospects:Q", title="Prospects", axis=alt.Axis(format="~s")), tooltip=["Tier", "Prospects", "Investment"]).properties(title="Prospects by Investment Tier", width=700, height=340)),
-            ("Investment by Tier", alt.Chart(export_df).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(x=x_axis, y=alt.Y("Investment:Q", title="Investment", axis=alt.Axis(format="$~s")), color=alt.Color("Tier Type:N", scale=alt.Scale(domain=["Standard", "Extension"], range=["#3b82f6", "#f97316"]), title="Type"), tooltip=["Tier", "Investment", "Tier Type"]).properties(title="Investment Tiers", width=700, height=360)),
-        ]
-        return [
-            (title, _export_vlc.vegalite_to_png(vl_spec=_export_json.dumps(chart.to_dict()), scale=2))
-            for title, chart in definitions
-        ]
+def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
+    """Render report-quality PNG charts without changing forecast values."""
+    try:
+        import io as _chart_io
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as _ChartCanvas
+        from matplotlib.figure import Figure as _ChartFigure
+        from matplotlib.ticker import FuncFormatter as _ChartFormatter
     except Exception:
+        # Native Excel charts remain available as a compatibility fallback.
         return []
 
+    all_ranges = sorted(result["ranges"], key=lambda row: float(row.investment))
+    if not all_ranges:
+        return []
+
+    def _label(raw_label):
+        label = export_tier_label(raw_label)
+        if label == "Current Investment":
+            return "Current\nInvestment"
+        if label == "Optimal Scale":
+            return "Optimal\nScale"
+        if "Incremental Reach" in label:
+            return label.replace("Incremental Reach ", "Incremental\nReach ")
+        if "Maximum Scale" in label:
+            return label.replace("Maximum Scale ", "Maximum\nScale ")
+        return label.replace(" ", "\n", 1) if len(label) > 16 else label
+
+    def _color(raw_label, index):
+        label = export_tier_label(raw_label)
+        if label == "Current Investment":
+            return "#1F3A5F"
+        if label == "Optimal Scale":
+            return "#0F9F7A"
+        if "Maximum" in label:
+            return "#D97706"
+        return ["#486E9E", "#557FB2", "#648FC2", "#779FD0"][min(index, 3)]
+
+    labels = [_label(row.tier_label) for row in all_ranges]
+    colors = [_color(row.tier_label, index) for index, row in enumerate(all_ranges)]
+    investments = [float(row.investment) for row in all_ranges]
+    cpix = [float((row.cpix.minimum + row.cpix.maximum) / 2) for row in all_ranges]
+    iroas = [float((row.iroas.minimum + row.iroas.maximum) / 2) for row in all_ranges]
+    customers = [float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2) for row in all_ranges]
+    revenue = [float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2) for row in all_ranges]
+    prospects = [float(row.prospects) for row in all_ranges]
+
+    def _compact(value, currency=False, precision=0):
+        prefix = "$" if currency else ""
+        absolute = abs(value)
+        if absolute >= 1_000_000:
+            return f"{prefix}{value / 1_000_000:.{precision or 1}f}M"
+        if absolute >= 1_000:
+            return f"{prefix}{value / 1_000:.{precision or 0}f}K"
+        return f"{prefix}{value:.{precision}f}"
+
+    def _base_figure(title, subtitle):
+        figure = _ChartFigure(figsize=(10.4, 5.7), dpi=180, facecolor="#F8FAFC")
+        _ChartCanvas(figure)
+        axis = figure.add_axes([0.085, 0.19, 0.88, 0.66])
+        axis.set_facecolor("#FFFFFF")
+        figure.text(0.085, 0.935, title, fontsize=15, fontweight="bold", color="#111827")
+        figure.text(0.085, 0.892, subtitle, fontsize=8.5, color="#64748B")
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+        axis.grid(axis="y", color="#E5E7EB", linewidth=0.7)
+        axis.set_axisbelow(True)
+        axis.tick_params(axis="x", length=0, pad=10, labelsize=8, colors="#334155")
+        axis.tick_params(axis="y", length=0, labelsize=8, colors="#64748B")
+        return figure, axis
+
+    def _render_bar(title, subtitle, values, currency=False):
+        figure, axis = _base_figure(title, subtitle)
+        x_values = list(range(len(values)))
+        bars = axis.bar(x_values, values, width=0.58, color=colors, edgecolor="none")
+        top = max(values) if values else 0
+        axis.set_ylim(0, top * 1.23 if top else 1)
+        axis.set_xticks(x_values, labels)
+        axis.yaxis.set_major_formatter(_ChartFormatter(lambda value, _pos: _compact(value, currency)))
+        for bar, value in zip(bars, values):
+            axis.text(bar.get_x() + bar.get_width() / 2, value + top * 0.045, _compact(value, currency), ha="center", va="bottom", fontsize=7.4, color="#334155", fontweight="semibold")
+        return figure
+
+    def _render_line(title, subtitle, values, currency=False, precision=0):
+        figure, axis = _base_figure(title, subtitle)
+        x_values = list(range(len(values)))
+        line_color = "#6D4AFF" if "CPIx" in title else "#1F77B4"
+        axis.fill_between(x_values, values, [min(values)] * len(values), color=line_color, alpha=0.10)
+        axis.plot(x_values, values, color=line_color, linewidth=2.7, solid_capstyle="round")
+        axis.scatter(x_values, values, s=42, color="#FFFFFF", edgecolor=line_color, linewidth=2.1, zorder=3)
+        low, high = min(values), max(values)
+        padding = max((high - low) * 0.30, 1 if high == low else 0)
+        axis.set_ylim(max(0, low - padding), high + padding)
+        axis.set_xticks(x_values, labels)
+        axis.yaxis.set_major_formatter(_ChartFormatter(lambda value, _pos: _compact(value, currency, precision)))
+        for x_value, value in zip(x_values, values):
+            axis.text(x_value, value + max((high - low) * 0.075, 0.25), _compact(value, currency, precision), ha="center", va="bottom", fontsize=7.4, color="#334155", fontweight="semibold")
+        if len(values) > 1:
+            axis.axvline(1, color="#0F9F7A", linewidth=1.0, linestyle=(0, (2, 3)), alpha=0.65)
+            axis.text(1, axis.get_ylim()[0], " Optimal", fontsize=7, color="#0F766E", va="bottom", ha="left")
+        return figure
+
+    definitions = [
+        ("Investment by Tier", _render_bar("Investment by Tier", "Investment ladder across the forecast tiers", investments, currency=True)),
+        ("CPIx by Investment Tier", _render_line("CPIx by Investment Tier", "Cost per incremental customer rises as reach expands", cpix, currency=True)),
+        ("iROAS by Investment Tier", _render_line("iROAS by Investment Tier", "Incremental revenue returned for each forecast dollar", iroas, currency=True, precision=2)),
+        ("Incremental Customers by Investment Tier", _render_bar("Incremental Customers by Investment Tier", "Customer gain at each forecast investment level", customers)),
+        ("Incremental Revenue by Investment Tier", _render_bar("Incremental Revenue by Investment Tier", "Projected incremental revenue at each investment level", revenue, currency=True)),
+        ("Prospects by Investment Tier", _render_bar("Prospects by Investment Tier", "Reachable prospects supporting each forecast tier", prospects)),
+    ]
+    rendered = []
+    for title, figure in definitions:
+        output = _chart_io.BytesIO()
+        figure.savefig(output, format="png", dpi=180, facecolor=figure.get_facecolor())
+        rendered.append((title, output.getvalue()))
+    return rendered
 
 def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes]] | None = None) -> None:
     """Build xlsx inline and render download button."""
@@ -1357,7 +1439,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     improvements = result["improvements"]
     indexes = st.session_state.get("_cached_indexes")
     proj_mode = st.session_state.get("projection_mode", "Quarterly")
-    proj_quarter = st.session_state.get("projection_quarter", "")
+    proj_quarter = st.session_state.get("projection_quarter") or ""
     account = st.session_state.source_account
     first_tier = vis_ranges[0].tier_label if vis_ranges else ""
     sig_util = st.session_state.get("_cached_sig_util", {})
@@ -1411,19 +1493,42 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     label = "Annual" if is_annual else proj_quarter
     forecast_sheet_name = "Annual Forecast" if is_annual else "Quarterly Forecast"
     f_rows = [f_header]
-    f_rows.append([f"Baseline ({label})"] + [""] * (nc - 1))
+    f_rows.append([f"Current Investment ({label})"] + [""] * (nc - 1))
+    previous_baseline_tier = None
     for r in vis_ranges:
+        marginal_cpix_display = "—"
+        marginal_iroas_display = "—"
+        if previous_baseline_tier is not None:
+            delta_investment = (float(r.investment) - float(previous_baseline_tier.investment)) * mult
+            customer_low_delta = (float(r.incremental_customers.minimum) - float(previous_baseline_tier.incremental_customers.minimum)) * mult
+            customer_high_delta = (float(r.incremental_customers.maximum) - float(previous_baseline_tier.incremental_customers.maximum)) * mult
+            revenue_low_delta = (float(r.incremental_revenue.minimum) - float(previous_baseline_tier.incremental_revenue.minimum)) * mult
+            revenue_high_delta = (float(r.incremental_revenue.maximum) - float(previous_baseline_tier.incremental_revenue.maximum)) * mult
+            if delta_investment > 0 and customer_low_delta > 0 and customer_high_delta > 0:
+                marginal_cpix_display = rng(
+                    delta_investment / customer_high_delta,
+                    delta_investment / customer_low_delta,
+                    fmoney,
+                )
+            if delta_investment > 0:
+                marginal_iroas_display = rng(
+                    revenue_low_delta / delta_investment,
+                    revenue_high_delta / delta_investment,
+                    firoas,
+                )
         f_rows.append([
-            r.tier_label, fmoney(float(r.investment) * mult), fint(float(r.delivered_volume) * mult),
+            export_tier_label(r.tier_label), fmoney(float(r.investment) * mult), fint(float(r.delivered_volume) * mult),
             fint(float(r.prospects) * mult),
             rng(float(r.incremental_customers.minimum) * mult, float(r.incremental_customers.maximum) * mult, fk),
             rng(float(r.incremental_revenue.minimum) * mult, float(r.incremental_revenue.maximum) * mult, fdk),
             rng(float(r.cpix.minimum), float(r.cpix.maximum), fmoney),
             rng(float(r.iroas.minimum), float(r.iroas.maximum), firoas),
-            "", "", f"{sig_util.get(r.tier_label, 0):.1f}%"])
+            marginal_cpix_display, marginal_iroas_display, f"{sig_util.get(r.tier_label, 0):.1f}%"])
+        previous_baseline_tier = r
     for name, factor, imp_rows in improvements:
         f_rows.append([""] * nc)
         f_rows.append([f"+{float(factor)*100:.0f}% Improvement ({name})"] + [""] * (nc - 1))
+        f_rows.append(f_header.copy())
         by_tier = _dd(list)
         for ir in imp_rows:
             by_tier[ir.tier_label].append(ir)
@@ -1435,8 +1540,8 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             rs = [float(x.incremental_revenue) for x in trows]
             cxs = [float(x.cpix) for x in trows]
             irs = [float(x.iroas) for x in trows]
-            mcs = [float(x.marginal_cpix) for x in trows if x.marginal_cpix and x.marginal_cpix > 0]
-            mis = [float(x.marginal_iroas) for x in trows if x.marginal_iroas and x.marginal_iroas > 0]
+            mcs = [float(x.marginal_cpix) for x in trows if x.marginal_cpix is not None]
+            mis = [float(x.marginal_iroas) for x in trows if x.marginal_iroas is not None]
             if len(trows) == 1:
                 cr = rng(cs[0]*(1-ra), cs[0]*(1+ra), fk)
                 rvr = rng(rs[0]*(1-ra), rs[0]*(1+ra), fdk)
@@ -1460,6 +1565,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     sheets[forecast_sheet_name] = f_rows
 
     # Tab 3+: Splits
+    _dbl_hdr_actual = set()
     QM = {1: ["Jan","Feb","Mar"], 2: ["Apr","May","Jun"], 3: ["Jul","Aug","Sep"], 4: ["Oct","Nov","Dec"]}
     sp_header = ["Tier", "Investment", "Delivered", "Prospects", "Inc. Customers",
                  "Inc. Revenue", "CPIx", "iROAS"]
@@ -1473,7 +1579,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             cmx = float(r.incremental_customers.maximum) * fac * ip * im
             rmn = float(r.incremental_revenue.minimum) * fac * ip * im
             rmx = float(r.incremental_revenue.maximum) * fac * ip * im
-            out.append([r.tier_label, fmoney(inv),
+            out.append([export_tier_label(r.tier_label), fmoney(inv),
                 fint(float(r.delivered_volume) * fac * op), fint(float(r.prospects) * fac * op),
                 rng(cmn, cmx, fk), rng(rmn, rmx, fdk),
                 rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fmoney),
@@ -1512,6 +1618,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                 op = indexes["monthly_organic"].get(mo, 1/12) / osum if osum else 1/3
                 ip = indexes["monthly_incremental"].get(mo, 1/12) / isum if isum else 1/3
                 ms_rows.append([mo] + [""] * (snc - 1))
+                ms_rows.append(sp_header.copy())
                 ms_rows.extend(split_rows(vis_ranges, op, ip, fac=1))
             sheets["Monthly Split"] = ms_rows
         else:
@@ -1550,16 +1657,18 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                     for _ in improvements:
                         sec += ["", ql] + [""] * 6
                     qs_rows.append(sec)
+                    qs_rows.append(col_row.copy())
                     base = split_vals(vis_ranges, o, i)
                     imp_data = []
                     for nm, fc, _ in improvements:
                         imp_data.append(split_vals(vis_ranges, o, i, 1 + float(fc)))
                     for ti, r in enumerate(vis_ranges):
-                        row = [r.tier_label] + base[ti]
+                        row = [export_tier_label(r.tier_label)] + base[ti]
                         for imp_v in imp_data:
                             row += [""] + imp_v[ti]
                         qs_rows.append(row)
                 sheets["Quarterly Split"] = qs_rows
+                _dbl_hdr_actual.add("Quarterly Split")
 
                 # --- Annual Monthly Split: side-by-side scenarios ---
                 ms_rows = [scenario_row, col_row]
@@ -1581,16 +1690,18 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                         for _ in improvements:
                             sec += ["", mo_label] + [""] * 6
                         ms_rows.append(sec)
+                        ms_rows.append(col_row.copy())
                         base = split_vals(vis_ranges, op, ip)
                         imp_data = []
                         for nm, fc, _ in improvements:
                             imp_data.append(split_vals(vis_ranges, op, ip, 1 + float(fc)))
                         for ti, r in enumerate(vis_ranges):
-                            row = [r.tier_label] + base[ti]
+                            row = [export_tier_label(r.tier_label)] + base[ti]
                             for imp_v in imp_data:
                                 row += [""] + imp_v[ti]
                             ms_rows.append(row)
                 sheets["Monthly Split"] = ms_rows
+                _dbl_hdr_actual.add("Monthly Split")
             else:
                 # No improvements — simple stacked layout
                 qs_rows = [sp_header]
@@ -1599,6 +1710,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                     o = indexes["quarterly_organic"].get(qk, 0.25)
                     i = indexes["quarterly_incremental"].get(qk, 0.25)
                     qs_rows.append([ql] + [""] * (snc - 1))
+                    qs_rows.append(sp_header.copy())
                     qs_rows.extend(split_rows(vis_ranges, o, i))
                 sheets["Quarterly Split"] = qs_rows
 
@@ -1616,16 +1728,35 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                         ip = qi * (indexes["monthly_incremental"].get(mo, 1/12) / is2) if is2 else qi / 3
                         mo_label = f"{mo} {yr}" if yr else mo
                         ms_rows.append([mo_label] + [""] * (snc - 1))
+                        ms_rows.append(sp_header.copy())
                         ms_rows.extend(split_rows(vis_ranges, op, ip))
                 sheets["Monthly Split"] = ms_rows
 
-    if export_charts:
-        sheets["Charts"] = [
-            ["Forecast charts"],
-            ["Charts mirror the colors, labels, and metrics shown in ForecastPro AI."],
+    # Charts are rendered as premium report images; the exact source values stay hidden in Chart Data.
+    native_charts = []
+    if vis_ranges:
+        chart_rows = [["Tier", "Investment", "CPIx Midpoint", "iROAS Midpoint", "Incremental Customers", "Incremental Revenue", "Prospects", "Delivered Volume"]]
+        for row in vis_ranges:
+            chart_rows.append([
+                export_tier_label(row.tier_label), float(row.investment),
+                float((row.cpix.minimum + row.cpix.maximum) / 2),
+                float((row.iroas.minimum + row.iroas.maximum) / 2),
+                float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2),
+                float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2),
+                float(row.prospects), float(row.delivered_volume),
+            ])
+        sheets["Chart Data"] = chart_rows
+        sheets["Charts"] = [[""]]
+        native_charts = [
+            ("Investment by Tier", 1, "00A86B"),
+            ("CPIx by Investment Tier", 2, "8B5CF6"),
+            ("iROAS by Investment Tier", 3, "1F77B4"),
+            ("Incremental Customers by Investment Tier", 4, "06B6D4"),
+            ("Incremental Revenue by Investment Tier", 5, "3B82F6"),
+            ("Prospects by Investment Tier", 6, "648FC2"),
         ]
 
-    # --- Build xlsx from raw XML with formatting ---
+        # --- Build xlsx from raw XML with formatting ---
     def col_letter(idx):
         r = ""; i = idx
         while i >= 0: r = chr(65 + i % 26) + r; i = i // 26 - 1
@@ -1699,7 +1830,8 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             rn += 1
         data_row_idx = 0
         for row in data_rows:
-            is_header = (data_row_idx == 0) or (double_header and data_row_idx == 1)
+            is_repeated_header = row == data_rows[0] or (double_header and row == data_rows[1])
+            is_header = (data_row_idx == 0) or (double_header and data_row_idx == 1) or (data_row_idx > 1 and is_repeated_header)
             _non_empty = [v for v in row if v != ""]
             is_section = (not is_header and len(row) > 1 and len(_non_empty) >= 1
                           and all(v == _non_empty[0] for v in _non_empty))
@@ -1762,26 +1894,30 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             f'{merge_xml}{drawing_xml}</worksheet>'
         )
 
-    def worksheet_drawing_xml(images):
-        anchors = [
-            '<xdr:twoCellAnchor editAs="oneCell">'
-            '<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
-            '<xdr:to><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
-            '<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="1" name="ZETA logo"/><xdr:cNvPicPr/></xdr:nvPicPr>'
-            '<xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
-            '<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>'
-            '<xdr:clientData/></xdr:twoCellAnchor>'
-        ]
-        for idx, (_title, _png) in enumerate(images, 2):
-            chart_index = idx - 2
+    def worksheet_drawing_xml(images, has_logo=True):
+        anchors = []
+        rid = 1
+        if has_logo:
+            anchors.append(
+                '<xdr:twoCellAnchor editAs="oneCell">'
+                '<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+                '<xdr:to><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+                '<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="1" name="ZETA logo"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+                '<xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+                '<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>'
+                '<xdr:clientData/></xdr:twoCellAnchor>'
+            )
+            rid = 2
+        for chart_index, (_title, _png) in enumerate(images):
+            cur_rid = rid + chart_index
             col = 0 if chart_index % 2 == 0 else 8
             row = 4 + (chart_index // 2) * 20
             anchors.append(
                 f'<xdr:twoCellAnchor editAs="oneCell">'
                 f'<xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
                 f'<xdr:to><xdr:col>{col + 7}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row + 17}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
-                f'<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{idx}" name="Forecast chart {chart_index + 1}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
-                f'<xdr:blipFill><a:blip r:embed="rId{idx}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+                f'<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{cur_rid}" name="Forecast chart {chart_index + 1}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+                f'<xdr:blipFill><a:blip r:embed="rId{cur_rid}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
                 f'<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>'
                 f'<xdr:clientData/></xdr:twoCellAnchor>'
             )
@@ -1793,6 +1929,45 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             + "".join(anchors) + '</xdr:wsDr>'
         )
 
+    def _native_chart_xml(title, value_column, color, chart_rows):
+        points = chart_rows[1:]
+        last_data_row = 3 + len(points)
+        category_formula = f"'Chart Data'!$A$4:$A${last_data_row}"
+        value_letter = col_letter(value_column)
+        value_formula = f"'Chart Data'!${value_letter}$4:${value_letter}${last_data_row}"
+        category_cache = "".join(
+            f'<c:pt idx="{index}"><c:v>{_esc(str(row[0]))}</c:v></c:pt>'
+            for index, row in enumerate(points)
+        )
+        value_cache = "".join(
+            f'<c:pt idx="{index}"><c:v>{float(row[value_column]):.8f}</c:v></c:pt>'
+            for index, row in enumerate(points)
+        )
+        value_format = "$#,##0" if value_column in (1, 2, 4) else "#,##0"
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>'
+            '<c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="1200" b="1"/>' + f'<a:t>{_esc(title)}</a:t>' + '</a:r></a:p></c:rich></c:tx><c:layout/></c:title>'
+            '<c:plotArea><c:layout/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/><c:ser><c:idx val="0"/><c:order val="0"/>' +
+            f'<c:tx><c:v>{_esc(title)}</c:v></c:tx><c:spPr><a:solidFill><a:srgbClr val="{color}"/></a:solidFill><a:ln><a:noFill/></a:ln></c:spPr>' +
+            f'<c:cat><c:strRef><c:f>{category_formula}</c:f><c:strCache><c:ptCount val="{len(points)}"/>{category_cache}</c:strCache></c:strRef></c:cat>' +
+            f'<c:val><c:numRef><c:f>{value_formula}</c:f><c:numCache><c:formatCode>{value_format}</c:formatCode><c:ptCount val="{len(points)}"/>{value_cache}</c:numCache></c:numRef></c:val>' +
+            '</c:ser><c:axId val="1001"/><c:axId val="1002"/></c:barChart><c:catAx><c:axId val="1001"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:tickLblPos val="low"/><c:crossAx val="1002"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:txPr><a:bodyPr rot="-2700000"/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800"/></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr></c:catAx><c:valAx><c:axId val="1002"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines><c:spPr><a:ln w="12700"><a:solidFill><a:srgbClr val="D1D5DB"/></a:solidFill></a:ln></c:spPr></c:majorGridlines>' +
+            f'<c:numFmt formatCode="{value_format}" sourceLinked="0"/><c:tickLblPos val="nextTo"/><c:crossAx val="1001"/><c:crosses val="autoZero"/></c:valAx></c:plotArea><c:plotVisOnly val="0"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>'
+        )
+
+    def _charts_drawing_xml(charts, has_logo=True):
+        anchors = []
+        if has_logo:
+            anchors.append('<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="1" name="ZETA logo"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>')
+        rid_start = 2 if has_logo else 1
+        for index, (title, _col, _color) in enumerate(charts):
+            rid = rid_start + index
+            col = 0 if index % 2 == 0 else 8
+            row = 4 + (index // 2) * 20
+            anchors.append(f'<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>{col+7}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row+17}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{rid}" name="{_esc(title)}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rId{rid}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>')
+        return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' + "".join(anchors) + '</xdr:wsDr>')
+
     buf = _io.BytesIO()
     snames = list(sheets.keys())
     chart_sheet_no = snames.index("Charts") + 1 if "Charts" in snames else None
@@ -1800,39 +1975,61 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
         "Historical KPIs": f"◆ ZETA | ForecastPro AI — Historical KPIs  |  {account}",
         "Quarterly Forecast": f"◆ ZETA | ForecastPro AI — Quarterly Forecast  |  {account}",
         "Annual Forecast": f"◆ ZETA | ForecastPro AI — Annual Forecast  |  {account}",
+        "Charts": f"ZETA | Forecast Report  |  {account}",
     }
     _dbl_hdr_sheets = {"Quarterly Split", "Monthly Split"}
     with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as z:
+        _has_drawings = bool(logo_bytes) or bool(export_charts) or bool(native_charts)
         ov = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(snames)+1))
         drawing_overrides = "".join(
             f'<Override PartName="/xl/drawings/drawing{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
             for i in range(1, len(snames) + 1)
-        ) if logo_bytes else ""
-        z.writestr("[Content_Types].xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>{ov}{drawing_overrides}</Types>')
+        ) if _has_drawings else ""
+        chart_overrides = "".join(f'<Override PartName="/xl/charts/chart{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>' for i in range(1, len(native_charts) + 1))
+        z.writestr("[Content_Types].xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>{ov}{drawing_overrides}{chart_overrides}</Types>')
         z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
-        ws = "".join(f'<sheet name="{_esc(n)}" sheetId="{i}" r:id="rId{i}"/>' for i, n in enumerate(snames, 1))
+        _workbook_sheets = []
+        for i, n in enumerate(snames, 1):
+            sheet_state = ' state="hidden"' if n == "Chart Data" else ""
+            _workbook_sheets.append(
+                f'<sheet name="{_esc(n)}" sheetId="{i}" r:id="rId{i}"{sheet_state}/>'
+            )
+        ws = "".join(_workbook_sheets)
         z.writestr("xl/workbook.xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{ws}</sheets></workbook>')
         rl = "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(snames)+1))
         z.writestr("xl/_rels/workbook.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rl}<Relationship Id="rIdS" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
         z.writestr("xl/styles.xml", _STYLED_STYLES)
         if logo_bytes:
             z.writestr("xl/media/zeta_logo.jpg", logo_bytes)
+        if _has_drawings:
+            _has_logo = bool(logo_bytes)
             for i, n in enumerate(snames, 1):
                 sheet_images = export_charts if i == chart_sheet_no else []
-                z.writestr(f"xl/drawings/drawing{i}.xml", worksheet_drawing_xml(sheet_images))
-                image_rels = '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/zeta_logo.jpg"/>'
+                sheet_native_charts = native_charts if i == chart_sheet_no and not sheet_images else []
+                drawing_xml = _charts_drawing_xml(sheet_native_charts, has_logo=_has_logo) if sheet_native_charts else worksheet_drawing_xml(sheet_images, has_logo=_has_logo)
+                z.writestr(f"xl/drawings/drawing{i}.xml", drawing_xml)
+                image_rels = ""
+                rid_offset = 1
+                if _has_logo:
+                    image_rels = '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/zeta_logo.jpg"/>'
+                    rid_offset = 2
                 image_rels += "".join(
-                    f'<Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/chart{idx - 1}.png"/>'
-                    for idx, (_title, _png) in enumerate(sheet_images, 2)
+                    f'<Relationship Id="rId{rid_offset + idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/chart{idx + 1}.png"/>'
+                    for idx, (_title, _png) in enumerate(sheet_images)
                 )
-                z.writestr(f"xl/drawings/_rels/drawing{i}.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{image_rels}</Relationships>')
+                chart_rid_start = rid_offset + len(sheet_images)
+                chart_rels = "".join(f'<Relationship Id="rId{chart_rid_start + j}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{j + 1}.xml"/>' for j, _chart in enumerate(sheet_native_charts))
+                z.writestr(f"xl/drawings/_rels/drawing{i}.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{image_rels}{chart_rels}</Relationships>')
                 z.writestr(f"xl/worksheets/_rels/sheet{i}.xml.rels", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{i}.xml"/></Relationships>')
             for idx, (_title, png) in enumerate(export_charts, 1):
                 z.writestr(f"xl/media/chart{idx}.png", png)
+            chart_rows_for_export = sheets.get("Chart Data", [])
+            for idx, (chart_title, value_column, chart_color) in enumerate(native_charts, 1):
+                z.writestr(f"xl/charts/chart{idx}.xml", _native_chart_xml(chart_title, value_column, chart_color, chart_rows_for_export))
         for i, n in enumerate(snames, 1):
             t = _sheet_titles.get(n, f"◆ ZETA | ForecastPro AI — {n}  |  {account}")
             dbl = (n in _dbl_hdr_sheets) and bool(improvements)
-            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl, with_drawing=bool(logo_bytes)))
+            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl, with_drawing=_has_drawings))
 
     _safe = re.sub(r"[^a-z0-9]+", "-", account.lower()).strip("-") or "forecast"
     st.download_button("Download Excel Workbook", buf.getvalue(), f"{_safe}-forecast.xlsx",
@@ -1922,6 +2119,13 @@ def load_historical_slice() -> None:
     st.session_state.historical_scope_label = "Historical slice"
 
 # --- Common header ---
+try:
+    _header_logo_b64 = base64.b64encode(
+        Path(__file__).with_name("zeta logo.jpg").read_bytes()
+    ).decode("ascii")
+except OSError:
+    _header_logo_b64 = ""
+
 brand_col, title_col, reset_col = st.columns(
     [2.2, 4.6, 1.5],
     vertical_alignment="center",
@@ -1933,12 +2137,23 @@ with brand_col:
         unsafe_allow_html=True,
     )
 with title_col:
+    _zeta_mark = (
+        f'<span style="display:block;width:42px;height:42px;overflow:hidden;flex:0 0 42px;">'
+        f'<img src="data:image/jpeg;base64,{_header_logo_b64}" alt="Zeta" '
+        'style="display:block;height:42px;width:auto;max-width:none;" />'
+        '</span>'
+        if _header_logo_b64
+        else ""
+    )
     st.markdown(
-        '<h1 style="font-family:Georgia,serif !important;font-weight:700 !important;'
-        'font-size:2.2rem !important;line-height:1.1;text-align:center;margin:0;">Forecast Engine</h1>',
+        '<div style="display:flex;align-items:center;justify-content:center;gap:0.7rem;min-height:46px;">'
+        + _zeta_mark
+        + '<h1 style="font-family:Georgia,serif !important;font-weight:700 !important;'
+        'font-size:2.2rem !important;line-height:1.1;margin:0;">Forecast Engine</h1>'
+        '</div>',
         unsafe_allow_html=True,
     )
-mailops_col, reset_col = st.columns([1, 1])
+mailops_col, _spacer, reset_col = st.columns([1, 6, 1])
 with mailops_col:
     if st.button("Change MailOps Data", key="_mailops_btn", help="Add MailOps data through this tool"):
         st.session_state.mailops_mode = True
@@ -1973,9 +2188,11 @@ if st.session_state.forecast:
         tab_names.append("3b Quarterly Split")
         tab_names.append("3c Monthly Split")
     tab_names.append("4 Charts")
-    tab_names.append("5 Projection Calculations (QA)")
+    tab_names.append("5 Save to Snowflake")
+    tab_names.append("99 Projection Calculations (QA)")
 
-_charts_tab_idx = len(tab_names) - 2
+_charts_tab_idx = len(tab_names) - 3
+_save_tab_idx = len(tab_names) - 2
 _qa_tab_idx = len(tab_names) - 1
 
 # Initialize active_tab if not set or out of bounds
@@ -2008,7 +2225,7 @@ def compact_field_label(title: str, instruction: str, tooltip: str) -> None:
 # TAB 1: INPUTS & DISCOVERY
 # =============================================================================
 if active_tab == 0:
-    st.header("1. Select Campaign")
+    st.header("Select Campaign")
     st.caption("Select a campaign from the dropdown.")
     account_rows = session.sql(f"""
         SELECT DISTINCT ACCT_NAME
@@ -2326,6 +2543,7 @@ if active_tab == 0:
             source_options.sort(key=_quarter_sort_value)
 
         # A target-quarter change restores the immediately preceding approved
+        # A target-quarter change restores the immediately preceding approved
         # quarter as the default source. The analyst may then select any earlier
         # approved source quarter from the visible dropdown.
         if st.session_state.get("_source_dropdown_projection") != projection_quarter_choice:
@@ -2533,7 +2751,7 @@ if st.session_state.confirmed and active_tab == 1:
         st.rerun()
 
     if st.session_state.show_historical_kpis:
-        st.header("4. Historical Quarterly KPIs & Performance")
+        st.header("Historical Quarterly KPIs & Performance")
         _kpi_rows = []
         for row in selected_history:
             _kpi_rows.append({
@@ -2650,7 +2868,7 @@ if st.session_state.confirmed and active_tab == 1:
             key=frequency_widget_key,
             on_change=_frequency_changed,
             help=(
-                f"Minimum {minimum_viable_frequency:.2f} keeps Sustainable Scale "
+                f"Minimum {minimum_viable_frequency:.2f} keeps Optimal Scale "
                 "at or above Current Budget."
             ),
         )
@@ -2737,7 +2955,11 @@ if st.session_state.confirmed and active_tab == 1:
     st.divider()
 
     # --- Calculated Investment Tiers ---
-    st.subheader("Calculated investment tiers")
+    st.markdown(
+        '### Calculated investment tiers '
+        '<span class="info-icon" title="These investment levels are calculated from the selected historical inputs, current investment, available signal reach, CPM, and frequency. The middle tiers can be adjusted while keeping the investment ladder in increasing order." aria-label="More information">i</span>',
+        unsafe_allow_html=True,
+    )
     high_utilization = float(signal_utilization) >= 0.90
     at_full_utilization = float(signal_utilization) >= 1.0
     labels = [
@@ -2748,6 +2970,14 @@ if st.session_state.confirmed and active_tab == 1:
         "Strategic Scale",
         "Optimal Scale",
     ]
+    tier_help = {
+        "Current Investment": "The current approved investment level used as the starting point for the forecast.",
+        "Growth Momentum": "The first calculated investment step above the current investment.",
+        "Strategic Growth": "A mid-range calculated investment level for additional scale.",
+        "Market Expansion": "A higher calculated investment level that expands reach beyond strategic growth.",
+        "Strategic Scale": "The final calculated growth tier before the optimal scale limit.",
+        "Optimal Scale": "The maximum calculated investment level supported by available reach and frequency assumptions.",
+    }
 
     if at_full_utilization:
         # Keep Current Budget as the initial tier; derive Optimal Scale from
@@ -2769,8 +2999,24 @@ if st.session_state.confirmed and active_tab == 1:
             current_budget + interval * index for index in range(6)
         ]
 
-    tier_headroom = float(max_investment) - float(current_budget)
-    has_tier_headroom = tier_headroom > 0.01
+    def _tier_rounding_increment(value: float) -> float:
+        return 1000.0 if abs(float(value)) >= 100_000 else 100.0
+
+    def _round_tier_investment(value: float) -> float:
+        quantum = Decimal("1E3") if abs(float(value)) >= 100_000 else Decimal("1E2")
+        return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+    # Tier values are intentionally rounded to clean planning increments before
+    # they are displayed or used by the forecast, charts, and workbook export.
+    calculated_tier_values = [
+        _round_tier_investment(value) for value in calculated_tier_values
+    ]
+    minimum_tier_gap = max(
+        minimum_tier_gap,
+        max(_tier_rounding_increment(value) for value in calculated_tier_values),
+    )
+    tier_headroom = float(calculated_tier_values[-1]) - float(calculated_tier_values[0])
+    has_tier_headroom = tier_headroom >= minimum_tier_gap
 
     # Store relative adjustments, never replacement investment values. This means
     # a +/- action changes only the selected tier and cannot make the remaining
@@ -2778,6 +3024,19 @@ if st.session_state.confirmed and active_tab == 1:
     st.session_state.setdefault("tier_adjustments", {})
     st.session_state.setdefault("manual_tier_mode", False)
     st.session_state.setdefault("manual_tier_values", {})
+    shared_adjustment_key = "_shared_tier_adjustment"
+    shared_adjustment_version = "shared-tier-adjustment-v1"
+    if st.session_state.get("_tier_adjustment_mode") != shared_adjustment_version:
+        # Replace legacy independent tier adjustments with one shared adjustment.
+        st.session_state.tier_adjustments = {}
+        st.session_state[shared_adjustment_key] = 10_000.0
+        st.session_state["_last_shared_tier_adjustment"] = 10_000.0
+        st.session_state["_tier_adjustment_mode"] = shared_adjustment_version
+        if st.session_state.get("forecast") is not None:
+            st.session_state.forecast = None
+            st.session_state.message = (
+                "Tier adjustment logic changed. Create a new forecast draft."
+            )
 
     tier_scope_signature = (
         st.session_state.get("source_account"),
@@ -2798,6 +3057,8 @@ if st.session_state.confirmed and active_tab == 1:
     )
     if st.session_state.get("tier_calculation_signature") != tier_calculation_signature:
         st.session_state.tier_adjustments = {}
+        st.session_state[shared_adjustment_key] = 10_000.0
+        st.session_state["_last_shared_tier_adjustment"] = 10_000.0
         st.session_state.tier_calculation_signature = tier_calculation_signature
         if st.session_state.get("forecast") is not None:
             st.session_state.forecast = None
@@ -2810,12 +3071,20 @@ if st.session_state.confirmed and active_tab == 1:
         st.session_state.message = message
 
     def _manual_tier_changed() -> None:
+        for tier_index in range(len(labels)):
+            manual_key = f"manual_tier_{tier_index}"
+            if manual_key in st.session_state:
+                st.session_state[manual_key] = _round_tier_investment(
+                    st.session_state[manual_key]
+                )
         _clear_stale_forecast(
             "Manual tier values changed. Create a new forecast draft to update results."
         )
 
     def _reset_calculated_tiers() -> None:
         st.session_state.tier_adjustments = {}
+        st.session_state[shared_adjustment_key] = 10_000.0
+        st.session_state["_last_shared_tier_adjustment"] = 10_000.0
         _clear_stale_forecast(
             "Calculated tiers reset. Create a new forecast draft to update results."
         )
@@ -2832,7 +3101,10 @@ if st.session_state.confirmed and active_tab == 1:
             upper_bound = float(calculated_tier_values[-1]) - (
                 minimum_tier_gap * (len(calculated_tier_values) - 1 - index)
             )
-            values.append(min(max(requested_value, lower_bound), upper_bound))
+            rounded_value = _round_tier_investment(
+                min(max(requested_value, lower_bound), upper_bound)
+            )
+            values.append(min(max(rounded_value, lower_bound), upper_bound))
         if len(calculated_tier_values) > 1:
             values.append(float(calculated_tier_values[-1]))
         return values
@@ -2842,7 +3114,7 @@ if st.session_state.confirmed and active_tab == 1:
         if at_full_utilization:
             st.caption(
                 "At 100% utilization, Current Budget is the Baseline. "
-                "Sustainable Scale is calculated from Max Reach and frequency."
+                "Optimal Scale is calculated from Max Reach and frequency."
             )
             st.session_state.manual_tier_mode = False
         elif st.session_state.manual_tier_mode:
@@ -2881,14 +3153,52 @@ if st.session_state.confirmed and active_tab == 1:
             help="Restore the original automatically calculated tier values.",
         )
 
+    def _shared_adjustment_changed() -> None:
+        previous_value = float(
+            st.session_state.get("_last_shared_tier_adjustment", 10_000.0)
+        )
+        requested_value = float(st.session_state[shared_adjustment_key])
+        requested_delta = requested_value - previous_value
+        if abs(requested_delta) < 0.01 or at_full_utilization:
+            st.session_state["_last_shared_tier_adjustment"] = requested_value
+            return
+
+        current_values = _calculated_values_with_adjustments()
+        first_middle = 1
+        last_middle = len(current_values) - 2
+        min_delta = (current_values[first_middle - 1] + minimum_tier_gap) - current_values[first_middle]
+        max_delta = (current_values[-1] - minimum_tier_gap) - current_values[last_middle]
+        applied_delta = min(max(requested_delta, min_delta), max_delta)
+        applied_delta = _round_tier_investment(applied_delta) if abs(applied_delta) >= 100_000 else round(applied_delta / 1000) * 1000
+
+        if abs(applied_delta) > 0.01:
+            for tier_label in labels[first_middle:-1]:
+                st.session_state.tier_adjustments[tier_label] = (
+                    float(st.session_state.tier_adjustments.get(tier_label, 0.0))
+                    + applied_delta
+                )
+            _clear_stale_forecast(
+                "Shared tier adjustment applied. Create a new forecast draft."
+            )
+
+        actual_value = previous_value + applied_delta
+        st.session_state[shared_adjustment_key] = actual_value
+        st.session_state["_last_shared_tier_adjustment"] = actual_value
+
     with control_step:
-        adjustment_step = st.number_input(
+        st.number_input(
             "Adjustment step",
-            min_value=1000,
-            value=50000,
-            step=10000,
-            key="_adj_step",
+            min_value=1_000.0,
+            value=10_000.0,
+            step=10_000.0,
+            format="%.0f",
+            key=shared_adjustment_key,
+            on_change=_shared_adjustment_changed,
             disabled=st.session_state.manual_tier_mode or at_full_utilization,
+            help=(
+                "Use + or − here to move every middle tier together. "
+                "Current Investment and Optimal Scale remain fixed."
+            ),
         )
 
     show_expansion = False
@@ -2909,13 +3219,14 @@ if st.session_state.confirmed and active_tab == 1:
                             label, calculated_value
                         )
                     ),
-                    step=float(adjustment_step),
-                    format="%.2f",
+                    step=1000.0,
+                    format="%.0f",
                     key=f"manual_tier_{index}",
                     on_change=_manual_tier_changed,
                 )
-                tier_values.append(float(value))
-                st.session_state.manual_tier_values[label] = float(value)
+                rounded_value = _round_tier_investment(value)
+                tier_values.append(rounded_value)
+                st.session_state.manual_tier_values[label] = rounded_value
     else:
         if not at_full_utilization and not has_tier_headroom:
             st.warning(
@@ -2932,63 +3243,15 @@ if st.session_state.confirmed and active_tab == 1:
         )
         for index, (label, value) in enumerate(zip(labels, tier_values)):
             with tier_cols[index]:
-                is_adjustable = (
-                    not high_utilization
-                    and has_tier_headroom
-                    and 0 < index < len(labels) - 1
-                )
-                if is_adjustable:
-                    def _change_tier(
-                        label_name=label,
-                        current_value=value,
-                        tier_index=index,
-                        direction=0,
-                    ):
-                        step = float(st.session_state.get("_adj_step", 50000))
-                        lower_bound = tier_values[tier_index - 1] + minimum_tier_gap
-                        upper_bound = tier_values[tier_index + 1] - minimum_tier_gap
-                        new_value = min(
-                            max(current_value + direction * step, lower_bound),
-                            upper_bound,
-                        )
-                        base_value = float(calculated_tier_values[tier_index])
-                        st.session_state.tier_adjustments[label_name] = (
-                            new_value - base_value
-                        )
-                        _clear_stale_forecast(
-                            f"{label_name} adjusted. Create a new forecast draft to update results."
-                        )
-
-                    with st.container(border=True):
-                        card_col, btn_col = st.columns([6, 1], gap="small")
-                        with card_col:
-                            st.markdown(
-                                f'<div class="tier-name">{label}</div>'
-                                f'<div class="tier-amount">{money(value)}</div>',
-                                unsafe_allow_html=True,
-                            )
-                        with btn_col:
-                            st.button(
-                                "+",
-                                key=f"inc_{index}",
-                                on_click=_change_tier,
-                                kwargs={"direction": 1},
-                                use_container_width=True,
-                            )
-                            st.button(
-                                "−",
-                                key=f"dec_{index}",
-                                on_click=_change_tier,
-                                kwargs={"direction": -1},
-                                use_container_width=True,
-                            )
-                else:
-                    with st.container(border=True):
-                        st.markdown(
-                            f'<div class="tier-name">{label}</div>'
-                            f'<div class="tier-amount">{money(value)}</div>',
-                            unsafe_allow_html=True,
-                        )
+                # One consistent card for each tier. Shared adjustment controls
+                # above replace the former per-card +/- buttons.
+                with st.container(height=118, border=True):
+                    st.markdown(
+                        f'<div class="tier-name">{label} '
+                        f'<span class="info-icon" title="{tier_help.get(label, "Calculated investment tier.")}" aria-label="More information">i</span></div>'
+                        f'<div class="tier-amount">{money(value)}</div>',
+                        unsafe_allow_html=True,
+                    )
     st.divider()
 
     # --- Improvement Scenarios ---
@@ -3221,9 +3484,9 @@ if st.session_state.forecast and active_tab == 2:
     _marginal_cpix_values: dict[str, list[float]] = _defaultdict(list)
     _marginal_iroas_values: dict[str, list[float]] = _defaultdict(list)
     for row in visible_projections:
-        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+        if row.marginal_cpix is not None:
             _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
-        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+        if row.marginal_iroas is not None:
             _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
 
     _sig_util_all = {
@@ -3239,14 +3502,14 @@ if st.session_state.forecast and active_tab == 2:
         st.subheader(f"{_proj_q_label} Projection")
         range_frame = pd.DataFrame([
             {"Tier": row.tier_label,
-             "Investment Tier": _fmt_dollar_commas(float(row.investment)),
-             "Delivered Volume": f"{float(row.delivered_volume):,.0f}",
-             "# of Prospects": f"{float(row.prospects):,.0f}",
-             "Inc. Customers": _range_str(
+             "Investment": _fmt_dollar_commas(float(row.investment)),
+             "Delivered": f"{float(row.delivered_volume):,.0f}",
+             "Prospects": f"{float(row.prospects):,.0f}",
+             "Inc. Cust": _range_str(
                  float(row.incremental_customers.minimum),
                  float(row.incremental_customers.maximum),
                  _fmt_compact_k),
-             "Incremental Revenue": _range_str(
+             "Inc. Rev": _range_str(
                  float(row.incremental_revenue.minimum),
                  float(row.incremental_revenue.maximum),
                  _fmt_dollar_compact_m),
@@ -3301,8 +3564,8 @@ if st.session_state.forecast and active_tab == 2:
                 revs = [float(r.incremental_revenue) for r in tier_rows]
                 cpixs = [float(r.cpix) for r in tier_rows]
                 iroass = [float(r.iroas) for r in tier_rows]
-                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix and r.marginal_cpix > 0]
-                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas and r.marginal_iroas > 0]
+                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix is not None]
+                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas is not None]
                 if len(tier_rows) == 1:
                     c = custs[0]
                     cust_range = _range_str(c * (1 - _range_adj), c * (1 + _range_adj), _fmt_compact_k)
@@ -3334,16 +3597,16 @@ if st.session_state.forecast and active_tab == 2:
                     miroas_range = "—"
                 scenario_rows.append({
                     "Tier": tier_label,
-                    "Investment Tier": _fmt_dollar_commas(float(tier_rows[0].investment)),
-                    "Delivered Volume": f"{float(rng.delivered_volume):,.0f}" if rng else "—",
-                    "# of Prospects": f"{float(rng.prospects):,.0f}" if rng else "—",
-                    "Inc. Customers": cust_range,
-                    "Incremental Revenue": rev_range,
+                    "Investment": _fmt_dollar_commas(float(tier_rows[0].investment)),
+                    "Delivered": f"{float(rng.delivered_volume):,.0f}" if rng else "—",
+                    "Prospects": f"{float(rng.prospects):,.0f}" if rng else "—",
+                    "Inc. Cust": cust_range,
+                    "Inc. Rev": rev_range,
                     "CPIx": cpix_range,
                     "iROAS": iroas_range,
                     "Marginal CPIx": mcpix_range,
                     "Marginal iROAS": miroas_range,
-                    "Signal Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
+                    "% Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
                 })
             if scenario_rows:
                 st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True)
@@ -3404,8 +3667,8 @@ if st.session_state.forecast and active_tab == 2:
                 revs = [float(r.incremental_revenue) * 4 for r in tier_rows]
                 cpixs = [float(r.cpix) for r in tier_rows]
                 iroass = [float(r.iroas) for r in tier_rows]
-                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix and r.marginal_cpix > 0]
-                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas and r.marginal_iroas > 0]
+                mcpixs = [float(r.marginal_cpix) for r in tier_rows if r.marginal_cpix is not None]
+                miroass = [float(r.marginal_iroas) for r in tier_rows if r.marginal_iroas is not None]
                 if len(tier_rows) == 1:
                     c = custs[0]
                     cust_range = _range_str(c * (1 - _range_adj_ann), c * (1 + _range_adj_ann), _fmt_compact_k)
@@ -3473,9 +3736,9 @@ if (st.session_state.forecast
     _marginal_cpix_values: dict[str, list[float]] = _dd_qs(list)
     _marginal_iroas_values: dict[str, list[float]] = _dd_qs(list)
     for row in visible_projections:
-        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+        if row.marginal_cpix is not None:
             _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
-        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+        if row.marginal_iroas is not None:
             _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
     _sig_util_by_tier = {
         row.tier_label: float(row.new_signal_utilization * 100)
@@ -3533,7 +3796,7 @@ if (st.session_state.forecast
                 iroas_min = rev_min / inv if inv > 0 else 0
                 iroas_max = rev_max / inv if inv > 0 else 0
                 qtr_rows.append({
-                    "Tiers": label,
+                    "Tier": label,
                     "Investment": _fmt_dollar_commas(inv),
                     "Delivered": f"{delivered:,.0f}",
                     "Prospects": f"{prospects:,.0f}",
@@ -3575,9 +3838,9 @@ if (st.session_state.forecast
     _marginal_cpix_values: dict[str, list[float]] = _dd_ms2(list)
     _marginal_iroas_values: dict[str, list[float]] = _dd_ms2(list)
     for row in visible_projections:
-        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+        if row.marginal_cpix is not None:
             _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
-        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+        if row.marginal_iroas is not None:
             _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
     _sig_util_by_tier = {
         row.tier_label: float(row.new_signal_utilization * 100)
@@ -3699,7 +3962,7 @@ if (st.session_state.forecast
                         iroas_min = rev_min / inv if inv > 0 else 0
                         iroas_max = rev_max / inv if inv > 0 else 0
                         month_rows.append({
-                            "Tiers": label,
+"Tier": label,
                             "Investment": _fmt_dollar_commas(inv),
                             "Delivered": f"{delivered:,.0f}",
                             "Prospects": f"{prospects:,.0f}",
@@ -3744,9 +4007,9 @@ if (st.session_state.forecast
     _marginal_cpix_values: dict[str, list[float]] = _dd_ms(list)
     _marginal_iroas_values: dict[str, list[float]] = _dd_ms(list)
     for row in visible_projections:
-        if row.marginal_cpix is not None and row.marginal_cpix > 0:
+        if row.marginal_cpix is not None:
             _marginal_cpix_values[row.tier_label].append(float(row.marginal_cpix))
-        if row.marginal_iroas is not None and row.marginal_iroas > 0:
+        if row.marginal_iroas is not None:
             _marginal_iroas_values[row.tier_label].append(float(row.marginal_iroas))
 
     # Signal utilization
@@ -3757,7 +4020,7 @@ if (st.session_state.forecast
     }
 
     # Determine projection quarter months
-    _proj_q = st.session_state.get("projection_quarter", "")
+    _proj_q = st.session_state.get("projection_quarter") or ""
     import re as _re_ms
     _pq_match = _re_ms.match(r"Q(\d)\s+(\d{4})", _proj_q)
     if _pq_match:
@@ -3867,7 +4130,7 @@ if (st.session_state.forecast
                                 miroas_str = _range_str(min(mi_vals), max(mi_vals), _fmt_iroas)
 
                     month_rows.append({
-                        "Tiers": label,
+"Tier": label,
                         "Investment": _fmt_dollar_commas(inv),
                         "Delivered": f"{delivered:,.0f}",
                         "Prospects": f"{prospects:,.0f}",
@@ -3946,7 +4209,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
         tooltip=["Tier", "CPIx Min", "CPIx Midpoint", "CPIx Max", "Investment"],
     )
     st.altair_chart(
-        (_v_rules + cpix_band + cpix_line).properties(title="CPIx increases as investment exceeds Sustainable Scale", height=380),
+        (_v_rules + cpix_band + cpix_line).properties(title="CPIx increases as investment exceeds Optimal Scale", height=380),
         use_container_width=True,
     )
 
@@ -3984,7 +4247,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
         tooltip=["Tier", "Customers Min", "Customers Midpoint", "Customers Max", "Investment"],
     )
     st.altair_chart(
-        (_v_rules + cust_band + cust_line).properties(title="Customer growth flattens beyond Sustainable Scale (decay curve effect)", height=380),
+        (_v_rules + cust_band + cust_line).properties(title="Customer growth flattens beyond Optimal Scale (decay curve effect)", height=380),
         use_container_width=True,
     )
 
@@ -4246,6 +4509,11 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                 "Multiple historical quarters are selected. Final Ranges use the "
                 "minimum and maximum across all quarter projections."
             )
+        _qa_hist = st.session_state.selected_history
+        historical_frequency = (
+            sum(float(row["frequency"]) for row in _qa_hist) / len(_qa_hist)
+            if _qa_hist else 0.0
+        )
         st.caption(
             f"Historic Prospect Frequency = {historical_frequency:.1f}x"
         )
@@ -4271,3 +4539,363 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
         )
 
     tab_nav_buttons(tab_names, _qa_tab_idx)
+
+
+# =============================================================================
+# TAB 6: SAVE TO SNOWFLAKE
+# =============================================================================
+if st.session_state.forecast and active_tab == _save_tab_idx:
+    import uuid as _uuid_save
+    import calendar as _cal_save
+
+    result = st.session_state.forecast
+    visible_ranges = [
+        r for r in result["ranges"]
+        if visible_tier(r.tier_label, result["show_expansion"])
+    ]
+    _is_quarterly_save = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
+    _proj_q_save = st.session_state.get("projection_quarter", "")
+    _sig_util_save = st.session_state.get("_cached_sig_util", {})
+
+    st.header("Save Results to Snowflake")
+    st.caption("Select which forecast outputs to save to ZX.ANALYTICS. Input reference data is always included.")
+
+    # Build scenario options
+    _scenario_opts = ["Baseline"]
+    for _sn, _sf, _sr in result["improvements"]:
+        _scenario_opts.append(f"+{float(_sf)*100:.0f}% Improvement ({_sn})")
+
+    # Per-table selection with inline scenario checkboxes
+    st.subheader("Select Output Tables & Scenarios")
+
+    # Track per-table scenarios
+    _annual_scenarios: list[str] = []
+    _quarterly_scenarios: list[str] = []
+    _monthly_scenarios: list[str] = []
+    _save_annual_chk = False
+    _save_quarterly_chk = False
+    _save_monthly_chk = False
+
+    _n_scen = len(_scenario_opts)
+
+    # Helper: render table checkbox on left, scenario checkboxes stacked vertically on right
+    def _render_table_row(label, chk_key, scen_prefix):
+        left, right = st.columns([1, 1])
+        with left:
+            enabled = st.checkbox(label, value=True, key=chk_key)
+        scenarios = []
+        with right:
+            for _si, _so in enumerate(_scenario_opts):
+                if st.checkbox(_so, value=True, key=f"{scen_prefix}_{_si}", disabled=not enabled):
+                    if enabled:
+                        scenarios.append(_so)
+            if enabled and not scenarios:
+                st.error("Select at least one scenario.")
+        return enabled, scenarios
+
+    if _is_quarterly_save:
+        # --- Quarterly Forecast ---
+        st.markdown("**Quarterly Forecast**")
+        _save_quarterly_chk, _quarterly_scenarios = _render_table_row(
+            "Quarterly Forecast (Tab 3a)", "_save_q_chk", "_q_scen")
+
+        st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
+
+        # --- Monthly Split ---
+        st.markdown("**Monthly Split**")
+        _m_left, _m_right = st.columns([1, 1])
+        with _m_left:
+            _save_monthly_chk = st.checkbox("Monthly Split (Tab 3b)", value=True, key="_save_m_chk")
+        if _save_monthly_chk:
+            with _m_right:
+                st.caption("Always uses the baseline scenario. For different scenarios, use Annual projection")
+            _monthly_scenarios = list(_quarterly_scenarios)
+    else:
+        # --- Annual Forecast ---
+        st.markdown("**Annual Forecast**")
+        _save_annual_chk, _annual_scenarios = _render_table_row(
+            "Annual Forecast (Tab 3a)", "_save_a_chk", "_a_scen")
+
+        st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
+
+        # --- Quarterly Split ---
+        st.markdown("**Quarterly Split**")
+        _save_quarterly_chk, _quarterly_scenarios = _render_table_row(
+            "Quarterly Split (Tab 3b)", "_save_q_chk", "_q_scen")
+
+        st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
+
+        # --- Monthly Split ---
+        st.markdown("**Monthly Split**")
+        _save_monthly_chk, _monthly_scenarios = _render_table_row(
+            "Monthly Split (Tab 3c)", "_save_m_chk", "_m_scen")
+
+    st.info("Historical input reference data (from Tab 2) will always be saved alongside your outputs.")
+
+    _any_output = (
+        (_save_annual_chk and _annual_scenarios)
+        or (_save_quarterly_chk and _quarterly_scenarios)
+        or (_save_monthly_chk and _monthly_scenarios)
+    )
+    _can_export = _any_output
+
+    if st.button("Export to Snowflake", type="primary", key="_btn_export_sf", disabled=not _can_export):
+        _export_status = st.empty()
+        _export_status.info("Saving...")
+        try:
+            session = get_session()
+            forecast_tag = _uuid_save.uuid4().hex[:12]
+            current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
+            selected_history = st.session_state.selected_history
+            indexes = st.session_state.get("_cached_indexes", {})
+
+            _pq_match_save = re.match(r"Q(\d)\s+(\d{4})", _proj_q_save)
+            _pq_num_save = int(_pq_match_save.group(1)) if _pq_match_save else 1
+            _pq_year_save = int(_pq_match_save.group(2)) if _pq_match_save else 2026
+            QM_SAVE = {1: ["Jan","Feb","Mar"], 2: ["Apr","May","Jun"], 3: ["Jul","Aug","Sep"], 4: ["Oct","Nov","Dec"]}
+
+            _scenario_factors = {"Baseline": 0.0}
+            for _sn, _sf, _sr in result["improvements"]:
+                _scenario_factors[f"+{float(_sf)*100:.0f}% Improvement ({_sn})"] = float(_sf)
+
+            rows_saved = 0
+
+            # --- 1. Always save input reference ---
+            for row in selected_history:
+                session.sql(
+                    """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE
+                       (FORECAST_TAG, QUARTER, DELIVERED, SPEND, AVG_FREQUENCY, PROSPECTS,
+                        INC_CUSTOMERS, INC_REVENUE, AVG_INC_REVENUE, CPIX, IROAS, CREATED_BY)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    params=[
+                        forecast_tag, row["campaign_quarter"],
+                        float(row["delivered_volume"]), float(row["source_spend"]),
+                        float(row["frequency"]), float(row["prospects"]),
+                        float(row["incremental_customers"]), float(row["incremental_revenue"]),
+                        float(row["average_incremental_revenue"]),
+                        float(row["cpix"]), float(row["iroas"]), current_user,
+                    ],
+                ).collect()
+                rows_saved += 1
+
+            # Helper to get improvement multiplier from scenario label
+            def _imp_mult_for(scenario_label):
+                return 1.0 + _scenario_factors.get(scenario_label, 0.0)
+
+            # --- 2a. Annual table (annual mode only) ---
+            if _save_annual_chk and not _is_quarterly_save and _annual_scenarios:
+                _rqs = rolling_quarters(_proj_q_save)
+                _fq_m = re.match(r"Q(\d)\s+(\d{4})", _rqs[0])
+                _lq_m = re.match(r"Q(\d)\s+(\d{4})", _rqs[-1])
+                _fq_n, _fq_y = int(_fq_m.group(1)), int(_fq_m.group(2))
+                _lq_n, _lq_y = int(_lq_m.group(1)), int(_lq_m.group(2))
+                _year_start = f"{_fq_y}-{(_fq_n-1)*3+1:02d}-01"
+                _end_month = _lq_n * 3
+                _last_day = _cal_save.monthrange(_lq_y, _end_month)[1]
+                _year_end = f"{_lq_y}-{_end_month:02d}-{_last_day:02d}"
+
+                for scenario_label in _annual_scenarios:
+                    imp_mult = _imp_mult_for(scenario_label)
+                    for r in visible_ranges:
+                        inv = float(r.investment) * 4
+                        cust_min = float(r.incremental_customers.minimum) * 4 * imp_mult
+                        cust_max = float(r.incremental_customers.maximum) * 4 * imp_mult
+                        rev_min = float(r.incremental_revenue.minimum) * 4 * imp_mult
+                        rev_max = float(r.incremental_revenue.maximum) * 4 * imp_mult
+                        session.sql(
+                            """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY
+                               (FORECAST_TAG, SCENARIO, TIER, YEAR_START, YEAR_END,
+                                INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
+                                INC_REVENUE_MIN, INC_REVENUE_MAX,
+                                CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                SIGNAL_UTILIZATION, CREATED_BY)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            params=[
+                                forecast_tag, scenario_label, r.tier_label,
+                                _year_start, _year_end,
+                                inv, float(r.delivered_volume) * 4, float(r.prospects) * 4,
+                                cust_min, cust_max, rev_min, rev_max,
+                                inv / cust_max if cust_max > 0 else 0,
+                                inv / cust_min if cust_min > 0 else 0,
+                                rev_min / inv if inv > 0 else 0,
+                                rev_max / inv if inv > 0 else 0,
+                                _sig_util_save.get(r.tier_label, 0), current_user,
+                            ],
+                        ).collect()
+                        rows_saved += 1
+
+            # --- 2b. Quarterly table ---
+            if _save_quarterly_chk and _quarterly_scenarios:
+                for scenario_label in _quarterly_scenarios:
+                    imp_mult = _imp_mult_for(scenario_label)
+                    if _is_quarterly_save:
+                        for r in visible_ranges:
+                            inv = float(r.investment)
+                            cust_min = float(r.incremental_customers.minimum) * imp_mult
+                            cust_max = float(r.incremental_customers.maximum) * imp_mult
+                            rev_min = float(r.incremental_revenue.minimum) * imp_mult
+                            rev_max = float(r.incremental_revenue.maximum) * imp_mult
+                            session.sql(
+                                """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
+                                   (FORECAST_TAG, SCENARIO, TIER, QUARTER, YEAR,
+                                    INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                    INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
+                                    INC_REVENUE_MIN, INC_REVENUE_MAX,
+                                    CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                    SIGNAL_UTILIZATION, CREATED_BY)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                params=[
+                                    forecast_tag, scenario_label, r.tier_label,
+                                    _proj_q_save, _pq_year_save,
+                                    inv, float(r.delivered_volume), float(r.prospects),
+                                    cust_min, cust_max, rev_min, rev_max,
+                                    inv / cust_max if cust_max > 0 else 0,
+                                    inv / cust_min if cust_min > 0 else 0,
+                                    rev_min / inv if inv > 0 else 0,
+                                    rev_max / inv if inv > 0 else 0,
+                                    _sig_util_save.get(r.tier_label, 0), current_user,
+                                ],
+                            ).collect()
+                            rows_saved += 1
+                    else:
+                        _rqs = rolling_quarters(_proj_q_save)
+                        for _ql in _rqs:
+                            _qk = re.match(r"Q(\d)", _ql)
+                            _q_key = f"Q{_qk.group(1)}" if _qk else "Q1"
+                            _q_year_m = re.search(r"\d{4}", _ql)
+                            _q_year = int(_q_year_m.group()) if _q_year_m else _pq_year_save
+                            o_pct = indexes.get("quarterly_organic", {}).get(_q_key, 0.25)
+                            i_pct = indexes.get("quarterly_incremental", {}).get(_q_key, 0.25)
+                            for r in visible_ranges:
+                                inv = float(r.investment) * 4 * o_pct
+                                cust_min = float(r.incremental_customers.minimum) * 4 * i_pct * imp_mult
+                                cust_max = float(r.incremental_customers.maximum) * 4 * i_pct * imp_mult
+                                rev_min = float(r.incremental_revenue.minimum) * 4 * i_pct * imp_mult
+                                rev_max = float(r.incremental_revenue.maximum) * 4 * i_pct * imp_mult
+                                session.sql(
+                                    """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
+                                       (FORECAST_TAG, SCENARIO, TIER, QUARTER, YEAR,
+                                        INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                        INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
+                                        INC_REVENUE_MIN, INC_REVENUE_MAX,
+                                        CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                        SIGNAL_UTILIZATION, CREATED_BY)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    params=[
+                                        forecast_tag, scenario_label, r.tier_label,
+                                        _ql, _q_year,
+                                        inv, float(r.delivered_volume) * 4 * o_pct,
+                                        float(r.prospects) * 4 * o_pct,
+                                        cust_min, cust_max, rev_min, rev_max,
+                                        inv / cust_max if cust_max > 0 else 0,
+                                        inv / cust_min if cust_min > 0 else 0,
+                                        rev_min / inv if inv > 0 else 0,
+                                        rev_max / inv if inv > 0 else 0,
+                                        _sig_util_save.get(r.tier_label, 0), current_user,
+                                    ],
+                                ).collect()
+                                rows_saved += 1
+
+            # --- 2c. Monthly table ---
+            if _save_monthly_chk and _monthly_scenarios:
+                for scenario_label in _monthly_scenarios:
+                    imp_mult = _imp_mult_for(scenario_label)
+                    if _is_quarterly_save:
+                        _proj_months_save = QM_SAVE[_pq_num_save]
+                        org_sum = sum(indexes.get("monthly_organic", {}).get(m, 1/12) for m in _proj_months_save)
+                        inc_sum = sum(indexes.get("monthly_incremental", {}).get(m, 1/12) for m in _proj_months_save)
+                        for month in _proj_months_save:
+                            m_org = indexes.get("monthly_organic", {}).get(month, 1/12) / org_sum if org_sum else 1/3
+                            m_inc = indexes.get("monthly_incremental", {}).get(month, 1/12) / inc_sum if inc_sum else 1/3
+                            for r in visible_ranges:
+                                inv = float(r.investment) * m_org
+                                cust_min = float(r.incremental_customers.minimum) * m_inc * imp_mult
+                                cust_max = float(r.incremental_customers.maximum) * m_inc * imp_mult
+                                rev_min = float(r.incremental_revenue.minimum) * m_inc * imp_mult
+                                rev_max = float(r.incremental_revenue.maximum) * m_inc * imp_mult
+                                session.sql(
+                                    """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
+                                       (FORECAST_TAG, SCENARIO, TIER, MONTH, YEAR,
+                                        INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                        INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
+                                        INC_REVENUE_MIN, INC_REVENUE_MAX,
+                                        CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                        SIGNAL_UTILIZATION, CREATED_BY)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    params=[
+                                        forecast_tag, scenario_label, r.tier_label,
+                                        month, _pq_year_save,
+                                        inv, float(r.delivered_volume) * m_org,
+                                        float(r.prospects) * m_org,
+                                        cust_min, cust_max, rev_min, rev_max,
+                                        inv / cust_max if cust_max > 0 else 0,
+                                        inv / cust_min if cust_min > 0 else 0,
+                                        rev_min / inv if inv > 0 else 0,
+                                        rev_max / inv if inv > 0 else 0,
+                                        _sig_util_save.get(r.tier_label, 0), current_user,
+                                    ],
+                                ).collect()
+                                rows_saved += 1
+                    else:
+                        _rqs = rolling_quarters(_proj_q_save)
+                        for _ql in _rqs:
+                            _qk = re.match(r"Q(\d)", _ql)
+                            _q_key = f"Q{_qk.group(1)}" if _qk else "Q1"
+                            _q_num = int(_qk.group(1)) if _qk else 1
+                            _q_year_m = re.search(r"\d{4}", _ql)
+                            _q_year = int(_q_year_m.group()) if _q_year_m else _pq_year_save
+                            months = QM_SAVE[_q_num]
+                            q_org = indexes.get("quarterly_organic", {}).get(_q_key, 0.25)
+                            q_inc = indexes.get("quarterly_incremental", {}).get(_q_key, 0.25)
+                            org_sum = sum(indexes.get("monthly_organic", {}).get(m, 1/12) for m in months)
+                            inc_sum = sum(indexes.get("monthly_incremental", {}).get(m, 1/12) for m in months)
+                            for month in months:
+                                m_org = q_org * (indexes.get("monthly_organic", {}).get(month, 1/12) / org_sum) if org_sum else q_org / 3
+                                m_inc = q_inc * (indexes.get("monthly_incremental", {}).get(month, 1/12) / inc_sum) if inc_sum else q_inc / 3
+                                for r in visible_ranges:
+                                    inv = float(r.investment) * 4 * m_org
+                                    cust_min = float(r.incremental_customers.minimum) * 4 * m_inc * imp_mult
+                                    cust_max = float(r.incremental_customers.maximum) * 4 * m_inc * imp_mult
+                                    rev_min = float(r.incremental_revenue.minimum) * 4 * m_inc * imp_mult
+                                    rev_max = float(r.incremental_revenue.maximum) * 4 * m_inc * imp_mult
+                                    session.sql(
+                                        """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
+                                           (FORECAST_TAG, SCENARIO, TIER, MONTH, YEAR,
+                                            INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                            INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
+                                            INC_REVENUE_MIN, INC_REVENUE_MAX,
+                                            CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                            SIGNAL_UTILIZATION, CREATED_BY)
+                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        params=[
+                                            forecast_tag, scenario_label, r.tier_label,
+                                            month, _q_year,
+                                            inv, float(r.delivered_volume) * 4 * m_org,
+                                            float(r.prospects) * 4 * m_org,
+                                            cust_min, cust_max, rev_min, rev_max,
+                                            inv / cust_max if cust_max > 0 else 0,
+                                            inv / cust_min if cust_min > 0 else 0,
+                                            rev_min / inv if inv > 0 else 0,
+                                            rev_max / inv if inv > 0 else 0,
+                                            _sig_util_save.get(r.tier_label, 0), current_user,
+                                        ],
+                                    ).collect()
+                                    rows_saved += 1
+
+            _tables_written = ["`ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE`"]
+            if _save_annual_chk and not _is_quarterly_save and _annual_scenarios:
+                _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY`")
+            if _save_quarterly_chk and _quarterly_scenarios:
+                _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY`")
+            if _save_monthly_chk and _monthly_scenarios:
+                _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY`")
+            _export_status.success(
+                f"Saved {rows_saved} rows to Snowflake.\n\n"
+                f"**Forecast Tag (unique ID):** `{forecast_tag}`\n\n"
+                f"**Tables written to:** {', '.join(_tables_written)}"
+            )
+        except Exception as exc:
+            _export_status.error(f"Export failed: {exc}")
+
+    tab_nav_buttons(tab_names, _save_tab_idx)
