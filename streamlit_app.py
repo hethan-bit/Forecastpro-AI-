@@ -2027,8 +2027,8 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                 z.writestr(f"xl/charts/chart{idx}.xml", _native_chart_xml(chart_title, value_column, chart_color, chart_rows_for_export))
         for i, n in enumerate(snames, 1):
             t = _sheet_titles.get(n, f"◆ ZETA | ForecastPro AI — {n}  |  {account}")
-            dbl = (n in _dbl_hdr_sheets) and bool(improvements)
-            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl, with_drawing=_has_drawings))
+            dbl = n in _dbl_hdr_actual
+            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl, with_drawing=bool(logo_bytes)))
 
     _safe = re.sub(r"[^a-z0-9]+", "-", account.lower()).strip("-") or "forecast"
     st.download_button("Download Excel Workbook", buf.getvalue(), f"{_safe}-forecast.xlsx",
@@ -3477,6 +3477,22 @@ if st.session_state.forecast and active_tab == 2:
             help="This selection applies to the Quarterly Split and Monthly Split tabs as well.",
         )
         st.session_state.annual_scenario = _selected_scenario
+    else:
+        if result["improvements"]:
+            _scenario_options_q = ["Baseline"]
+            for _sn, _sf, _sr in result["improvements"]:
+                _scenario_options_q.append(f"+{float(_sf)*100:.0f}% Improvement")
+            st.session_state.setdefault("quarterly_scenario", "Baseline")
+            _selected_q_scenario = st.radio(
+                "Scenario for Monthly Split",
+                options=_scenario_options_q,
+                index=_scenario_options_q.index(st.session_state.get("quarterly_scenario", "Baseline"))
+                    if st.session_state.get("quarterly_scenario", "Baseline") in _scenario_options_q else 0,
+                horizontal=True,
+                key="_widget_quarterly_scenario",
+                help="This selection applies to the Monthly Split tab.",
+            )
+            st.session_state.quarterly_scenario = _selected_q_scenario
     _first_tier_label = visible_ranges[0].tier_label if visible_ranges else ""
     # Build marginal ranges from projections across all historical quarters
     from collections import defaultdict as _defaultdict
@@ -4035,7 +4051,17 @@ if (st.session_state.forecast
     _proj_months = QUARTER_MONTHS_MAP[_pq_num]
 
     st.header(f"Quarterly Monthly Split: {_proj_q}")
-    st.caption("Quarterly forecast distributed across the 3 months using seasonal indexes.")
+    _quarterly_scenario = st.session_state.get("quarterly_scenario", "Baseline")
+    _imp_factor_val = 0.0
+    for _name, _factor, _rows in result["improvements"]:
+        if f"+{float(_factor)*100:.0f}% Improvement" == _quarterly_scenario:
+            _imp_factor_val = float(_factor)
+            break
+    _imp_mult = 1 + _imp_factor_val
+    if _quarterly_scenario != "Baseline":
+        st.caption(f"Quarterly forecast ({_quarterly_scenario}) distributed across the 3 months using seasonal indexes.")
+    else:
+        st.caption("Quarterly forecast distributed across the 3 months using seasonal indexes.")
 
     _qm_view_mode = st.radio("Group by", ("Month", "Tier"), horizontal=True, key="_qm_view_mode")
 
@@ -4068,10 +4094,10 @@ if (st.session_state.forecast
                     inv = float(r.investment) * m_org_pct
                     delivered = float(r.delivered_volume) * m_org_pct
                     prospects = float(r.prospects) * m_org_pct
-                    cust_min = float(r.incremental_customers.minimum) * m_inc_pct
-                    cust_max = float(r.incremental_customers.maximum) * m_inc_pct
-                    rev_min = float(r.incremental_revenue.minimum) * m_inc_pct
-                    rev_max = float(r.incremental_revenue.maximum) * m_inc_pct
+                    cust_min = float(r.incremental_customers.minimum) * m_inc_pct * _imp_mult
+                    cust_max = float(r.incremental_customers.maximum) * m_inc_pct * _imp_mult
+                    rev_min = float(r.incremental_revenue.minimum) * m_inc_pct * _imp_mult
+                    rev_max = float(r.incremental_revenue.maximum) * m_inc_pct * _imp_mult
                     cpix_min = inv / cust_max if cust_max > 0 else 0
                     cpix_max = inv / cust_min if cust_min > 0 else 0
                     iroas_min = rev_min / inv if inv > 0 else 0
@@ -4102,10 +4128,10 @@ if (st.session_state.forecast
                     delivered = float(r.delivered_volume) * org_pct
                     prospects = float(r.prospects) * org_pct
 
-                    cust_min = float(r.incremental_customers.minimum) * inc_pct
-                    cust_max = float(r.incremental_customers.maximum) * inc_pct
-                    rev_min = float(r.incremental_revenue.minimum) * inc_pct
-                    rev_max = float(r.incremental_revenue.maximum) * inc_pct
+                    cust_min = float(r.incremental_customers.minimum) * inc_pct * _imp_mult
+                    cust_max = float(r.incremental_customers.maximum) * inc_pct * _imp_mult
+                    rev_min = float(r.incremental_revenue.minimum) * inc_pct * _imp_mult
+                    rev_max = float(r.incremental_revenue.maximum) * inc_pct * _imp_mult
 
                     cpix_min = inv / cust_max if cust_max > 0 else 0
                     cpix_max = inv / cust_min if cust_min > 0 else 0
@@ -4545,7 +4571,6 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
 # =============================================================================
 if st.session_state.forecast and active_tab == _save_tab_idx:
     import uuid as _uuid_save
-    import calendar as _cal_save
 
     result = st.session_state.forecast
     visible_ranges = [
@@ -4602,13 +4627,8 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
 
         # --- Monthly Split ---
         st.markdown("**Monthly Split**")
-        _m_left, _m_right = st.columns([1, 1])
-        with _m_left:
-            _save_monthly_chk = st.checkbox("Monthly Split (Tab 3b)", value=True, key="_save_m_chk")
-        if _save_monthly_chk:
-            with _m_right:
-                st.caption("Always uses the baseline scenario. For different scenarios, use Annual projection")
-            _monthly_scenarios = list(_quarterly_scenarios)
+        _save_monthly_chk, _monthly_scenarios = _render_table_row(
+            "Monthly Split (Tab 3b)", "_save_m_chk", "_m_scen")
     else:
         # --- Annual Forecast ---
         st.markdown("**Annual Forecast**")
@@ -4647,6 +4667,10 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
             current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
             selected_history = st.session_state.selected_history
             indexes = st.session_state.get("_cached_indexes", {})
+            _client_name = st.session_state.get("source_account") or ""
+            _campaign_name = st.session_state.get("selected_sub_account") or ""
+            _conversion_event = st.session_state.get("selected_event") or ""
+            _marketing_channel = st.session_state.get("selected_channel") or ""
 
             _pq_match_save = re.match(r"Q(\d)\s+(\d{4})", _proj_q_save)
             _pq_num_save = int(_pq_match_save.group(1)) if _pq_match_save else 1
@@ -4659,20 +4683,31 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
 
             rows_saved = 0
 
+            _today_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
             # --- 1. Always save input reference ---
             for row in selected_history:
+                _ref_q_str = row["campaign_quarter"]
+                _ref_q_match = re.match(r"(Q\d)\s+(\d{4})", _ref_q_str)
+                _ref_planning_quarter = _ref_q_match.group(1) if _ref_q_match else _ref_q_str
+                _ref_planning_year = int(_ref_q_match.group(2)) if _ref_q_match else None
                 session.sql(
                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE
-                       (FORECAST_TAG, QUARTER, DELIVERED, SPEND, AVG_FREQUENCY, PROSPECTS,
-                        INC_CUSTOMERS, INC_REVENUE, AVG_INC_REVENUE, CPIX, IROAS, CREATED_BY)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
+                        PLANNING_QUARTER, PLANNING_YEAR,
+                        DELIVERED, SPEND, AVG_FREQUENCY, PROSPECTS,
+                        INC_CUSTOMERS, INC_REVENUE, AVG_INC_REVENUE, CPIX, IROAS,
+                        CREATED_BY, DATE_CREATED)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     params=[
-                        forecast_tag, row["campaign_quarter"],
+                        forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
+                        _ref_planning_quarter, _ref_planning_year,
                         float(row["delivered_volume"]), float(row["source_spend"]),
                         float(row["frequency"]), float(row["prospects"]),
                         float(row["incremental_customers"]), float(row["incremental_revenue"]),
                         float(row["average_incremental_revenue"]),
-                        float(row["cpix"]), float(row["iroas"]), current_user,
+                        float(row["cpix"]), float(row["iroas"]),
+                        current_user, _today_date,
                     ],
                 ).collect()
                 rows_saved += 1
@@ -4685,13 +4720,8 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
             if _save_annual_chk and not _is_quarterly_save and _annual_scenarios:
                 _rqs = rolling_quarters(_proj_q_save)
                 _fq_m = re.match(r"Q(\d)\s+(\d{4})", _rqs[0])
-                _lq_m = re.match(r"Q(\d)\s+(\d{4})", _rqs[-1])
-                _fq_n, _fq_y = int(_fq_m.group(1)), int(_fq_m.group(2))
-                _lq_n, _lq_y = int(_lq_m.group(1)), int(_lq_m.group(2))
-                _year_start = f"{_fq_y}-{(_fq_n-1)*3+1:02d}-01"
-                _end_month = _lq_n * 3
-                _last_day = _cal_save.monthrange(_lq_y, _end_month)[1]
-                _year_end = f"{_lq_y}-{_end_month:02d}-{_last_day:02d}"
+                _annual_start_quarter = f"Q{_fq_m.group(1)}" if _fq_m else ""
+                _annual_start_year = int(_fq_m.group(2)) if _fq_m else _pq_year_save
 
                 for scenario_label in _annual_scenarios:
                     imp_mult = _imp_mult_for(scenario_label)
@@ -4703,23 +4733,26 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                         rev_max = float(r.incremental_revenue.maximum) * 4 * imp_mult
                         session.sql(
                             """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY
-                               (FORECAST_TAG, SCENARIO, TIER, YEAR_START, YEAR_END,
+                               (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
+                                FORECAST_YEAR_START_QUARTER, FORECAST_YEAR_START_YEAR,
+                                SCENARIO, TIER,
                                 INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
                                 INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                 INC_REVENUE_MIN, INC_REVENUE_MAX,
                                 CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
-                                SIGNAL_UTILIZATION, CREATED_BY)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             params=[
-                                forecast_tag, scenario_label, r.tier_label,
-                                _year_start, _year_end,
+                                forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
+                                _annual_start_quarter, _annual_start_year,
+                                scenario_label, r.tier_label,
                                 inv, float(r.delivered_volume) * 4, float(r.prospects) * 4,
                                 cust_min, cust_max, rev_min, rev_max,
                                 inv / cust_max if cust_max > 0 else 0,
                                 inv / cust_min if cust_min > 0 else 0,
                                 rev_min / inv if inv > 0 else 0,
                                 rev_max / inv if inv > 0 else 0,
-                                _sig_util_save.get(r.tier_label, 0), current_user,
+                                _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                             ],
                         ).collect()
                         rows_saved += 1
@@ -4737,23 +4770,25 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                             rev_max = float(r.incremental_revenue.maximum) * imp_mult
                             session.sql(
                                 """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
-                                   (FORECAST_TAG, SCENARIO, TIER, QUARTER, YEAR,
+                                   (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
+                                    FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER,
                                     INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
                                     INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                     INC_REVENUE_MIN, INC_REVENUE_MAX,
                                     CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
-                                    SIGNAL_UTILIZATION, CREATED_BY)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 params=[
-                                    forecast_tag, scenario_label, r.tier_label,
-                                    _proj_q_save, _pq_year_save,
+                                    forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
+                                    f"Q{_pq_num_save}", _pq_year_save,
+                                    scenario_label, r.tier_label,
                                     inv, float(r.delivered_volume), float(r.prospects),
                                     cust_min, cust_max, rev_min, rev_max,
                                     inv / cust_max if cust_max > 0 else 0,
                                     inv / cust_min if cust_min > 0 else 0,
                                     rev_min / inv if inv > 0 else 0,
                                     rev_max / inv if inv > 0 else 0,
-                                    _sig_util_save.get(r.tier_label, 0), current_user,
+                                    _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                 ],
                             ).collect()
                             rows_saved += 1
@@ -4774,16 +4809,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 rev_max = float(r.incremental_revenue.maximum) * 4 * i_pct * imp_mult
                                 session.sql(
                                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
-                                       (FORECAST_TAG, SCENARIO, TIER, QUARTER, YEAR,
+                                       (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
+                                        FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER,
                                         INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
-                                        SIGNAL_UTILIZATION, CREATED_BY)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     params=[
-                                        forecast_tag, scenario_label, r.tier_label,
-                                        _ql, _q_year,
+                                        forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
+                                        _q_key, _q_year,
+                                        scenario_label, r.tier_label,
                                         inv, float(r.delivered_volume) * 4 * o_pct,
                                         float(r.prospects) * 4 * o_pct,
                                         cust_min, cust_max, rev_min, rev_max,
@@ -4791,7 +4828,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         inv / cust_min if cust_min > 0 else 0,
                                         rev_min / inv if inv > 0 else 0,
                                         rev_max / inv if inv > 0 else 0,
-                                        _sig_util_save.get(r.tier_label, 0), current_user,
+                                        _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                     ],
                                 ).collect()
                                 rows_saved += 1
@@ -4815,16 +4852,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 rev_max = float(r.incremental_revenue.maximum) * m_inc * imp_mult
                                 session.sql(
                                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
-                                       (FORECAST_TAG, SCENARIO, TIER, MONTH, YEAR,
+                                       (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
+                                        FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER,
                                         INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
-                                        SIGNAL_UTILIZATION, CREATED_BY)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     params=[
-                                        forecast_tag, scenario_label, r.tier_label,
+                                        forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                         month, _pq_year_save,
+                                        scenario_label, r.tier_label,
                                         inv, float(r.delivered_volume) * m_org,
                                         float(r.prospects) * m_org,
                                         cust_min, cust_max, rev_min, rev_max,
@@ -4832,7 +4871,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         inv / cust_min if cust_min > 0 else 0,
                                         rev_min / inv if inv > 0 else 0,
                                         rev_max / inv if inv > 0 else 0,
-                                        _sig_util_save.get(r.tier_label, 0), current_user,
+                                        _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                     ],
                                 ).collect()
                                 rows_saved += 1
@@ -4860,16 +4899,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     rev_max = float(r.incremental_revenue.maximum) * 4 * m_inc * imp_mult
                                     session.sql(
                                         """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
-                                           (FORECAST_TAG, SCENARIO, TIER, MONTH, YEAR,
+                                           (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
+                                            FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER,
                                             INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
                                             INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                             INC_REVENUE_MIN, INC_REVENUE_MAX,
                                             CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
-                                            SIGNAL_UTILIZATION, CREATED_BY)
-                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                            SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
+                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                         params=[
-                                            forecast_tag, scenario_label, r.tier_label,
+                                            forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                             month, _q_year,
+                                            scenario_label, r.tier_label,
                                             inv, float(r.delivered_volume) * 4 * m_org,
                                             float(r.prospects) * 4 * m_org,
                                             cust_min, cust_max, rev_min, rev_max,
@@ -4877,7 +4918,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                             inv / cust_min if cust_min > 0 else 0,
                                             rev_min / inv if inv > 0 else 0,
                                             rev_max / inv if inv > 0 else 0,
-                                            _sig_util_save.get(r.tier_label, 0), current_user,
+                                            _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                         ],
                                     ).collect()
                                     rows_saved += 1
