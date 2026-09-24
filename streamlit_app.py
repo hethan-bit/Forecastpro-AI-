@@ -1977,6 +1977,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
         "Annual Forecast": f"◆ ZETA | ForecastPro AI — Annual Forecast  |  {account}",
         "Charts": f"ZETA | Forecast Report  |  {account}",
     }
+    _dbl_hdr_sheets = {"Quarterly Split", "Monthly Split"}
     with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as z:
         _has_drawings = bool(logo_bytes) or bool(export_charts) or bool(native_charts)
         ov = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(snames)+1))
@@ -2955,8 +2956,8 @@ if st.session_state.confirmed and active_tab == 1:
 
     # --- Calculated Investment Tiers ---
     st.markdown(
-        '### Calculated investment tiers '
-        '<span class="info-icon" title="These investment levels are calculated from the selected historical inputs, current investment, available signal reach, CPM, and frequency. The middle tiers can be adjusted while keeping the investment ladder in increasing order." aria-label="More information">i</span>',
+        '<h3 style="margin: 0 0 0.35rem;">Calculated investment tiers '
+        '<span class="info-icon" title="These investment levels are calculated from the selected historical inputs, current investment, available signal reach, CPM, and frequency. The middle tiers can be adjusted while keeping the investment ladder in increasing order." aria-label="More information">i</span></h3>',
         unsafe_allow_html=True,
     )
     high_utilization = float(signal_utilization) >= 0.90
@@ -3024,7 +3025,7 @@ if st.session_state.confirmed and active_tab == 1:
     st.session_state.setdefault("manual_tier_mode", False)
     st.session_state.setdefault("manual_tier_values", {})
     shared_adjustment_key = "_shared_tier_adjustment"
-    shared_adjustment_version = "shared-tier-adjustment-v1"
+    shared_adjustment_version = "shared-tier-adjustment-v2"
     if st.session_state.get("_tier_adjustment_mode") != shared_adjustment_version:
         # Replace legacy independent tier adjustments with one shared adjustment.
         st.session_state.tier_adjustments = {}
@@ -3108,8 +3109,12 @@ if st.session_state.confirmed and active_tab == 1:
             values.append(float(calculated_tier_values[-1]))
         return values
 
-    control_edit, control_reset, control_step, _ = st.columns([1.45, 1.0, 1.25, 4.3])
+    # Keep the actions left-grouped, while reserving enough width for each
+    # label and the adjustment controls.
+    control_edit, control_reset, control_step, _ = st.columns([2.1, 1.3, 3.5, 3.1])
     with control_edit:
+        # Match the Adjustment Step label height so each action control aligns.
+        st.markdown("<div style='height: 3.6rem'></div>", unsafe_allow_html=True)
         if at_full_utilization:
             st.caption(
                 "At 100% utilization, Current Budget is the Baseline. "
@@ -3140,6 +3145,7 @@ if st.session_state.confirmed and active_tab == 1:
                 st.rerun()
 
     with control_reset:
+        st.markdown("<div style='height: 3.6rem'></div>", unsafe_allow_html=True)
         st.button(
             "↺ Reset",
             key="reset_calculated_tiers",
@@ -3152,53 +3158,105 @@ if st.session_state.confirmed and active_tab == 1:
             help="Restore the original automatically calculated tier values.",
         )
 
-    def _shared_adjustment_changed() -> None:
-        previous_value = float(
-            st.session_state.get("_last_shared_tier_adjustment", 10_000.0)
-        )
-        requested_value = float(st.session_state[shared_adjustment_key])
-        requested_delta = requested_value - previous_value
-        if abs(requested_delta) < 0.01 or at_full_utilization:
-            st.session_state["_last_shared_tier_adjustment"] = requested_value
+    def _apply_shared_tier_adjustment(direction: int) -> None:
+        """Move every calculated middle tier by exactly one selected adjustment step."""
+        if at_full_utilization or st.session_state.manual_tier_mode:
             return
 
+        adjustment_step = float(st.session_state.get(shared_adjustment_key, 10_000.0))
         current_values = _calculated_values_with_adjustments()
         first_middle = 1
         last_middle = len(current_values) - 2
-        min_delta = (current_values[first_middle - 1] + minimum_tier_gap) - current_values[first_middle]
-        max_delta = (current_values[-1] - minimum_tier_gap) - current_values[last_middle]
-        applied_delta = min(max(requested_delta, min_delta), max_delta)
-        applied_delta = _round_tier_investment(applied_delta) if abs(applied_delta) >= 100_000 else round(applied_delta / 1000) * 1000
+        requested_delta = direction * adjustment_step
+        lower_limit = current_values[first_middle - 1] + minimum_tier_gap
+        upper_limit = current_values[-1] - minimum_tier_gap
 
-        if abs(applied_delta) > 0.01:
-            for tier_label in labels[first_middle:-1]:
-                st.session_state.tier_adjustments[tier_label] = (
-                    float(st.session_state.tier_adjustments.get(tier_label, 0.0))
-                    + applied_delta
-                )
-            _clear_stale_forecast(
-                "Shared tier adjustment applied. Create a new forecast draft."
+        # Apply a full configured step only. Do not silently apply a smaller,
+        # partial movement when it would collide with either fixed endpoint.
+        if (
+            current_values[first_middle] + requested_delta < lower_limit
+            or current_values[last_middle] + requested_delta > upper_limit
+        ):
+            return
+
+        for tier_label in labels[first_middle:-1]:
+            st.session_state.tier_adjustments[tier_label] = (
+                float(st.session_state.tier_adjustments.get(tier_label, 0.0))
+                + requested_delta
             )
+        _clear_stale_forecast(
+            "Tier adjustment applied. Create a new forecast draft."
+        )
 
-        actual_value = previous_value + applied_delta
-        st.session_state[shared_adjustment_key] = actual_value
-        st.session_state["_last_shared_tier_adjustment"] = actual_value
+    current_adjustment_step = float(
+        st.session_state.get(shared_adjustment_key, 10_000.0)
+    )
+    current_adjusted_values = _calculated_values_with_adjustments()
+    can_decrease_tiers = (
+        not at_full_utilization
+        and not st.session_state.manual_tier_mode
+        and current_adjusted_values[1] - current_adjustment_step
+        >= current_adjusted_values[0] + minimum_tier_gap
+    )
+    can_increase_tiers = (
+        not at_full_utilization
+        and not st.session_state.manual_tier_mode
+        and current_adjusted_values[-2] + current_adjustment_step
+        <= current_adjusted_values[-1] - minimum_tier_gap
+    )
 
     with control_step:
-        st.number_input(
-            "Adjustment step",
-            min_value=1_000.0,
-            value=10_000.0,
-            step=10_000.0,
-            format="%.0f",
-            key=shared_adjustment_key,
-            on_change=_shared_adjustment_changed,
-            disabled=st.session_state.manual_tier_mode or at_full_utilization,
-            help=(
-                "Use + or − here to move every middle tier together. "
-                "Current Investment and Optimal Scale remain fixed."
-            ),
+        st.markdown(
+            "<style>"
+            "div[data-testid='stNumberInput']:has(input[aria-label='Adjustment step']) "
+            "button { display: none !important; }"
+            "</style>",
+            unsafe_allow_html=True,
         )
+        st.markdown(
+            "<div style='margin:0 0 0.35rem; font-size:0.85rem; "
+            "font-weight:700; letter-spacing:0.04em; color:#374151;'>"
+            "ADJUSTMENT STEP</div>",
+            unsafe_allow_html=True,
+        )
+        decrease_col, step_value_col, increase_col = st.columns(
+            [0.65, 2.7, 0.65], vertical_alignment="bottom"
+        )
+        with decrease_col:
+            st.button(
+                "−",
+                key="decrease_calculated_tiers",
+                on_click=_apply_shared_tier_adjustment,
+                args=(-1,),
+                disabled=not can_decrease_tiers,
+                help="Decrease every adjustable middle tier by the selected adjustment step.",
+                use_container_width=True,
+            )
+        with step_value_col:
+            st.number_input(
+                "Adjustment step",
+                min_value=1_000.0,
+                value=10_000.0,
+                step=1_000.0,
+                format="%.0f",
+                key=shared_adjustment_key,
+                disabled=st.session_state.manual_tier_mode or at_full_utilization,
+                label_visibility="collapsed",
+                help=(
+                    "Set the amount applied when you click − or +. "
+                    "Changing this value alone does not change any tier."
+                ),
+            )
+        with increase_col:
+            st.button(
+                "+",
+                key="increase_calculated_tiers",
+                on_click=_apply_shared_tier_adjustment,
+                args=(1,),
+                disabled=not can_increase_tiers,
+                help="Increase every adjustable middle tier by the selected adjustment step.",
+                use_container_width=True,
+            )
 
     show_expansion = True
     if st.session_state.manual_tier_mode and not at_full_utilization:
