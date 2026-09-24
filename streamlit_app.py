@@ -3200,7 +3200,7 @@ if st.session_state.confirmed and active_tab == 1:
             ),
         )
 
-    show_expansion = False
+    show_expansion = True
     if st.session_state.manual_tier_mode and not at_full_utilization:
         st.caption("Manual values replace the calculated investment tiers for this forecast.")
         st.caption("Enter values in strictly increasing order from left to right.")
@@ -3546,7 +3546,7 @@ if st.session_state.forecast and active_tab == 2:
                  else "—"}
             for row in visible_ranges
         ])
-        st.dataframe(range_frame, hide_index=True, use_container_width=True)
+        st.dataframe(range_frame, hide_index=True, use_container_width=True, height=(len(range_frame) + 1) * 31 + 3)
 
     # --- Sub-content depends on projection mode ---
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
@@ -3624,7 +3624,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
                 })
             if scenario_rows:
-                st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True, height=(len(scenario_rows) + 1) * 31 + 3)
 
     if _is_quarterly_mode:
         # Quarterly mode: improvement scenarios inline with simple headers
@@ -3664,7 +3664,7 @@ if st.session_state.forecast and active_tab == 2:
              "% Utilization": f"{_sig_util_all.get(row.tier_label, 0):.0f}%"}
             for row in visible_ranges
         ])
-        st.dataframe(annual_frame, hide_index=True, use_container_width=True)
+        st.dataframe(annual_frame, hide_index=True, use_container_width=True, height=(len(annual_frame) + 1) * 31 + 3)
 
         # Annual improvement scenarios
         _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
@@ -3719,7 +3719,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_all.get(tier_label, 0):.0f}%",
                 })
             if imp_rows:
-                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True, height=(len(imp_rows) + 1) * 31 + 3)
 
 
     _render_download_button("tab3a")
@@ -3821,7 +3821,7 @@ if (st.session_state.forecast
                     "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                     "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                 })
-            st.dataframe(pd.DataFrame(qtr_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(qtr_rows), hide_index=True, use_container_width=True, height=(len(qtr_rows) + 1) * 31 + 3)
     except Exception as exc:
         st.warning(f"Could not compute quarterly split: {exc}")
 
@@ -3943,7 +3943,7 @@ if (st.session_state.forecast
                             "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                             "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                         })
-                st.dataframe(pd.DataFrame(tier_month_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(tier_month_rows), hide_index=True, use_container_width=True, height=(len(tier_month_rows) + 1) * 31 + 3)
         else:
             _rq_ms2 = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
             for _ql2 in _rq_ms2:
@@ -3987,7 +3987,7 @@ if (st.session_state.forecast
                             "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                             "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                         })
-                    st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -4113,7 +4113,7 @@ if (st.session_state.forecast
                         "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                         "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
-                st.dataframe(pd.DataFrame(tier_month_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(tier_month_rows), hide_index=True, use_container_width=True, height=(len(tier_month_rows) + 1) * 31 + 3)
         else:
             for month in _proj_months:
                 org_pct = indexes["monthly_organic"].get(month, 1/12) / org_sum if org_sum else 1/3
@@ -4168,7 +4168,7 @@ if (st.session_state.forecast
                         "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
 
-                st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
