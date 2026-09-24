@@ -1977,7 +1977,6 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
         "Annual Forecast": f"◆ ZETA | ForecastPro AI — Annual Forecast  |  {account}",
         "Charts": f"ZETA | Forecast Report  |  {account}",
     }
-    _dbl_hdr_sheets = {"Quarterly Split", "Monthly Split"}
     with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as z:
         _has_drawings = bool(logo_bytes) or bool(export_charts) or bool(native_charts)
         ov = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(snames)+1))
