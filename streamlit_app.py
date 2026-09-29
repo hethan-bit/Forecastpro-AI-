@@ -38,6 +38,16 @@ from planning_source import planning_input, planning_quarters, PLANNING_INPUT_TA
 
 
 st.set_page_config(page_title="ForecastPro AI", page_icon="📈", layout="wide")
+
+def _scenario_factor_title(factor: Decimal | float) -> str:
+    """Return a user-facing label for either an upside or downside scenario."""
+    percentage = float(factor) * 100
+    if percentage > 0:
+        return f"+{percentage:.0f}% Improvement"
+    if percentage < 0:
+        return f"{percentage:.0f}% Reduction"
+    return "0% No Change"
+
 st.markdown(
     """
 <style>
@@ -591,7 +601,7 @@ def render_mailops_editor(session) -> None:
     _mo_accounts = sorted({
         str(r["ACCT_NAME"]).strip()
         for r in session.sql(
-            f"SELECT DISTINCT ACCT_NAME FROM {REFERENCE_HISTORICAL_TABLE} WHERE ACCT_NAME IS NOT NULL ORDER BY ACCT_NAME"
+            f"SELECT DISTINCT CLIENT_NAME AS ACCT_NAME FROM {REFERENCE_HISTORICAL_TABLE} WHERE CLIENT_NAME IS NOT NULL AND AGGREGATION_LEVEL = 'OVERALL' ORDER BY CLIENT_NAME"
         ).collect()
         if r["ACCT_NAME"]
     })
@@ -603,7 +613,7 @@ def render_mailops_editor(session) -> None:
     _mo_subs = sorted({
         str(r["SUB_ACCOUNT"]).strip()
         for r in session.sql(
-            f"SELECT DISTINCT SUB_ACCOUNT FROM {REFERENCE_HISTORICAL_TABLE} WHERE UPPER(TRIM(ACCT_NAME))=UPPER(TRIM(?)) AND SUB_ACCOUNT IS NOT NULL",
+            f"SELECT DISTINCT CAMPAIGN_NAME AS SUB_ACCOUNT FROM {REFERENCE_HISTORICAL_TABLE} WHERE UPPER(TRIM(CLIENT_NAME))=UPPER(TRIM(?)) AND CAMPAIGN_NAME IS NOT NULL AND AGGREGATION_LEVEL = 'OVERALL'",
             params=[_mo_account],
         ).collect()
         if r["SUB_ACCOUNT"]
@@ -611,7 +621,7 @@ def render_mailops_editor(session) -> None:
     _mo_channels = sorted({
         str(r["CHANNEL"]).strip()
         for r in session.sql(
-            f"SELECT DISTINCT CHANNEL FROM {REFERENCE_HISTORICAL_TABLE} WHERE UPPER(TRIM(ACCT_NAME))=UPPER(TRIM(?)) AND CHANNEL IS NOT NULL",
+            f"SELECT DISTINCT MARKETING_CHANNEL AS CHANNEL FROM {REFERENCE_HISTORICAL_TABLE} WHERE UPPER(TRIM(CLIENT_NAME))=UPPER(TRIM(?)) AND MARKETING_CHANNEL IS NOT NULL AND AGGREGATION_LEVEL = 'OVERALL'",
             params=[_mo_account],
         ).collect()
         if r["CHANNEL"]
@@ -927,12 +937,28 @@ def reset_for_new_account() -> None:
         "selected_channel", "selected_planning_quarter",
         "planning_quarter_scope", "monthly_index_mode",
         "manual_monthly_organic", "manual_monthly_incremental",
+        "manual_quarterly_organic", "manual_quarterly_incremental",
         "monthly_index_signature",
         "_widget_all_account", "_widget_sub_account", "_widget_event",
         "_widget_channel", "input_selection_signature",
+        "projection_quarter", "projection_mode",
+        "_widget_projection_quarter", "_widget_projection_mode",
+        "_source_dropdown_projection",
+        "monthly_history", "_cached_indexes",
+        "_forecast_export_charts", "_forecast_export_charts_key",
+        "mailops_mode", "scroll_to_top", "range_percent_input",
+        "tier_adjustments", "manual_tier_values", "manual_tier_mode",
+        "tier_calculation_signature", "tier_scope_signature",
+        "_shared_tier_adjustment", "_tier_adjustment_mode",
+        "_last_shared_tier_adjustment",
     ]
     for key in keys_to_clear:
         st.session_state.pop(key, None)
+    for key in tuple(st.session_state):
+        if key.startswith(("scenario_name_", "scenario_factor_", "manual_tier_")):
+            st.session_state.pop(key, None)
+    # Front-end widget values can otherwise be restored by Streamlit on rerun.
+    st.session_state["_reset_input_widgets"] = True
 
 
 def reset_after_source() -> None:
@@ -1016,6 +1042,10 @@ def _range_str(lo: float, hi: float, fmt_func) -> str:
     if abs(lo - hi) < 0.005:
         return fmt_func(lo)
     return f"{fmt_func(lo)} - {fmt_func(hi)}"
+
+def _forecast_output_frame(rows) -> pd.DataFrame:
+    """Remove prospect counts from user-facing forecast output only."""
+    return pd.DataFrame(rows).drop(columns=["Prospects", "# of Prospects"], errors="ignore")
 
 
 MONTH_NAMES = (
@@ -1347,7 +1377,6 @@ def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
     iroas = [float((row.iroas.minimum + row.iroas.maximum) / 2) for row in all_ranges]
     customers = [float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2) for row in all_ranges]
     revenue = [float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2) for row in all_ranges]
-    prospects = [float(row.prospects) for row in all_ranges]
 
     def _compact(value, currency=False, precision=0):
         prefix = "$" if currency else ""
@@ -1410,7 +1439,6 @@ def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
         ("iROAS by Investment Tier", _render_line("iROAS by Investment Tier", "Incremental revenue returned for each forecast dollar", iroas, currency=True, precision=2)),
         ("Incremental Customers by Investment Tier", _render_bar("Incremental Customers by Investment Tier", "Customer gain at each forecast investment level", customers)),
         ("Incremental Revenue by Investment Tier", _render_bar("Incremental Revenue by Investment Tier", "Projected incremental revenue at each investment level", revenue, currency=True)),
-        ("Prospects by Investment Tier", _render_bar("Prospects by Investment Tier", "Reachable prospects supporting each forecast tier", prospects)),
     ]
     rendered = []
     for title, figure in definitions:
@@ -1781,7 +1809,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     # Charts are rendered as premium report images; the exact source values stay hidden in Chart Data.
     native_charts = []
     if vis_ranges:
-        chart_rows = [["Tier", "Investment", "CPIx Midpoint", "iROAS Midpoint", "Incremental Customers", "Incremental Revenue", "Prospects", "Delivered Volume"]]
+        chart_rows = [["Tier", "Investment", "CPIx Midpoint", "iROAS Midpoint", "Incremental Customers", "Incremental Revenue", "Delivered Volume"]]
         for row in vis_ranges:
             chart_rows.append([
                 export_tier_label(row.tier_label), float(row.investment),
@@ -1789,7 +1817,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                 float((row.iroas.minimum + row.iroas.maximum) / 2),
                 float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2),
                 float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2),
-                float(row.prospects), float(row.delivered_volume),
+                float(row.delivered_volume),
             ])
         sheets["Chart Data"] = chart_rows
         sheets["Charts"] = [[""]]
@@ -1799,10 +1827,22 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             ("iROAS by Investment Tier", 3, "1F77B4"),
             ("Incremental Customers by Investment Tier", 4, "06B6D4"),
             ("Incremental Revenue by Investment Tier", 5, "3B82F6"),
-            ("Prospects by Investment Tier", 6, "648FC2"),
         ]
 
         # --- Build xlsx from raw XML with formatting ---
+    # Remove prospect columns from forecast/split workbook sheets; historical KPIs stay intact.
+    for _sheet_name, _sheet_rows in sheets.items():
+        if _sheet_name in {"Historical KPIs", "Chart Data", "Charts"}:
+            continue
+        _prospect_columns = None
+        for _row in _sheet_rows:
+            _headers = [index for index, value in enumerate(_row) if str(value) in {"Prospects", "# of Prospects"}]
+            if _headers:
+                _prospect_columns = _headers
+            if _prospect_columns:
+                for index in reversed(_prospect_columns):
+                    if index < len(_row):
+                        _row.pop(index)
     def col_letter(idx):
         r = ""; i = idx
         while i >= 0: r = chr(65 + i % 26) + r; i = i // 26 - 1
@@ -2268,16 +2308,27 @@ def compact_field_label(title: str, instruction: str, tooltip: str) -> None:
 
 
 # =============================================================================
+# Clear the browser-backed selectboxes before they are instantiated again.
+if st.session_state.pop("_reset_input_widgets", False):
+    for _input_widget_key in (
+        "_widget_all_account", "_widget_sub_account", "_widget_event",
+        "_widget_channel", "_widget_projection_quarter",
+        "_widget_using_data_from", "_source_dropdown_projection",
+    ):
+        st.session_state[_input_widget_key] = None
+    st.session_state["_widget_projection_mode"] = "Quarterly"
+
 # TAB 1: INPUTS & DISCOVERY
 # =============================================================================
 if active_tab == 0:
     st.header("Select Campaign")
     st.caption("Select a campaign from the dropdown.")
     account_rows = session.sql(f"""
-        SELECT DISTINCT ACCT_NAME
+        SELECT DISTINCT CLIENT_NAME AS ACCT_NAME
         FROM {REFERENCE_HISTORICAL_TABLE}
-        WHERE ACCT_NAME IS NOT NULL
-        ORDER BY ACCT_NAME
+        WHERE CLIENT_NAME IS NOT NULL
+          AND AGGREGATION_LEVEL = 'OVERALL'
+        ORDER BY CLIENT_NAME
     """).collect()
     all_account_options = sorted({
         str(row["ACCT_NAME"]).strip()
@@ -2308,6 +2359,73 @@ if active_tab == 0:
     if st.session_state.get("_widget_all_account") not in all_account_options:
         st.session_state.pop("_widget_all_account", None)
 
+    def _campaign_event_channel_pairs() -> list[tuple[str, str]]:
+        """Return valid event/channel pairs for the selected client and campaign."""
+        account = st.session_state.get("source_account")
+        campaign = st.session_state.get("selected_sub_account")
+        if not account or not campaign:
+            return []
+        rows = account_dimensions(session, account, sub_account=campaign)
+        return sorted({
+            (str(row.get("EVENT")).strip(), str(row.get("CHANNEL")).strip())
+            for row in rows
+            if row.get("EVENT") and row.get("CHANNEL")
+        })
+
+    def _preferred_campaign_pair(
+        pairs: list[tuple[str, str]],
+    ) -> tuple[str | None, str | None]:
+        """Prefer a campaign pair with an approved Forecasting Inputs quarter."""
+        account = st.session_state.get("source_account")
+        campaign = st.session_state.get("selected_sub_account")
+        for event, channel in pairs:
+            try:
+                if planning_quarters(session, account, campaign, event, channel):
+                    return event, channel
+            except Exception:
+                # If the planning lookup is unavailable, preserve the valid
+                # Multi-Tenant pairing rather than blocking the user.
+                continue
+        return pairs[0] if pairs else (None, None)
+
+    def _populate_campaign_event_and_channel() -> None:
+        """Refresh both dependent fields after Campaign Name changes."""
+        event, channel = _preferred_campaign_pair(_campaign_event_channel_pairs())
+        if event:
+            st.session_state._widget_event = event
+            st.session_state.selected_event = event
+        if channel:
+            st.session_state._widget_channel = channel
+            st.session_state.selected_channel = channel
+
+    def _populate_channel_for_event() -> None:
+        """Refresh Marketing Channel after a user manually changes the event."""
+        account = st.session_state.get("source_account")
+        campaign = st.session_state.get("selected_sub_account")
+        event = st.session_state.get("selected_event")
+        if not account or not campaign or not event:
+            return
+        rows = account_dimensions(
+            session, account, sub_account=campaign, event=event
+        )
+        channels = sorted({
+            str(row.get("CHANNEL")).strip()
+            for row in rows
+            if row.get("CHANNEL")
+        })
+        if not channels:
+            return
+        preferred_channel = channels[0]
+        for channel in channels:
+            try:
+                if planning_quarters(session, account, campaign, event, channel):
+                    preferred_channel = channel
+                    break
+            except Exception:
+                continue
+        st.session_state._widget_channel = preferred_channel
+        st.session_state.selected_channel = preferred_channel
+
     def _account_changed():
         account = st.session_state.get("_widget_all_account")
         st.session_state.source_account = account or None
@@ -2318,66 +2436,48 @@ if active_tab == 0:
             st.session_state.pop(key, None)
         clear_downstream_input_state()
 
-        # Make account selection a useful one-click starting point.  Each
-        # dependent control receives the first valid value from the account's
-        # filtered hierarchy; analysts can still select another valid option.
         if not st.session_state.source_account:
             return
         try:
             account_rows = account_dimensions(session, st.session_state.source_account)
-            sub_accounts = sorted({
+            campaigns = sorted({
                 str(row.get("SUB_ACCOUNT")).strip()
-                for row in account_rows if row.get("SUB_ACCOUNT")
+                for row in account_rows
+                if row.get("SUB_ACCOUNT")
             })
-            if not sub_accounts:
+            if not campaigns:
                 return
-            sub_account = sub_accounts[0]
-            st.session_state._widget_sub_account = sub_account
-            st.session_state.selected_sub_account = sub_account
-
-            event_rows = account_dimensions(
-                session, st.session_state.source_account, sub_account=sub_account
-            )
-            events = sorted({
-                str(row.get("EVENT")).strip()
-                for row in event_rows if row.get("EVENT")
-            })
-            if not events:
-                return
-            event = events[0]
-            st.session_state._widget_event = event
-            st.session_state.selected_event = event
-
-            channel_rows = account_dimensions(
-                session,
-                st.session_state.source_account,
-                sub_account=sub_account,
-                event=event,
-            )
-            channels = sorted({
-                str(row.get("CHANNEL")).strip()
-                for row in channel_rows if row.get("CHANNEL")
-            })
-            if channels:
-                st.session_state._widget_channel = channels[0]
-                st.session_state.selected_channel = channels[0]
+            campaign = campaigns[0]
+            st.session_state._widget_sub_account = campaign
+            st.session_state.selected_sub_account = campaign
+            _populate_campaign_event_and_channel()
         except Exception:
             # The normal render path will show any available dependent options.
             pass
 
     def _sub_account_changed():
-        st.session_state.selected_sub_account = st.session_state.get("_widget_sub_account")
+        st.session_state.selected_sub_account = st.session_state.get(
+            "_widget_sub_account"
+        )
         st.session_state.selected_event = None
         st.session_state.selected_channel = None
         for key in ("_widget_event", "_widget_channel"):
             st.session_state.pop(key, None)
         clear_downstream_input_state()
+        try:
+            _populate_campaign_event_and_channel()
+        except Exception:
+            pass
 
     def _event_changed():
         st.session_state.selected_event = st.session_state.get("_widget_event")
         st.session_state.selected_channel = None
         st.session_state.pop("_widget_channel", None)
         clear_downstream_input_state()
+        try:
+            _populate_channel_for_event()
+        except Exception:
+            pass
 
     def _channel_changed():
         st.session_state.selected_channel = st.session_state.get("_widget_channel")
@@ -2748,12 +2848,27 @@ if st.session_state.preview and active_tab == 0:
         if row["campaign_quarter"] in selected_quarters
     ]
 
+    if len(selected_history) > 4:
+        st.error("Select no more than four historical quarters to continue.")
     incomplete = [row for row in selected_history if not row["is_complete"]]
     partial_approved = False
     if incomplete:
         partial_approved = st.checkbox(
             "I reviewed and approve the selected partial quarter(s)."
         )
+
+    # A range is relevant only when the selected history is one current partial quarter.
+    if len(selected_history) == 1 and incomplete:
+        st.number_input(
+            "One-quarter range adjustment",
+            min_value=0,
+            max_value=99,
+            value=int(st.session_state.get("range_percent_input", 10)),
+            key="range_percent_input",
+            help="Sets the range around a forecast based on one partial historical quarter.",
+        )
+    else:
+        st.session_state.setdefault("range_percent_input", 10)
 
     # Keep the seasonal-index review with the historical selection, before the
     # user confirms it. Automatic values use the existing calculation; manual
@@ -2773,6 +2888,7 @@ if st.session_state.preview and active_tab == 0:
         st.warning(f"Could not load monthly breakdown: {exc}")
     can_confirm = (
         bool(selected_history)
+        and len(selected_history) <= 4
         and (not incomplete or partial_approved)
     )
     if st.button(
@@ -2794,6 +2910,7 @@ if st.session_state.preview and active_tab == 0:
 # =============================================================================
 if st.session_state.confirmed and active_tab == 1:
     selected_history = st.session_state.selected_history
+    st.subheader("Mail Ops Data")
     st.session_state.setdefault("show_historical_kpis", False)
     kpi_button_label = (
         "Hide historical quarterly KPIs"
@@ -2869,7 +2986,7 @@ if st.session_state.confirmed and active_tab == 1:
 
     # Planning values are loaded from the approved Snowflake table above. The
     # field labels below are sufficient context, so avoid a repeated section heading.
-    frequency_col, range_col = st.columns(2)
+    frequency_col = st.container()
     planning_quarter = st.session_state.get("selected_planning_quarter")
     if planning_quarter:
         try:
@@ -2932,15 +3049,7 @@ if st.session_state.confirmed and active_tab == 1:
         st.session_state.frequency_at_max = float(frequency_at_max)
         st.caption(f"Historic Prospect Frequency = {historical_frequency:.1f}x")
 
-    with range_col:
-        range_percent = st.number_input(
-            "One-quarter range adjustment",
-            min_value=0,
-            max_value=99,
-            value=10,
-            key="range_percent_input",
-        )
-
+    range_percent = int(st.session_state.get("range_percent_input", 10))
 
     # Calculated values retained for the existing tier and forecast methodology.
     max_investment = max_reach * frequency_at_max * cpm / 1000
@@ -3075,9 +3184,8 @@ if st.session_state.confirmed and active_tab == 1:
     tier_headroom = float(calculated_tier_values[-1]) - float(calculated_tier_values[0])
     has_tier_headroom = tier_headroom >= minimum_tier_gap
 
-    # Store relative adjustments, never replacement investment values. This means
-    # a +/- action changes only the selected tier and cannot make the remaining
-    # tiers fall back to Current Budget.
+    # Store individual adjustments for the editable middle tiers. Current Investment
+    # and Optimal Scale remain fixed reference points.
     st.session_state.setdefault("tier_adjustments", {})
     st.session_state.setdefault("manual_tier_mode", False)
     st.session_state.setdefault("manual_tier_values", {})
@@ -3086,14 +3194,8 @@ if st.session_state.confirmed and active_tab == 1:
     if st.session_state.get("_tier_adjustment_mode") != shared_adjustment_version:
         # Replace legacy independent tier adjustments with one shared adjustment.
         st.session_state.tier_adjustments = {}
-        st.session_state[shared_adjustment_key] = 10_000.0
-        st.session_state["_last_shared_tier_adjustment"] = 10_000.0
-        st.session_state["_tier_adjustment_mode"] = shared_adjustment_version
-        if st.session_state.get("forecast") is not None:
-            st.session_state.forecast = None
-            st.session_state.message = (
-                "Tier adjustment logic changed. Create a new forecast draft."
-            )
+        st.session_state[adjustment_key] = 50_000.0
+        st.session_state["_tier_adjustment_mode"] = adjustment_version
 
     tier_scope_signature = (
         st.session_state.get("source_account"),
@@ -3114,8 +3216,7 @@ if st.session_state.confirmed and active_tab == 1:
     )
     if st.session_state.get("tier_calculation_signature") != tier_calculation_signature:
         st.session_state.tier_adjustments = {}
-        st.session_state[shared_adjustment_key] = 10_000.0
-        st.session_state["_last_shared_tier_adjustment"] = 10_000.0
+        st.session_state[adjustment_key] = 50_000.0
         st.session_state.tier_calculation_signature = tier_calculation_signature
         if st.session_state.get("forecast") is not None:
             st.session_state.forecast = None
@@ -3128,7 +3229,7 @@ if st.session_state.confirmed and active_tab == 1:
         st.session_state.message = message
 
     def _manual_tier_changed() -> None:
-        for tier_index in range(len(labels)):
+        for tier_index in range(1, len(labels) - 1):
             manual_key = f"manual_tier_{tier_index}"
             if manual_key in st.session_state:
                 st.session_state[manual_key] = _round_tier_investment(
@@ -3140,8 +3241,6 @@ if st.session_state.confirmed and active_tab == 1:
 
     def _reset_calculated_tiers() -> None:
         st.session_state.tier_adjustments = {}
-        st.session_state[shared_adjustment_key] = 10_000.0
-        st.session_state["_last_shared_tier_adjustment"] = 10_000.0
         _clear_stale_forecast(
             "Calculated tiers reset. Create a new forecast draft to update results."
         )
@@ -3151,17 +3250,10 @@ if st.session_state.confirmed and active_tab == 1:
         for index in range(1, len(calculated_tier_values) - 1):
             label = labels[index]
             base_value = float(calculated_tier_values[index])
-            requested_value = base_value + float(
+            adjusted_value = base_value + float(
                 st.session_state.tier_adjustments.get(label, 0.0)
             )
-            lower_bound = values[-1] + minimum_tier_gap
-            upper_bound = float(calculated_tier_values[-1]) - (
-                minimum_tier_gap * (len(calculated_tier_values) - 1 - index)
-            )
-            rounded_value = _round_tier_investment(
-                min(max(requested_value, lower_bound), upper_bound)
-            )
-            values.append(min(max(rounded_value, lower_bound), upper_bound))
+            values.append(_round_tier_investment(adjusted_value))
         if len(calculated_tier_values) > 1:
             values.append(float(calculated_tier_values[-1]))
         return values
@@ -3171,6 +3263,24 @@ if st.session_state.confirmed and active_tab == 1:
     control_edit, control_reset, control_step, _ = st.columns([2.1, 1.3, 3.5, 3.1])
     with control_edit:
         # Match the Adjustment Step label height so each action control aligns.
+    def _apply_tier_adjustment(tier_index: int, direction: int) -> None:
+        """Move exactly one editable tier by the selected manual adjustment step."""
+        if at_full_utilization or st.session_state.manual_tier_mode:
+            return
+        values = _calculated_values_with_adjustments()
+        if tier_index <= 0 or tier_index >= len(values) - 1:
+            return
+        step = float(st.session_state.get(adjustment_key, 50_000.0))
+        proposed = _round_tier_investment(values[tier_index] + direction * step)
+        if proposed <= values[tier_index - 1] or proposed >= values[tier_index + 1]:
+            return
+        st.session_state.tier_adjustments[labels[tier_index]] = (
+            proposed - float(calculated_tier_values[tier_index])
+        )
+        _clear_stale_forecast("Tier adjustment applied. Create a new forecast draft.")
+
+    control_edit, control_reset, control_step, _ = st.columns([2.1, 1.3, 3.5, 3.1])
+    with control_edit:
         st.markdown("<div style='height: 3.6rem'></div>", unsafe_allow_html=True)
         if at_full_utilization:
             st.caption(
@@ -3337,6 +3447,7 @@ if st.session_state.confirmed and active_tab == 1:
                     format="%.0f",
                     key=f"manual_tier_{index}",
                     on_change=_manual_tier_changed,
+                    disabled=(index == 0 or index == len(labels) - 1),
                 )
                 rounded_value = _round_tier_investment(value)
                 tier_values.append(rounded_value)
@@ -3350,22 +3461,27 @@ if st.session_state.confirmed and active_tab == 1:
                 "to manual tier mode and enter a strictly increasing tier ladder."
             )
         tier_values = _calculated_values_with_adjustments()
-        tier_cols = (
-            st.columns(3)
-            if high_utilization
-            else st.columns(3) + st.columns(3)
-        )
-        for index, (label, value) in enumerate(zip(labels, tier_values)):
-            with tier_cols[index]:
-                # One consistent card for each tier. Shared adjustment controls
-                # above replace the former per-card +/- buttons.
-                with st.container(height=118, border=True):
-                    st.markdown(
-                        f'<div class="tier-name">{label} '
-                        f'<span class="info-icon" title="{tier_help.get(label, "Calculated investment tier.")}" aria-label="More information">i</span></div>'
-                        f'<div class="tier-amount">{money(value)}</div>',
-                        unsafe_allow_html=True,
-                    )
+        st.markdown("""<style>
+        .investment-journey-wrap{overflow-x:auto;padding:.25rem 0 .1rem}.investment-journey{min-width:820px;display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));position:relative;padding:.3rem 0}.investment-journey:before{content:'';position:absolute;left:8.3%;right:8.3%;top:4.35rem;height:2px;background:linear-gradient(90deg,#23496B,#2A9D8F,#0F9F7A);opacity:.42}.investment-stage{position:relative;z-index:1;text-align:center;font-family:Inter,Arial,sans-serif}.investment-stage-name{min-height:2rem;color:#64748B;font-size:.66rem;font-weight:800;letter-spacing:.075em;line-height:1.15;text-transform:uppercase}.investment-stage-value{margin:.2rem 0 .6rem;color:#172033;font-size:clamp(1.25rem,1.7vw,1.7rem);font-weight:750;letter-spacing:-.03em;white-space:nowrap}.investment-stage-node{width:.82rem;height:.82rem;margin:auto;border-radius:50%;background:#E2E8F0;border:3px solid #fff;box-shadow:0 0 0 1px #CBD5E1}.investment-stage.current .investment-stage-value{color:#23496B}.investment-stage.current .investment-stage-node{background:#23496B;box-shadow:0 0 0 1px #23496B}.investment-stage.optimal .investment-stage-value{color:#087F67}.investment-stage.optimal .investment-stage-node{width:1.06rem;height:1.06rem;margin-top:-.12rem;background:#0F9F7A;box-shadow:0 0 0 1px #0F9F7A,0 0 0 5px rgba(15,159,122,.12)}.investment-stage:nth-child(1) .investment-stage-value{color:#62A8D7!important}.investment-stage:nth-child(2) .investment-stage-value{color:#4D96CE!important}.investment-stage:nth-child(3) .investment-stage-value{color:#3C83BD!important}.investment-stage:nth-child(4) .investment-stage-value{color:#2D70A9!important}.investment-stage:nth-child(5) .investment-stage-value{color:#205D93!important}.investment-stage:nth-child(6) .investment-stage-value{color:#154B7F!important}.investment-stage-name .tier-info{display:inline-flex;align-items:center;justify-content:center;width:.82rem;height:.82rem;margin-left:.15rem;border:1px solid #94A3B8;border-radius:50%;color:#475569;font-size:.58rem;font-weight:800;text-transform:none;letter-spacing:0;vertical-align:middle;cursor:help}.investment-controls{min-width:820px;margin-top:.5rem}.investment-controls div[data-testid='stButton'] button{min-height:1.72rem;padding:0 .42rem;border:1px solid #D8E1EA;border-radius:999px;background:#fff;color:#465569;font-size:.85rem;box-shadow:none}.investment-controls div[data-testid='stButton'] button:hover:not(:disabled){border-color:#4AAE9B;color:#087F67;background:#F0FBF8}.investment-controls div[class*='st-key-decrease_tier_'] button{background:#EFF6FF;border-color:#BFDBFE;color:#2563EB}.investment-controls div[class*='st-key-decrease_tier_'] button:hover:not(:disabled){background:#DBEAFE;border-color:#93C5FD;color:#1D4ED8}.investment-controls div[class*='st-key-increase_tier_'] button{background:#ECFDF5;border-color:#A7F3D0;color:#059669}.investment-controls div[class*='st-key-increase_tier_'] button:hover:not(:disabled){background:#D1FAE5;border-color:#6EE7B7;color:#047857}.adjustment-factor-label{margin:0 0 .35rem;color:#374151;font-size:.72rem;font-weight:800;letter-spacing:.075em;text-transform:uppercase}.st-key-tier-decrease-wrap-1 button,.st-key-tier-decrease-wrap-2 button,.st-key-tier-decrease-wrap-3 button,.st-key-tier-decrease-wrap-4 button{background:#EAF4FF!important;border-color:#B6DAFE!important;color:#1D63B5!important}.st-key-tier-increase-wrap-1 button,.st-key-tier-increase-wrap-2 button,.st-key-tier-increase-wrap-3 button,.st-key-tier-increase-wrap-4 button{background:#E9FBF3!important;border-color:#A9E8CC!important;color:#07865D!important}.st-key-tier-decrease-wrap button,div[class*='decrease_tier'] button{background:#EAF4FF!important;border:1px solid #A9D5FF!important;color:#155E9E!important}.st-key-tier-increase-wrap button,div[class*='increase_tier'] button{background:#E9FBF3!important;border:1px solid #9DE3C6!important;color:#067653!important}@media(max-width:900px){.investment-journey,.investment-controls{min-width:720px}}</style>""",unsafe_allow_html=True)
+        _journey_markup=[]
+        for index,(label,value) in enumerate(zip(labels,tier_values)):
+            _stage="current" if index==0 else "optimal" if index==len(tier_values)-1 else "middle"
+            _journey_markup.append(f'<div class="investment-stage {_stage}"><div class="investment-stage-name">{label} <span class="tier-info" title="{tier_help.get(label, "Calculated investment tier.")}" aria-label="Tier information">i</span></div><div class="investment-stage-value">{_fmt_tier_compact(value)}</div><div class="investment-stage-node"></div></div>')
+        st.markdown('<div class="investment-journey-wrap"><div class="investment-journey">'+''.join(_journey_markup)+'</div></div>',unsafe_allow_html=True)
+        st.markdown('<div class="investment-journey-wrap investment-controls">',unsafe_allow_html=True)
+        tier_control_columns=st.columns(len(tier_values),gap="small")
+        for index,(label,value) in enumerate(zip(labels,tier_values)):
+            with tier_control_columns[index]:
+                if 0<index<len(tier_values)-1:
+                    minus_col,plus_col=st.columns(2,gap="small")
+                    adjustment_value=float(st.session_state.get(adjustment_key,50_000.0))
+                    with minus_col:
+                        with st.container(key=f"tier-decrease-wrap-{index}"):
+                            st.button("−",key=f"decrease_tier_{index}",on_click=_apply_tier_adjustment,args=(index,-1),disabled=value-adjustment_value<=tier_values[index-1],use_container_width=True)
+                    with plus_col:
+                        with st.container(key=f"tier-increase-wrap-{index}"):
+                            st.button("+",key=f"increase_tier_{index}",on_click=_apply_tier_adjustment,args=(index,1),disabled=value+adjustment_value>=tier_values[index+1],use_container_width=True)
+        st.markdown('</div>',unsafe_allow_html=True)
     st.divider()
 
     # --- Improvement Scenarios ---
@@ -3397,6 +3513,26 @@ if st.session_state.confirmed and active_tab == 1:
         'class="info-icon" aria-label="More information">i</span></h3>',
         unsafe_allow_html=True,
     )
+    scenario_heading_col, scenario_add_col, scenario_remove_col = st.columns([6, 1.55, 1.2])
+    with scenario_heading_col:
+        st.markdown(
+            '<h3 style="margin:0.2rem 0 0.3rem;">Forecasting Adjustment Scenarios '
+            '<span title="Test the effect of one or more improvement assumptions on the forecast. '
+            'Scenario factors preserve decimal precision in inputs, results, and charts." '
+            'class="info-icon" aria-label="More information">i</span></h3>',
+            unsafe_allow_html=True,
+        )
+    with scenario_add_col:
+        if num_scenarios < 10:
+            st.button("+ Add scenario", key="add_scenario_heading", on_click=_add_scenario)
+    with scenario_remove_col:
+        st.button(
+            "× Remove",
+            key="remove_scenario_heading",
+            on_click=_remove_scenario,
+            disabled=num_scenarios <= 1,
+            help="Remove the last improvement scenario.",
+        )
 
     scenario_factors = []
     scenario_names = []
@@ -3639,7 +3775,7 @@ if st.session_state.forecast and active_tab == 2:
         # --- Quarterly mode: show one-quarter baseline table ---
         _proj_q_label = st.session_state.get("projection_quarter") or "No Projection"
         st.subheader(f"{_proj_q_label} Projection")
-        range_frame = pd.DataFrame([
+        range_frame = _forecast_output_frame([
             {"Tier": row.tier_label,
              "Investment": _fmt_dollar_commas(float(row.investment)),
              "Delivered": _fmt_compact_k(float(row.delivered_volume)),
@@ -3669,7 +3805,7 @@ if st.session_state.forecast and active_tab == 2:
                  else "—"}
             for row in visible_ranges
         ])
-        st.dataframe(range_frame, hide_index=True, use_container_width=True, height=(len(range_frame) + 1) * 31 + 3)
+        st.dataframe(range_frame, hide_index=True, use_container_width=True, height=(len(range_frame) + 1) * 35 + 2)
 
     # --- Sub-content depends on projection mode ---
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
@@ -3689,7 +3825,7 @@ if st.session_state.forecast and active_tab == 2:
             else:
                 st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
                     f'<div class="kpi-label">{name}</div>'
-                    f'<div class="kpi-value">+{float(factor)*100:.0f}% improvement</div></div>', unsafe_allow_html=True)
+                    f'<div class="kpi-value">{_scenario_factor_title(factor)}</div></div>', unsafe_allow_html=True)
             from collections import defaultdict as _dd
             _imp_by_tier: dict[str, list] = _dd(list)
             for r in rows:
@@ -3746,7 +3882,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
                 })
             if scenario_rows:
-                st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True, height=(len(scenario_rows) + 1) * 31 + 3)
+                st.dataframe(_forecast_output_frame(scenario_rows), hide_index=True, use_container_width=True, height=(len(scenario_rows) + 1) * 35 + 2)
 
     if _is_quarterly_mode:
         # Quarterly mode: improvement scenarios inline with simple headers
@@ -3754,7 +3890,7 @@ if st.session_state.forecast and active_tab == 2:
     else:
         # Annual mode: show annual baseline + improvements inline (x4 multiplier)
         st.subheader("Annual Projection")
-        annual_frame = pd.DataFrame([
+        annual_frame = _forecast_output_frame([
             {"Tier": row.tier_label,
              "Investment": _fmt_dollar_commas(float(row.investment) * 4),
              "Delivered": _fmt_compact_k(float(row.delivered_volume) * 4),
@@ -3785,7 +3921,7 @@ if st.session_state.forecast and active_tab == 2:
              "% Utilization": f"{_sig_util_all.get(row.tier_label, 0):.0f}%"}
             for row in visible_ranges
         ])
-        st.dataframe(annual_frame, hide_index=True, use_container_width=True, height=(len(annual_frame) + 1) * 31 + 3)
+        st.dataframe(annual_frame, hide_index=True, use_container_width=True, height=(len(annual_frame) + 1) * 35 + 2)
 
         # Annual improvement scenarios
         _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
@@ -3839,7 +3975,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_all.get(tier_label, 0):.0f}%",
                 })
             if imp_rows:
-                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True, height=(len(imp_rows) + 1) * 31 + 3)
+                st.dataframe(_forecast_output_frame(imp_rows), hide_index=True, use_container_width=True, height=(len(imp_rows) + 1) * 35 + 2)
 
 
     _render_download_button("tab3a")
@@ -4189,7 +4325,7 @@ if (st.session_state.forecast
                             "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                             "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                         })
-                    st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
+                    st.dataframe(_forecast_output_frame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 35 + 2)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -4385,7 +4521,7 @@ if (st.session_state.forecast
                         "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
 
-                st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
+                st.dataframe(_forecast_output_frame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 35 + 2)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -4691,7 +4827,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                 scenario_tabs, result.get("improvements", [])
             ):
                 with scenario_tab:
-                    st.caption(f"Improvement factor: {float(scenario_factor) * 100:.1f}%")
+                    st.caption(f"Scenario adjustment: {_scenario_factor_title(scenario_factor)}")
                     st.dataframe(
                         _qa_scenario_frame([
                             row for row in scenario_rows
@@ -4804,6 +4940,34 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     _scenario_opts = ["Baseline"]
     for _sn, _sf, _sr in result["improvements"]:
         _scenario_opts.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
+
+    # Per-table selection with inline scenario checkboxes
+    st.subheader("Select Output Tables & Scenarios")
+
+    # Track per-table scenarios
+    _annual_scenarios: list[str] = []
+    _quarterly_scenarios: list[str] = []
+    _monthly_scenarios: list[str] = []
+    _save_annual_chk = False
+    _save_quarterly_chk = False
+    _save_monthly_chk = False
+
+    _n_scen = len(_scenario_opts)
+
+    # Helper: render table checkbox on left, scenario checkboxes stacked vertically on right
+    def _render_table_row(label, chk_key, scen_prefix):
+        left, right = st.columns([1, 1])
+        with left:
+            enabled = st.checkbox(label, value=True, key=chk_key)
+        scenarios = []
+        with right:
+            for _si, _so in enumerate(_scenario_opts):
+                if st.checkbox(_so, value=True, key=f"{scen_prefix}_{_si}", disabled=not enabled):
+                    if enabled:
+                        scenarios.append(_so)
+            if enabled and not scenarios:
+                st.error("Select at least one scenario.")
+        return enabled, scenarios
 
     # Scenario selection — each selected scenario exports all output tables
     st.subheader("Select Scenarios to Export")
