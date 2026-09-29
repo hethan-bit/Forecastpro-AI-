@@ -39,15 +39,6 @@ from planning_source import planning_input, planning_quarters, PLANNING_INPUT_TA
 
 st.set_page_config(page_title="ForecastPro AI", page_icon="📈", layout="wide")
 
-def _scenario_factor_title(factor: Decimal | float) -> str:
-    """Return a user-facing label for either an upside or downside scenario."""
-    percentage = float(factor) * 100
-    if percentage > 0:
-        return f"+{percentage:.0f}% Improvement"
-    if percentage < 0:
-        return f"{percentage:.0f}% Reduction"
-    return "0% No Change"
-
 st.markdown(
     """
 <style>
@@ -1014,6 +1005,9 @@ def _fmt_compact_k(v: float) -> str:
         return f"{v/1_000:.1f}K"
     return f"{v:.1f}"
 
+def _fmt_int(v: float) -> str:
+    return f"{float(v):,.0f}"
+
 def _fmt_dollar_compact_m(v: float) -> str:
     abs_v = abs(v)
     if abs_v >= 1_000_000:
@@ -1042,10 +1036,6 @@ def _range_str(lo: float, hi: float, fmt_func) -> str:
     if abs(lo - hi) < 0.005:
         return fmt_func(lo)
     return f"{fmt_func(lo)} - {fmt_func(hi)}"
-
-def _forecast_output_frame(rows) -> pd.DataFrame:
-    """Remove prospect counts from user-facing forecast output only."""
-    return pd.DataFrame(rows).drop(columns=["Prospects", "# of Prospects"], errors="ignore")
 
 
 MONTH_NAMES = (
@@ -1377,6 +1367,7 @@ def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
     iroas = [float((row.iroas.minimum + row.iroas.maximum) / 2) for row in all_ranges]
     customers = [float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2) for row in all_ranges]
     revenue = [float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2) for row in all_ranges]
+    prospects = [float(row.prospects) for row in all_ranges]
 
     def _compact(value, currency=False, precision=0):
         prefix = "$" if currency else ""
@@ -1439,6 +1430,7 @@ def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
         ("iROAS by Investment Tier", _render_line("iROAS by Investment Tier", "Incremental revenue returned for each forecast dollar", iroas, currency=True, precision=2)),
         ("Incremental Customers by Investment Tier", _render_bar("Incremental Customers by Investment Tier", "Customer gain at each forecast investment level", customers)),
         ("Incremental Revenue by Investment Tier", _render_bar("Incremental Revenue by Investment Tier", "Projected incremental revenue at each investment level", revenue, currency=True)),
+        ("Prospects by Investment Tier", _render_bar("Prospects by Investment Tier", "Reachable prospects supporting each forecast tier", prospects)),
     ]
     rendered = []
     for title, figure in definitions:
@@ -1564,7 +1556,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                     firoas,
                 )
         f_rows.append([
-            export_tier_label(r.tier_label), fmoney(float(r.investment) * mult), fk(float(r.delivered_volume) * mult),
+            export_tier_label(r.tier_label), fmoney(float(r.investment) * mult), fint(float(r.delivered_volume) * mult),
             rng(float(r.incremental_customers.minimum) * mult, float(r.incremental_customers.maximum) * mult, fk),
             rng(float(r.incremental_revenue.minimum) * mult, float(r.incremental_revenue.maximum) * mult, fdk),
             rng(float(r.cpix.minimum), float(r.cpix.maximum), fcpix),
@@ -1605,7 +1597,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             if tl == first_tier:
                 mcr = "—"; mir = "—"
             f_rows.append([tl, fmoney(float(trows[0].investment)),
-                fk(float(rr.delivered_volume)) if rr else "—",
+                fint(float(rr.delivered_volume)) if rr else "—",
                 cr, rvr, cxr, irr, mcr, mir, f"{sig_util.get(tl, 0):.1f}%"])
     sheets[forecast_sheet_name] = f_rows
 
@@ -1625,7 +1617,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             rmn = float(r.incremental_revenue.minimum) * fac * ip * im
             rmx = float(r.incremental_revenue.maximum) * fac * ip * im
             out.append([export_tier_label(r.tier_label), fmoney(inv),
-                fk(float(r.delivered_volume) * fac * op),
+                fint(float(r.delivered_volume) * fac * op),
                 rng(cmn, cmx, fk), rng(rmn, rmx, fdk),
                 rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fcpix),
                 rng(rmn/inv if inv > 0 else 0, rmx/inv if inv > 0 else 0, firoas)])
@@ -1641,7 +1633,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             rmn = float(r.incremental_revenue.minimum) * fac * ip * im
             rmx = float(r.incremental_revenue.maximum) * fac * ip * im
             out.append([fmoney(inv),
-                fk(float(r.delivered_volume) * fac * op),
+                fint(float(r.delivered_volume) * fac * op),
                 rng(cmn, cmx, fk), rng(rmn, rmx, fdk),
                 rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fcpix),
                 rng(rmn/inv if inv > 0 else 0, rmx/inv if inv > 0 else 0, firoas)])
@@ -1809,7 +1801,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     # Charts are rendered as premium report images; the exact source values stay hidden in Chart Data.
     native_charts = []
     if vis_ranges:
-        chart_rows = [["Tier", "Investment", "CPIx Midpoint", "iROAS Midpoint", "Incremental Customers", "Incremental Revenue", "Delivered Volume"]]
+        chart_rows = [["Tier", "Investment", "CPIx Midpoint", "iROAS Midpoint", "Incremental Customers", "Incremental Revenue", "Prospects", "Delivered Volume"]]
         for row in vis_ranges:
             chart_rows.append([
                 export_tier_label(row.tier_label), float(row.investment),
@@ -1817,7 +1809,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                 float((row.iroas.minimum + row.iroas.maximum) / 2),
                 float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2),
                 float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2),
-                float(row.delivered_volume),
+                float(row.prospects), float(row.delivered_volume),
             ])
         sheets["Chart Data"] = chart_rows
         sheets["Charts"] = [[""]]
@@ -1827,22 +1819,10 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             ("iROAS by Investment Tier", 3, "1F77B4"),
             ("Incremental Customers by Investment Tier", 4, "06B6D4"),
             ("Incremental Revenue by Investment Tier", 5, "3B82F6"),
+            ("Prospects by Investment Tier", 6, "648FC2"),
         ]
 
         # --- Build xlsx from raw XML with formatting ---
-    # Remove prospect columns from forecast/split workbook sheets; historical KPIs stay intact.
-    for _sheet_name, _sheet_rows in sheets.items():
-        if _sheet_name in {"Historical KPIs", "Chart Data", "Charts"}:
-            continue
-        _prospect_columns = None
-        for _row in _sheet_rows:
-            _headers = [index for index, value in enumerate(_row) if str(value) in {"Prospects", "# of Prospects"}]
-            if _headers:
-                _prospect_columns = _headers
-            if _prospect_columns:
-                for index in reversed(_prospect_columns):
-                    if index < len(_row):
-                        _row.pop(index)
     def col_letter(idx):
         r = ""; i = idx
         while i >= 0: r = chr(65 + i % 26) + r; i = i // 26 - 1
@@ -3189,10 +3169,9 @@ if st.session_state.confirmed and active_tab == 1:
     st.session_state.setdefault("tier_adjustments", {})
     st.session_state.setdefault("manual_tier_mode", False)
     st.session_state.setdefault("manual_tier_values", {})
-    shared_adjustment_key = "_shared_tier_adjustment"
-    shared_adjustment_version = "shared-tier-adjustment-v2"
-    if st.session_state.get("_tier_adjustment_mode") != shared_adjustment_version:
-        # Replace legacy independent tier adjustments with one shared adjustment.
+    adjustment_key = "_tier_adjustment_step"
+    adjustment_version = "individual-tier-adjustment-v1"
+    if st.session_state.get("_tier_adjustment_mode") != adjustment_version:
         st.session_state.tier_adjustments = {}
         st.session_state[adjustment_key] = 50_000.0
         st.session_state["_tier_adjustment_mode"] = adjustment_version
@@ -3258,11 +3237,6 @@ if st.session_state.confirmed and active_tab == 1:
             values.append(float(calculated_tier_values[-1]))
         return values
 
-    # Keep the actions left-grouped, while reserving enough width for each
-    # label and the adjustment controls.
-    control_edit, control_reset, control_step, _ = st.columns([2.1, 1.3, 3.5, 3.1])
-    with control_edit:
-        # Match the Adjustment Step label height so each action control aligns.
     def _apply_tier_adjustment(tier_index: int, direction: int) -> None:
         """Move exactly one editable tier by the selected manual adjustment step."""
         if at_full_utilization or st.session_state.manual_tier_mode:
@@ -3325,105 +3299,22 @@ if st.session_state.confirmed and active_tab == 1:
             help="Restore the original automatically calculated tier values.",
         )
 
-    def _apply_shared_tier_adjustment(direction: int) -> None:
-        """Move every calculated middle tier by exactly one selected adjustment step."""
-        if at_full_utilization or st.session_state.manual_tier_mode:
-            return
-
-        adjustment_step = float(st.session_state.get(shared_adjustment_key, 10_000.0))
-        current_values = _calculated_values_with_adjustments()
-        first_middle = 1
-        last_middle = len(current_values) - 2
-        requested_delta = direction * adjustment_step
-        lower_limit = current_values[first_middle - 1] + minimum_tier_gap
-        upper_limit = current_values[-1] - minimum_tier_gap
-
-        # Apply a full configured step only. Do not silently apply a smaller,
-        # partial movement when it would collide with either fixed endpoint.
-        if (
-            current_values[first_middle] + requested_delta < lower_limit
-            or current_values[last_middle] + requested_delta > upper_limit
-        ):
-            return
-
-        for tier_label in labels[first_middle:-1]:
-            st.session_state.tier_adjustments[tier_label] = (
-                float(st.session_state.tier_adjustments.get(tier_label, 0.0))
-                + requested_delta
-            )
-        _clear_stale_forecast(
-            "Tier adjustment applied. Create a new forecast draft."
-        )
-
-    current_adjustment_step = float(
-        st.session_state.get(shared_adjustment_key, 10_000.0)
-    )
-    current_adjusted_values = _calculated_values_with_adjustments()
-    can_decrease_tiers = (
-        not at_full_utilization
-        and not st.session_state.manual_tier_mode
-        and current_adjusted_values[1] - current_adjustment_step
-        >= current_adjusted_values[0] + minimum_tier_gap
-    )
-    can_increase_tiers = (
-        not at_full_utilization
-        and not st.session_state.manual_tier_mode
-        and current_adjusted_values[-2] + current_adjustment_step
-        <= current_adjusted_values[-1] - minimum_tier_gap
-    )
-
     with control_step:
         st.markdown(
-            "<style>"
-            "div[data-testid='stNumberInput']:has(input[aria-label='Adjustment step']) "
-            "button { display: none !important; }"
-            "</style>",
+            "<div class='adjustment-factor-label'>Adjustment Factor <span class='info-icon' title='Set the dollar amount used when adjusting an editable tier. Changing this value alone does not change a tier; use the tier − or + control to apply it.' aria-label='Adjustment Factor information'>i</span></div>",
             unsafe_allow_html=True,
         )
-        st.markdown(
-            "<div style='margin:0 0 0.35rem; font-size:0.85rem; "
-            "font-weight:700; letter-spacing:0.04em; color:#374151;'>"
-            "ADJUSTMENT STEP</div>",
-            unsafe_allow_html=True,
+        st.number_input(
+            "Adjustment factor",
+            min_value=1_000.0,
+            value=50_000.0,
+            step=10_000.0,
+            format="%.0f",
+            key=adjustment_key,
+            disabled=st.session_state.manual_tier_mode or at_full_utilization,
+            label_visibility="collapsed",
+            help="Enter the amount applied to an individual tier when its − or + button is selected. Changing this value alone does not change any tier.",
         )
-        decrease_col, step_value_col, increase_col = st.columns(
-            [0.65, 2.7, 0.65], vertical_alignment="bottom"
-        )
-        with decrease_col:
-            st.button(
-                "−",
-                key="decrease_calculated_tiers",
-                on_click=_apply_shared_tier_adjustment,
-                args=(-1,),
-                disabled=not can_decrease_tiers,
-                help="Decrease every adjustable middle tier by the selected adjustment step.",
-                use_container_width=True,
-            )
-        with step_value_col:
-            st.number_input(
-                "Adjustment step",
-                min_value=1_000.0,
-                value=10_000.0,
-                step=1_000.0,
-                format="%.0f",
-                key=shared_adjustment_key,
-                disabled=st.session_state.manual_tier_mode or at_full_utilization,
-                label_visibility="collapsed",
-                help=(
-                    "Set the amount applied when you click − or +. "
-                    "Changing this value alone does not change any tier."
-                ),
-            )
-        with increase_col:
-            st.button(
-                "+",
-                key="increase_calculated_tiers",
-                on_click=_apply_shared_tier_adjustment,
-                args=(1,),
-                disabled=not can_increase_tiers,
-                help="Increase every adjustable middle tier by the selected adjustment step.",
-                use_container_width=True,
-            )
 
     show_expansion = True
     if st.session_state.manual_tier_mode and not at_full_utilization:
@@ -3466,7 +3357,7 @@ if st.session_state.confirmed and active_tab == 1:
         _journey_markup=[]
         for index,(label,value) in enumerate(zip(labels,tier_values)):
             _stage="current" if index==0 else "optimal" if index==len(tier_values)-1 else "middle"
-            _journey_markup.append(f'<div class="investment-stage {_stage}"><div class="investment-stage-name">{label} <span class="tier-info" title="{tier_help.get(label, "Calculated investment tier.")}" aria-label="Tier information">i</span></div><div class="investment-stage-value">{_fmt_tier_compact(value)}</div><div class="investment-stage-node"></div></div>')
+            _journey_markup.append(f'<div class="investment-stage {_stage}"><div class="investment-stage-name">{label} <span class="tier-info" title="{tier_help.get(label, "Calculated investment tier.")}" aria-label="Tier information">i</span></div><div class="investment-stage-value">{money(value)}</div><div class="investment-stage-node"></div></div>')
         st.markdown('<div class="investment-journey-wrap"><div class="investment-journey">'+''.join(_journey_markup)+'</div></div>',unsafe_allow_html=True)
         st.markdown('<div class="investment-journey-wrap investment-controls">',unsafe_allow_html=True)
         tier_control_columns=st.columns(len(tier_values),gap="small")
@@ -3513,26 +3404,6 @@ if st.session_state.confirmed and active_tab == 1:
         'class="info-icon" aria-label="More information">i</span></h3>',
         unsafe_allow_html=True,
     )
-    scenario_heading_col, scenario_add_col, scenario_remove_col = st.columns([6, 1.55, 1.2])
-    with scenario_heading_col:
-        st.markdown(
-            '<h3 style="margin:0.2rem 0 0.3rem;">Forecasting Adjustment Scenarios '
-            '<span title="Test the effect of one or more improvement assumptions on the forecast. '
-            'Scenario factors preserve decimal precision in inputs, results, and charts." '
-            'class="info-icon" aria-label="More information">i</span></h3>',
-            unsafe_allow_html=True,
-        )
-    with scenario_add_col:
-        if num_scenarios < 10:
-            st.button("+ Add scenario", key="add_scenario_heading", on_click=_add_scenario)
-    with scenario_remove_col:
-        st.button(
-            "× Remove",
-            key="remove_scenario_heading",
-            on_click=_remove_scenario,
-            disabled=num_scenarios <= 1,
-            help="Remove the last improvement scenario.",
-        )
 
     scenario_factors = []
     scenario_names = []
@@ -3775,10 +3646,10 @@ if st.session_state.forecast and active_tab == 2:
         # --- Quarterly mode: show one-quarter baseline table ---
         _proj_q_label = st.session_state.get("projection_quarter") or "No Projection"
         st.subheader(f"{_proj_q_label} Projection")
-        range_frame = _forecast_output_frame([
+        range_frame = pd.DataFrame([
             {"Tier": row.tier_label,
              "Investment": _fmt_dollar_commas(float(row.investment)),
-             "Delivered": _fmt_compact_k(float(row.delivered_volume)),
+             "Delivered": _fmt_int(float(row.delivered_volume)),
              "Inc. Cust": _range_str(
                  float(row.incremental_customers.minimum),
                  float(row.incremental_customers.maximum),
@@ -3805,7 +3676,7 @@ if st.session_state.forecast and active_tab == 2:
                  else "—"}
             for row in visible_ranges
         ])
-        st.dataframe(range_frame, hide_index=True, use_container_width=True, height=(len(range_frame) + 1) * 35 + 2)
+        st.dataframe(range_frame, hide_index=True, use_container_width=True, height=(len(range_frame) + 1) * 31 + 3)
 
     # --- Sub-content depends on projection mode ---
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
@@ -3825,7 +3696,7 @@ if st.session_state.forecast and active_tab == 2:
             else:
                 st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
                     f'<div class="kpi-label">{name}</div>'
-                    f'<div class="kpi-value">{_scenario_factor_title(factor)}</div></div>', unsafe_allow_html=True)
+                    f'<div class="kpi-value">+{float(factor)*100:.0f}% improvement</div></div>', unsafe_allow_html=True)
             from collections import defaultdict as _dd
             _imp_by_tier: dict[str, list] = _dd(list)
             for r in rows:
@@ -3872,7 +3743,7 @@ if st.session_state.forecast and active_tab == 2:
                 scenario_rows.append({
                     "Tier": tier_label,
                     "Investment": _fmt_dollar_commas(float(tier_rows[0].investment)),
-                    "Delivered": _fmt_compact_k(float(rng.delivered_volume)) if rng else "—",
+                    "Delivered": _fmt_int(float(rng.delivered_volume)) if rng else "—",
                     "Inc. Cust": cust_range,
                     "Inc. Rev": rev_range,
                     "CPIx": cpix_range,
@@ -3882,7 +3753,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
                 })
             if scenario_rows:
-                st.dataframe(_forecast_output_frame(scenario_rows), hide_index=True, use_container_width=True, height=(len(scenario_rows) + 1) * 35 + 2)
+                st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True, height=(len(scenario_rows) + 1) * 31 + 3)
 
     if _is_quarterly_mode:
         # Quarterly mode: improvement scenarios inline with simple headers
@@ -3890,10 +3761,10 @@ if st.session_state.forecast and active_tab == 2:
     else:
         # Annual mode: show annual baseline + improvements inline (x4 multiplier)
         st.subheader("Annual Projection")
-        annual_frame = _forecast_output_frame([
+        annual_frame = pd.DataFrame([
             {"Tier": row.tier_label,
              "Investment": _fmt_dollar_commas(float(row.investment) * 4),
-             "Delivered": _fmt_compact_k(float(row.delivered_volume) * 4),
+             "Delivered": _fmt_int(float(row.delivered_volume) * 4),
              "Inc. Cust": _range_str(
                  float(row.incremental_customers.minimum) * 4,
                  float(row.incremental_customers.maximum) * 4,
@@ -3921,7 +3792,7 @@ if st.session_state.forecast and active_tab == 2:
              "% Utilization": f"{_sig_util_all.get(row.tier_label, 0):.0f}%"}
             for row in visible_ranges
         ])
-        st.dataframe(annual_frame, hide_index=True, use_container_width=True, height=(len(annual_frame) + 1) * 35 + 2)
+        st.dataframe(annual_frame, hide_index=True, use_container_width=True, height=(len(annual_frame) + 1) * 31 + 3)
 
         # Annual improvement scenarios
         _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
@@ -3965,7 +3836,7 @@ if st.session_state.forecast and active_tab == 2:
                 imp_rows.append({
                     "Tier": tier_label,
                     "Investment": _fmt_dollar_commas(float(tier_rows[0].investment) * 4),
-                    "Delivered": _fmt_compact_k(float(rng.delivered_volume) * 4) if rng else "—",
+                    "Delivered": _fmt_int(float(rng.delivered_volume) * 4) if rng else "—",
                     "Inc. Cust": cust_range,
                     "Inc. Rev": rev_range,
                     "CPIx": cpix_range,
@@ -3975,7 +3846,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_all.get(tier_label, 0):.0f}%",
                 })
             if imp_rows:
-                st.dataframe(_forecast_output_frame(imp_rows), hide_index=True, use_container_width=True, height=(len(imp_rows) + 1) * 35 + 2)
+                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True, height=(len(imp_rows) + 1) * 31 + 3)
 
 
     _render_download_button("tab3a")
@@ -4076,7 +3947,7 @@ if (st.session_state.forecast
                     tier_qtr_rows.append({
                         "Quarter": _rq_label,
                         "Investment": _fmt_dollar_commas(inv),
-                        "Delivered": _fmt_compact_k(delivered),
+                        "Delivered": _fmt_int(delivered),
                         "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                         "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                         "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4086,7 +3957,7 @@ if (st.session_state.forecast
                 tier_qtr_rows.append({
                     "Quarter": "Annual Total",
                     "Investment": _fmt_dollar_commas(_tot_inv),
-                    "Delivered": _fmt_compact_k(_tot_del),
+                    "Delivered": _fmt_int(_tot_del),
                     "Inc. Cust": _range_str(_tot_cmin, _tot_cmax, _fmt_compact_k),
                     "Inc. Rev": _range_str(_tot_rmin, _tot_rmax, _fmt_dollar_compact_m),
                     "CPIx": _range_str(_tot_inv / _tot_cmax if _tot_cmax > 0 else 0, _tot_inv / _tot_cmin if _tot_cmin > 0 else 0, _fmt_dollar_0),
@@ -4121,7 +3992,7 @@ if (st.session_state.forecast
                     qtr_rows.append({
                         "Tier": label,
                         "Investment": _fmt_dollar_commas(inv),
-                        "Delivered": _fmt_compact_k(delivered),
+                        "Delivered": _fmt_int(delivered),
                         "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                         "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                         "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4246,7 +4117,7 @@ if (st.session_state.forecast
                         tier_month_rows.append({
                             "Month": f"{month} {_yr}",
                             "Investment": _fmt_dollar_commas(inv),
-                            "Delivered": _fmt_compact_k(delivered),
+                            "Delivered": _fmt_int(delivered),
                             "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                             "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                             "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4259,7 +4130,7 @@ if (st.session_state.forecast
                     tier_month_rows.append({
                         "Month": f"{_ql} Total",
                         "Investment": _fmt_dollar_commas(_qt_inv),
-                        "Delivered": _fmt_compact_k(_qt_del),
+                        "Delivered": _fmt_int(_qt_del),
                         "Inc. Cust": _range_str(_qt_cmin, _qt_cmax, _fmt_compact_k),
                         "Inc. Rev": _range_str(_qt_rmin, _qt_rmax, _fmt_dollar_compact_m),
                         "CPIx": _range_str(_qt_inv / _qt_cmax if _qt_cmax > 0 else 0, _qt_inv / _qt_cmin if _qt_cmin > 0 else 0, _fmt_dollar_0),
@@ -4269,7 +4140,7 @@ if (st.session_state.forecast
                 tier_month_rows.append({
                     "Month": "Annual Total",
                     "Investment": _fmt_dollar_commas(_an_inv),
-                    "Delivered": _fmt_compact_k(_an_del),
+                    "Delivered": _fmt_int(_an_del),
                     "Inc. Cust": _range_str(_an_cmin, _an_cmax, _fmt_compact_k),
                     "Inc. Rev": _range_str(_an_rmin, _an_rmax, _fmt_dollar_compact_m),
                     "CPIx": _range_str(_an_inv / _an_cmax if _an_cmax > 0 else 0, _an_inv / _an_cmin if _an_cmin > 0 else 0, _fmt_dollar_0),
@@ -4318,14 +4189,14 @@ if (st.session_state.forecast
                         month_rows.append({
 "Tier": label,
                             "Investment": _fmt_dollar_commas(inv),
-                            "Delivered": _fmt_compact_k(delivered),
+                            "Delivered": _fmt_int(delivered),
                             "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                             "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                             "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
                             "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                             "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                         })
-                    st.dataframe(_forecast_output_frame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 35 + 2)
+                    st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -4446,7 +4317,7 @@ if (st.session_state.forecast
                     tier_month_rows.append({
                         "Month": month,
                         "Investment": _fmt_dollar_commas(inv),
-                        "Delivered": _fmt_compact_k(delivered),
+                        "Delivered": _fmt_int(delivered),
                         "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                         "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                         "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4456,7 +4327,7 @@ if (st.session_state.forecast
                 tier_month_rows.append({
                     "Month": "Quarter Total",
                     "Investment": _fmt_dollar_commas(_qt_inv),
-                    "Delivered": _fmt_compact_k(_qt_del),
+                    "Delivered": _fmt_int(_qt_del),
                     "Inc. Cust": _range_str(_qt_cmin, _qt_cmax, _fmt_compact_k),
                     "Inc. Rev": _range_str(_qt_rmin, _qt_rmax, _fmt_dollar_compact_m),
                     "CPIx": _range_str(_qt_inv / _qt_cmax if _qt_cmax > 0 else 0, _qt_inv / _qt_cmin if _qt_cmin > 0 else 0, _fmt_dollar_0),
@@ -4511,7 +4382,7 @@ if (st.session_state.forecast
                     month_rows.append({
 "Tier": label,
                         "Investment": _fmt_dollar_commas(inv),
-                        "Delivered": _fmt_compact_k(delivered),
+                        "Delivered": _fmt_int(delivered),
                         "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                         "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                         "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4521,7 +4392,7 @@ if (st.session_state.forecast
                         "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
 
-                st.dataframe(_forecast_output_frame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 35 + 2)
+                st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -4827,7 +4698,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                 scenario_tabs, result.get("improvements", [])
             ):
                 with scenario_tab:
-                    st.caption(f"Scenario adjustment: {_scenario_factor_title(scenario_factor)}")
+                    st.caption(f"Improvement factor: {float(scenario_factor) * 100:.1f}%")
                     st.dataframe(
                         _qa_scenario_frame([
                             row for row in scenario_rows
@@ -4940,34 +4811,6 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     _scenario_opts = ["Baseline"]
     for _sn, _sf, _sr in result["improvements"]:
         _scenario_opts.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
-
-    # Per-table selection with inline scenario checkboxes
-    st.subheader("Select Output Tables & Scenarios")
-
-    # Track per-table scenarios
-    _annual_scenarios: list[str] = []
-    _quarterly_scenarios: list[str] = []
-    _monthly_scenarios: list[str] = []
-    _save_annual_chk = False
-    _save_quarterly_chk = False
-    _save_monthly_chk = False
-
-    _n_scen = len(_scenario_opts)
-
-    # Helper: render table checkbox on left, scenario checkboxes stacked vertically on right
-    def _render_table_row(label, chk_key, scen_prefix):
-        left, right = st.columns([1, 1])
-        with left:
-            enabled = st.checkbox(label, value=True, key=chk_key)
-        scenarios = []
-        with right:
-            for _si, _so in enumerate(_scenario_opts):
-                if st.checkbox(_so, value=True, key=f"{scen_prefix}_{_si}", disabled=not enabled):
-                    if enabled:
-                        scenarios.append(_so)
-            if enabled and not scenarios:
-                st.error("Select at least one scenario.")
-        return enabled, scenarios
 
     # Scenario selection — each selected scenario exports all output tables
     st.subheader("Select Scenarios to Export")
