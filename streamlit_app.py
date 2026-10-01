@@ -584,13 +584,9 @@ def render_mailops_editor(session) -> None:
         '<h1 class="hero-title">Edit MailOps Data</h1>',
         unsafe_allow_html=True,
     )
-    _top_cols = st.columns([2, 4, 2])
+    _view_label = "Single-Row Editor" if st.session_state.get("_mo_excel_view") else "Excel View"
+    _top_cols = st.columns([2, 6])
     with _top_cols[0]:
-        if st.button("Back to Forecast Engine", key="_mailops_back"):
-            st.session_state.mailops_mode = False
-            st.rerun()
-    with _top_cols[2]:
-        _view_label = "Single-Row Editor" if st.session_state.get("_mo_excel_view") else "Excel View"
         if st.button(_view_label, key="_mo_toggle_view"):
             st.session_state["_mo_excel_view"] = not st.session_state.get("_mo_excel_view", False)
             st.rerun()
@@ -1373,6 +1369,12 @@ def _fmt_compact_k(v: float) -> str:
     elif abs_v >= 1_000:
         return f"{v/1_000:.1f}K"
     return f"{v:.1f}"
+
+def _fmt_int(v: float) -> str:
+    return f"{float(v):,.0f}"
+
+def _forecast_output_frame(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows)
 
 def _fmt_dollar_compact_m(v: float) -> str:
     abs_v = abs(v)
@@ -2592,8 +2594,10 @@ with title_col:
     )
 mailops_col, _spacer, reset_col = st.columns([2, 4, 2])
 with mailops_col:
-    if st.button("Change MailOps Data", key="_mailops_btn", help="Add MailOps data through this tool"):
-        st.session_state.mailops_mode = True
+    _mailops_active = st.session_state.get("mailops_mode", False)
+    _mailops_label = "Back to Forecast Engine" if _mailops_active else "Change MailOps Data"
+    if st.button(_mailops_label, key="_mailops_btn", help="Add MailOps data through this tool"):
+        st.session_state.mailops_mode = not _mailops_active
         st.rerun()
 with reset_col:
     if st.button("Start New Account", key="_reset_btn", help="Clear all state and start fresh for next account"):
@@ -3771,26 +3775,13 @@ if st.session_state.confirmed and active_tab == 1:
             )
 
     num_scenarios = st.session_state.num_scenarios
-    scenario_heading_col, scenario_add_col, scenario_remove_col = st.columns([6, 1.55, 1.2])
-    with scenario_heading_col:
-        st.markdown(
-            '<h3 style="margin:0.2rem 0 0.3rem;">Forecasting Adjustment Scenarios '
-            '<span title="Test the effect of one or more improvement assumptions on the forecast. '
-            'Scenario factors preserve decimal precision in inputs, results, and charts." '
-            'class="info-icon" aria-label="More information">i</span></h3>',
-            unsafe_allow_html=True,
-        )
-    with scenario_add_col:
-        if num_scenarios < 10:
-            st.button("+ Add scenario", key="add_scenario_heading", on_click=_add_scenario)
-    with scenario_remove_col:
-        st.button(
-            "× Remove",
-            key="remove_scenario_heading",
-            on_click=_remove_scenario,
-            disabled=num_scenarios <= 0,
-            help="Remove the last improvement scenario.",
-        )
+    st.markdown(
+        '<h3 style="margin:0.2rem 0 0.3rem;">Forecasting Adjustment Scenarios '
+        '<span title="Test the effect of one or more improvement assumptions on the forecast. '
+        'Scenario factors preserve decimal precision in inputs, results, and charts." '
+        'class="info-icon" aria-label="More information">i</span></h3>',
+        unsafe_allow_html=True,
+    )
 
     scenario_factors = []
     scenario_names = []
