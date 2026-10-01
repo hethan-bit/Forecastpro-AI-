@@ -570,6 +570,15 @@ st.markdown(
   [data-testid="stAppViewContainer"] > section > div {
     background-color: #FAFAFA !important;
   }
+  /* === USER GUIDE === */
+  [class*=_guide_nav_button] > button { background:linear-gradient(135deg,#173B73,#2864A7)!important; color:#FFFFFF!important; border:1px solid #173B73!important; box-shadow:0 5px 14px rgba(23,59,115,.18)!important; }
+  [class*=_guide_nav_button] > button:hover { background:linear-gradient(135deg,#102B55,#1D528B)!important; color:#FFFFFF!important; transform:translateY(-1px); }
+  .guide-hero { padding:2rem 2.25rem; margin:.2rem 0 1.1rem; border-radius:20px; color:#FFFFFF; background:linear-gradient(120deg,#102A52,#184E83 60%,#158B84); box-shadow:0 14px 32px rgba(23,59,115,.15); }
+  .guide-eyebrow { color:#A7F3D0!important; font-size:.72rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }
+  .guide-title { color:#FFFFFF!important; font-family:Georgia,serif; font-size:2.25rem; line-height:1.1; margin:.45rem 0; }
+  .guide-copy { color:rgba(255,255,255,.90)!important; max-width:720px; line-height:1.6; }
+  .guide-section-title { color:#173B73!important; font-size:.76rem; font-weight:800; text-transform:uppercase; letter-spacing:.12em; margin:1.25rem 0 .6rem; }
+  .qa-copy-note { color:#64748B!important; font-size:.78rem; margin:.1rem 0 .25rem; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -647,8 +656,22 @@ def render_mailops_editor(session) -> None:
             st.warning("No rows found in this table.")
             return
 
+        # Quarter filter
+        _all_quarters = sorted(_orig_df["Quarter"].dropna().unique().tolist())
+        _quarter_options = ["All Quarters"] + _all_quarters
+        _selected_quarter = st.selectbox(
+            "Filter by Quarter",
+            _quarter_options,
+            key="_mo_quarter_filter",
+        )
+        if _selected_quarter != "All Quarters":
+            _filter_mask = _orig_df["Quarter"] == _selected_quarter
+            _filtered_orig = _orig_df[_filter_mask].reset_index(drop=True)
+        else:
+            _filtered_orig = _orig_df
+
         _edited_df = st.data_editor(
-            _orig_df,
+            _filtered_orig,
             hide_index=False,
             use_container_width=True,
             num_rows="dynamic",
@@ -679,7 +702,7 @@ def render_mailops_editor(session) -> None:
                     changed.append(edited.iloc[idx])
             return pd.DataFrame(changed) if changed else pd.DataFrame()
 
-        _changed_df = _detect_changed_rows(_orig_df, _edited_df)
+        _changed_df = _detect_changed_rows(_filtered_orig, _edited_df)
         if not _changed_df.empty:
             st.info(f"{len(_changed_df)} row(s) changed or added.")
 
@@ -2500,6 +2523,60 @@ def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
                 st.session_state.scroll_to_top = True
                 st.rerun()
 
+def render_user_guide() -> None:
+    """Show the complete ForecastPro user guide without changing forecast state."""
+    st.markdown(
+        """<section class="guide-hero">
+        <div class="guide-eyebrow">ForecastPro AI · User Guide</div>
+        <div class="guide-title">From campaign selection to a saved forecast.</div>
+        <p class="guide-copy">Use this guide whenever you need a reminder of the workflow. It does not change campaign selections, historical inputs, or forecast calculations.</p>
+        </section>""",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class=\"guide-section-title\">Forecasting workflow</div>", unsafe_allow_html=True)
+    with st.expander("1. Select a campaign and projection setup", expanded=True):
+        st.markdown("""
+        Start on **Inputs** and select **Client Name**, **Campaign Name**, **Conversion Event**, and **Marketing Channel**. The choices come from approved multi-tenant historical data.
+
+        Then choose the **Projection Quarter** you want to forecast and **Using Data From** - the quarter that supplies the MailOps Max Reach and Signal Utilization planning inputs. Choose **Quarterly** for a single-quarter forecast or **Annual** for a four-quarter forecast, then select **Load Historical Data**.
+        """)
+    with st.expander("2. Select and confirm historical inputs"):
+        st.markdown("""
+        Review the available historical records and select the periods that best represent the expected campaign. You can choose up to four historical quarters.
+
+        The seasonal-index section shows Organic and Zeta-influenced Incremental conversion patterns by month and quarter. These indexes are used to split the forecast into quarterly and monthly outputs. Review the selections, then choose **Confirm Selected Historical Inputs**.
+        """)
+    with st.expander("3. Review MailOps delivery inputs"):
+        st.markdown("""
+        MailOps and media-plan values are populated from the **Using Data From** quarter. Review the delivery inputs before continuing.
+
+        Where appropriate, **Frequency at Max Reach** can be adjusted. A one-quarter range control appears only when the selected history is limited to a single applicable quarter; it adjusts the uncertainty range around the projected result.
+        """)
+    with st.expander("4. Review investment tiers and scenarios"):
+        st.markdown("""
+        The investment journey is calculated from **Current Investment** through **Optimal Scale** using the selected planning inputs and Signal Utilization. Current Investment and Optimal Scale remain fixed.
+
+        **Investment increase for each tier** controls the spacing of meaningful intermediate tiers. The tool will not allow a tier to exceed Optimal Scale or enter its high-utilization band. A large increase can therefore result in fewer intermediate tiers.
+
+        Use **Edit tiers manually** only for a deliberate business case; keep tiers in ascending order. **Reset** returns to the calculated tiers. Add optional adjustment scenarios when future performance is expected to improve or decline from the historical baseline.
+        """)
+    with st.expander("5. Create and review the forecast"):
+        st.markdown("""
+        Before selecting **Create Forecast Draft**, validate the selected history, MailOps inputs, tier setup, and adjustment scenarios. The forecast includes the baseline and each selected scenario across the available tiers.
+
+        Annual forecasts can be reviewed by scenario, then distributed into quarterly and monthly views using the seasonal indexes. Use charts for internal review and validation rather than as a client-facing deliverable.
+        """)
+    with st.expander("6. Save the final result to Snowflake"):
+        st.markdown("""
+        When the forecast has been reviewed and finalized, open **Save to Snowflake** and save the required outputs. Saved forecasts can be retrieved in future releases and compared with actual campaign performance.
+        """)
+    st.info("Tip: Inputs remains the default page so returning users can start forecasting immediately.")
+    if st.button("← Back to Inputs", key="_guide_back_to_inputs"):
+        st.session_state.show_user_guide = False
+        st.session_state.active_tab = 0
+        st.session_state.scroll_to_top = True
+        st.rerun()
+
 
 initialize_state()
 _should_scroll_to_top = st.session_state.pop("scroll_to_top", False)
@@ -2640,17 +2717,27 @@ _qa_tab_idx = len(tab_names) - 1
 if "active_tab" not in st.session_state or st.session_state.active_tab >= len(tab_names):
     st.session_state.active_tab = 0
 
-# Render tab bar as buttons
-tab_cols = st.columns(len(tab_names))
+# Render navigation with an optional User Guide before the working tabs.
+nav_cols = st.columns([1.25] + [1] * len(tab_names))
+with nav_cols[0]:
+    if st.button("✦ User Guide", key="_guide_nav_button", width="stretch",
+                 help="Open the ForecastPro user guide"):
+        st.session_state.show_user_guide = True
+        st.session_state.scroll_to_top = True
+        st.rerun()
 for i, name in enumerate(tab_names):
-    with tab_cols[i]:
+    with nav_cols[i + 1]:
         if st.button(name, key=f"tab_btn_{i}", width="stretch",
                      type="primary" if i == st.session_state.active_tab else "secondary"):
+            st.session_state.show_user_guide = False
             st.session_state.active_tab = i
             st.session_state.scroll_to_top = True
             st.rerun()
 
 st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
+if st.session_state.get("show_user_guide", False):
+    render_user_guide()
+    st.stop()
 active_tab = st.session_state.active_tab
 
 
@@ -4966,7 +5053,10 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
         """Format QA output presentation without altering QA calculations."""
         if value is None or pd.isna(value):
             return "—"
-        numeric_value = float(value)
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return str(value)
         if column == "Investment":
             return _fmt_dollar_commas(numeric_value)
         if column == "Delivered Volume":
@@ -5047,7 +5137,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
         {"Input": "One-Quarter Range Adjustment (%)", "Value": _qa_float(st.session_state.get("range_percent_input", 10))},
         {"Input": "Range Method", "Value": result.get("method", "—")},
     ]
-    st.dataframe(pd.DataFrame(qa_input_rows), hide_index=True, width="stretch")
+    _qa_render_table(pd.DataFrame(qa_input_rows), "qa_inputs")
 
     qa_tabs = st.tabs([*qa_quarters, "KPI Minimums", "KPI Maximums", "Final Ranges"])
     for qa_tab, quarter in zip(qa_tabs[:len(qa_quarters)], qa_quarters):
@@ -5068,19 +5158,18 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                 ]
             )
             with actual_tab:
-                st.dataframe(_qa_format_frame(_qa_actual_frame(quarter_rows)), hide_index=True, width="stretch")
+                _qa_render_table(_qa_actual_frame(quarter_rows), f"qa_{quarter}_actual")
             for scenario_tab, (scenario_name, scenario_factor, scenario_rows) in zip(
                 scenario_tabs, result.get("improvements", [])
             ):
                 with scenario_tab:
                     st.caption(f"Improvement factor: {float(scenario_factor) * 100:.1f}%")
-                    st.dataframe(
-                        _qa_format_frame(_qa_scenario_frame([
+                    _qa_render_table(
+                        _qa_scenario_frame([
                             row for row in scenario_rows
                             if row.historical_quarter == quarter
-                        ])),
-                        hide_index=True,
-                        width="stretch",
+                        ]),
+                        f"qa_{quarter}_{scenario_name}",
                     )
 
     qa_metric_fields = [
@@ -5117,10 +5206,10 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
 
     with qa_tabs[-3]:
         st.caption("Metric-by-metric minimum across the selected historical-quarter projection tables.")
-        st.dataframe(_qa_format_frame(_qa_bound_frame(min)), hide_index=True, width="stretch")
+        _qa_render_table(_qa_bound_frame(min), "qa_kpi_minimums")
     with qa_tabs[-2]:
         st.caption("Metric-by-metric maximum across the selected historical-quarter projection tables.")
-        st.dataframe(_qa_format_frame(_qa_bound_frame(max)), hide_index=True, width="stretch")
+        _qa_render_table(_qa_bound_frame(max), "qa_kpi_maximums")
     with qa_tabs[-1]:
         if result.get("method") == "single-quarter-exact":
             st.caption(
@@ -5140,8 +5229,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
         st.caption(
             f"Historic Prospect Frequency = {historical_frequency:.1f}x"
         )
-        st.dataframe(
-            _qa_format_frame(pd.DataFrame([
+        _qa_final_table = pd.DataFrame([
                 {
                     "Tier": row.tier_label,
                     "Investment": _qa_float(row.investment),
@@ -5155,10 +5243,8 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                     "iROAS Min": _qa_float(row.iroas.minimum),
                     "iROAS Max": _qa_float(row.iroas.maximum),
                 }
-                for row in result["ranges"]            ])),
-            hide_index=True,
-            width="stretch",
-        )
+                for row in result["ranges"]            ])
+        _qa_render_table(_qa_final_table, "qa_final_ranges")
 
     tab_nav_buttons(tab_names, _qa_tab_idx)
 
