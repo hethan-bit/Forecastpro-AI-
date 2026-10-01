@@ -647,8 +647,22 @@ def render_mailops_editor(session) -> None:
             st.warning("No rows found in this table.")
             return
 
+        # Quarter filter
+        _all_quarters = sorted(_orig_df["Quarter"].dropna().unique().tolist())
+        _quarter_options = ["All Quarters"] + _all_quarters
+        _selected_quarter = st.selectbox(
+            "Filter by Quarter",
+            _quarter_options,
+            key="_mo_quarter_filter",
+        )
+        if _selected_quarter != "All Quarters":
+            _filter_mask = _orig_df["Quarter"] == _selected_quarter
+            _filtered_orig = _orig_df[_filter_mask].reset_index(drop=True)
+        else:
+            _filtered_orig = _orig_df
+
         _edited_df = st.data_editor(
-            _orig_df,
+            _filtered_orig,
             hide_index=False,
             use_container_width=True,
             num_rows="dynamic",
@@ -679,7 +693,7 @@ def render_mailops_editor(session) -> None:
                     changed.append(edited.iloc[idx])
             return pd.DataFrame(changed) if changed else pd.DataFrame()
 
-        _changed_df = _detect_changed_rows(_orig_df, _edited_df)
+        _changed_df = _detect_changed_rows(_filtered_orig, _edited_df)
         if not _changed_df.empty:
             st.info(f"{len(_changed_df)} row(s) changed or added.")
 
