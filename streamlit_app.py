@@ -584,13 +584,9 @@ def render_mailops_editor(session) -> None:
         '<h1 class="hero-title">Edit MailOps Data</h1>',
         unsafe_allow_html=True,
     )
-    _top_cols = st.columns([2, 4, 2])
+    _view_label = "Single-Row Editor" if st.session_state.get("_mo_excel_view") else "Excel View"
+    _top_cols = st.columns([2, 6])
     with _top_cols[0]:
-        if st.button("Back to Forecast Engine", key="_mailops_back"):
-            st.session_state.mailops_mode = False
-            st.rerun()
-    with _top_cols[2]:
-        _view_label = "Single-Row Editor" if st.session_state.get("_mo_excel_view") else "Excel View"
         if st.button(_view_label, key="_mo_toggle_view"):
             st.session_state["_mo_excel_view"] = not st.session_state.get("_mo_excel_view", False)
             st.rerun()
@@ -1043,7 +1039,7 @@ def render_mailops_editor(session) -> None:
     _edited1 = st.data_editor(
         _df1,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         disabled=list(_DISPLAY_KEY_COLS),
         key="_mo_editor_1",
         column_config={
@@ -1054,7 +1050,7 @@ def render_mailops_editor(session) -> None:
     _edited2 = st.data_editor(
         _df2,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key="_mo_editor_2",
         column_config={
             "CPM": st.column_config.NumberColumn(format="%.2f"),
@@ -1202,8 +1198,86 @@ def sql_literal(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _query_cache_key(*parts) -> tuple[str, ...]:
+    return tuple("" if part is None else str(part) for part in parts)
+
+
+def _clear_query_cache(*, keep_account_options: bool = False) -> None:
+    """Remove query results when the authoritative selection changes."""
+    existing = st.session_state.get("_forecast_query_cache", {})
+    account_options = existing.get("account_options", {}) if keep_account_options else {}
+    st.session_state["_forecast_query_cache"] = {"account_options": account_options}
+
+
+def _cached_query(bucket: str, key: tuple[str, ...], loader):
+    """Reuse a Snowflake result only while its input dimensions are unchanged."""
+    cache = st.session_state.setdefault("_forecast_query_cache", {})
+    bucket_cache = cache.setdefault(bucket, {})
+    if key not in bucket_cache:
+        bucket_cache[key] = loader()
+    return bucket_cache[key]
+
+
+def _cached_account_dimensions(
+    session,
+    account_identifier: str,
+    sub_account: str | None = None,
+    event: str | None = None,
+):
+    return _cached_query(
+        "account_dimensions",
+        _query_cache_key(account_identifier, sub_account, event),
+        lambda: account_dimensions(
+            session, account_identifier, sub_account=sub_account, event=event
+        ),
+    )
+
+
+def _cached_planning_quarters(session, *args):
+    return _cached_query(
+        "planning_quarters",
+        _query_cache_key(*args),
+        lambda: planning_quarters(session, *args),
+    )
+
+
+def _cached_planning_input(session, *args):
+    return _cached_query(
+        "planning_input",
+        _query_cache_key(*args),
+        lambda: planning_input(session, *args),
+    )
+
+
+def _cached_seasonal_indexes(
+    session,
+    table_name: str,
+    attribution_window: int = 30,
+    account_name: str | None = None,
+    sub_account: str | None = None,
+    event: str | None = None,
+    channel: str | None = None,
+):
+    return _cached_query(
+        "seasonal_indexes",
+        _query_cache_key(
+            table_name, attribution_window, account_name, sub_account, event, channel
+        ),
+        lambda: seasonal_indexes(
+            session,
+            table_name,
+            attribution_window,
+            account_name=account_name,
+            sub_account=sub_account,
+            event=event,
+            channel=channel,
+        ),
+    )
+
+
 def reset_for_new_account() -> None:
     """Clear all app state so user can start fresh with a new account."""
+    _clear_query_cache()
     keys_to_clear = [
         "sources", "preview", "confirmed", "forecast",
         "planning_campaigns", "message", "source_account",
@@ -1241,6 +1315,7 @@ def reset_for_new_account() -> None:
 
 
 def reset_after_source() -> None:
+    _clear_query_cache(keep_account_options=True)
     st.session_state.pop("_widget_selected_source_v2", None)
     st.session_state.preview = []
     st.session_state.monthly_history = []
@@ -1264,6 +1339,7 @@ def reset_after_source() -> None:
 
 def clear_downstream_input_state() -> None:
     """Invalidate a loaded slice when any of its four identifying inputs changes."""
+    _clear_query_cache(keep_account_options=True)
     st.session_state.preview = []
     st.session_state.monthly_history = []
     st.session_state.confirmed = False
@@ -1286,6 +1362,7 @@ def _fmt_dollar_commas(v: float) -> str:
     return f"${v:,.0f}"
 
 def _fmt_compact_k(v: float) -> str:
+    """Format projected incremental customers with K/M suffixes, 1 decimal."""
     abs_v = abs(v)
     if abs_v >= 1_000_000:
         return f"{v/1_000_000:.1f}M"
@@ -1296,6 +1373,9 @@ def _fmt_compact_k(v: float) -> str:
 def _fmt_int(v: float) -> str:
     return f"{float(v):,.0f}"
 
+def _forecast_output_frame(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows)
+
 def _fmt_dollar_compact_m(v: float) -> str:
     abs_v = abs(v)
     if abs_v >= 1_000_000:
@@ -1305,12 +1385,11 @@ def _fmt_dollar_compact_m(v: float) -> str:
     return f"${v:.1f}"
 
 def _fmt_dollar_0(v: float) -> str:
-    abs_v = abs(v)
-    if abs_v >= 1_000_000:
-        return f"${v/1_000_000:.1f}M"
-    elif abs_v >= 1_000:
-        return f"${v/1_000:.1f}K"
-    return f"${v:.1f}"
+    return _fmt_dollar_compact_m(v)
+
+def _fmt_tier_compact(v: float) -> str:
+    """Full currency display used only for the investment tier scale."""
+    return "$" + "{:,.0f}".format(float(v))
 
 def _fmt_iroas(v: float) -> str:
     abs_v = abs(v)
@@ -1510,7 +1589,7 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         monthly_edited = st.data_editor(
             transposed_frame,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             disabled=["Metric", *[f"{quarter} Total" for quarter in QUARTER_MONTHS], "Overall Total"],
             key="monthly_seasonal_index_editor",
             column_config=seasonal_columns,
@@ -1541,7 +1620,7 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         st.dataframe(
             transposed_frame.style.apply(_total_column_shading, axis=0),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config=seasonal_columns,
         )
 
@@ -1593,10 +1672,13 @@ def scroll_page_to_top() -> None:
             main.scrollTop = 0;
             main.scrollTo({top: 0, left: 0, behavior: 'auto'});
           }
+          window.parent.scrollTo({top: 0, left: 0, behavior: 'auto'});
         };
         scrollToTop();
         window.parent.setTimeout(scrollToTop, 50);
-        window.parent.setTimeout(scrollToTop, 250);
+        window.parent.setTimeout(scrollToTop, 150);
+        window.parent.setTimeout(scrollToTop, 400);
+        window.parent.setTimeout(scrollToTop, 800);
         </script>
         """,
         height=0,
@@ -2393,6 +2475,8 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
 
 def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
     """Render Previous / Next navigation buttons at the bottom of a tab."""
+    if _should_scroll_to_top:
+        scroll_page_to_top()
     st.markdown("---")
     cols = st.columns([1, 8, 1])
     if current_index > 0:
@@ -2400,7 +2484,7 @@ def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
             if st.button(
                 f"⬅ Previous: {tab_names[current_index - 1]}",
                 key=f"prev_{current_index}",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state.active_tab = current_index - 1
                 st.session_state.scroll_to_top = True
@@ -2410,7 +2494,7 @@ def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
             if st.button(
                 f"Next: {tab_names[current_index + 1]} ➡",
                 key=f"next_{current_index}",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state.active_tab = current_index + 1
                 st.session_state.scroll_to_top = True
@@ -2418,7 +2502,8 @@ def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
 
 
 initialize_state()
-if st.session_state.pop("scroll_to_top", False):
+_should_scroll_to_top = st.session_state.pop("scroll_to_top", False)
+if _should_scroll_to_top:
     scroll_page_to_top()
 
 # --- Get session (simple — no caching, no health checks) ---
@@ -2509,8 +2594,10 @@ with title_col:
     )
 mailops_col, _spacer, reset_col = st.columns([2, 4, 2])
 with mailops_col:
-    if st.button("Change MailOps Data", key="_mailops_btn", help="Add MailOps data through this tool"):
-        st.session_state.mailops_mode = True
+    _mailops_active = st.session_state.get("mailops_mode", False)
+    _mailops_label = "Back to Forecast Engine" if _mailops_active else "Change MailOps Data"
+    if st.button(_mailops_label, key="_mailops_btn", help="Add MailOps data through this tool"):
+        st.session_state.mailops_mode = not _mailops_active
         st.rerun()
 with reset_col:
     if st.button("Start New Account", key="_reset_btn", help="Clear all state and start fresh for next account"):
@@ -2557,7 +2644,7 @@ if "active_tab" not in st.session_state or st.session_state.active_tab >= len(ta
 tab_cols = st.columns(len(tab_names))
 for i, name in enumerate(tab_names):
     with tab_cols[i]:
-        if st.button(name, key=f"tab_btn_{i}", use_container_width=True,
+        if st.button(name, key=f"tab_btn_{i}", width="stretch",
                      type="primary" if i == st.session_state.active_tab else "secondary"):
             st.session_state.active_tab = i
             st.session_state.scroll_to_top = True
@@ -2591,18 +2678,25 @@ if st.session_state.pop("_reset_input_widgets", False):
 if active_tab == 0:
     st.header("Select Campaign")
     st.caption("Select a campaign from the dropdown.")
-    account_rows = session.sql(f"""
-        SELECT DISTINCT CLIENT_NAME AS ACCT_NAME
-        FROM {REFERENCE_HISTORICAL_TABLE}
-        WHERE CLIENT_NAME IS NOT NULL
-          AND AGGREGATION_LEVEL = 'OVERALL'
-        ORDER BY CLIENT_NAME
-    """).collect()
-    all_account_options = sorted({
-        str(row["ACCT_NAME"]).strip()
-        for row in account_rows
-        if row["ACCT_NAME"] is not None
-    })
+    def _load_account_options():
+        account_rows = session.sql(f"""
+            SELECT DISTINCT CLIENT_NAME AS ACCT_NAME
+            FROM {REFERENCE_HISTORICAL_TABLE}
+            WHERE CLIENT_NAME IS NOT NULL
+              AND AGGREGATION_LEVEL = 'OVERALL'
+            ORDER BY CLIENT_NAME
+        """).collect()
+        return sorted({
+            str(row["ACCT_NAME"]).strip()
+            for row in account_rows
+            if row["ACCT_NAME"] is not None
+        })
+
+    all_account_options = _cached_query(
+        "account_options",
+        ("overall",),
+        _load_account_options,
+    )
     saved_account = st.session_state.get("source_account")
     # Returning from review/forecast must show the exact historical slice that
     # was confirmed, even if a dependent widget previously fell back to its
@@ -2633,7 +2727,7 @@ if active_tab == 0:
         campaign = st.session_state.get("selected_sub_account")
         if not account or not campaign:
             return []
-        rows = account_dimensions(session, account, sub_account=campaign)
+        rows = _cached_account_dimensions(session, account, sub_account=campaign)
         return sorted({
             (str(row.get("EVENT")).strip(), str(row.get("CHANNEL")).strip())
             for row in rows
@@ -2648,7 +2742,7 @@ if active_tab == 0:
         campaign = st.session_state.get("selected_sub_account")
         for event, channel in pairs:
             try:
-                if planning_quarters(session, account, campaign, event, channel):
+                if _cached_planning_quarters(session, account, campaign, channel):
                     return event, channel
             except Exception:
                 # If the planning lookup is unavailable, preserve the valid
@@ -2673,7 +2767,7 @@ if active_tab == 0:
         event = st.session_state.get("selected_event")
         if not account or not campaign or not event:
             return
-        rows = account_dimensions(
+        rows = _cached_account_dimensions(
             session, account, sub_account=campaign, event=event
         )
         channels = sorted({
@@ -2686,7 +2780,7 @@ if active_tab == 0:
         preferred_channel = channels[0]
         for channel in channels:
             try:
-                if planning_quarters(session, account, campaign, event, channel):
+                if _cached_planning_quarters(session, account, campaign, channel):
                     preferred_channel = channel
                     break
             except Exception:
@@ -2707,7 +2801,7 @@ if active_tab == 0:
         if not st.session_state.source_account:
             return
         try:
-            account_rows = account_dimensions(session, st.session_state.source_account)
+            account_rows = _cached_account_dimensions(session, st.session_state.source_account)
             campaigns = sorted({
                 str(row.get("SUB_ACCOUNT")).strip()
                 for row in account_rows
@@ -2772,7 +2866,7 @@ if active_tab == 0:
     base_dimensions = []
     if all_account_choice:
         try:
-            base_dimensions = account_dimensions(session, all_account_choice)
+            base_dimensions = _cached_account_dimensions(session, all_account_choice)
         except Exception as exc:
             st.warning(f"Account filters could not be loaded yet: {exc}")
     sub_options = sorted({
@@ -2811,7 +2905,7 @@ if active_tab == 0:
 
     event_dimensions = []
     if all_account_choice and sub_account_choice:
-        event_dimensions = account_dimensions(
+        event_dimensions = _cached_account_dimensions(
             session, all_account_choice, sub_account=sub_account_choice
         )
     event_options = sorted({
@@ -2840,7 +2934,7 @@ if active_tab == 0:
 
     channel_dimensions = []
     if all_account_choice and sub_account_choice and event_choice:
-        channel_dimensions = account_dimensions(
+        channel_dimensions = _cached_account_dimensions(
             session, all_account_choice,
             sub_account=sub_account_choice, event=event_choice,
         )
@@ -2873,7 +2967,7 @@ if active_tab == 0:
     )
     try:
         available_planning_quarters = (
-            planning_quarters(
+            _cached_planning_quarters(
                 session,
                 all_account_choice,
                 sub_account_choice,
@@ -3095,7 +3189,7 @@ if st.session_state.preview and active_tab == 0:
     edited = st.data_editor(
         display,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key=f"history_editor_{hash(str([r['campaign_quarter'] for r in _eligible_preview]))}",
         disabled=[column for column in display.columns if column != "Use"],
         column_config={
@@ -3142,7 +3236,7 @@ if st.session_state.preview and active_tab == 0:
     # user confirms it. Automatic values use the existing calculation; manual
     # values are an explicit analyst override.
     try:
-        automatic_indexes = seasonal_indexes(
+        automatic_indexes = _cached_seasonal_indexes(
             session,
             st.session_state.selected_source,
             st.session_state.get("attribution_window", 30),
@@ -3226,7 +3320,7 @@ if st.session_state.confirmed and active_tab == 1:
                 st.session_state.get("applied_planning_key") != planning_key
                 or st.session_state.signal_utilization > 1
             ):
-                values = planning_input(
+                values = _cached_planning_input(
                     session,
                     planning_quarter,
                     st.session_state.source_account,
@@ -3371,16 +3465,12 @@ if st.session_state.confirmed and active_tab == 1:
         "Optimal Scale": "The maximum calculated investment level supported by available reach and frequency assumptions.",
     }
 
-    if at_full_utilization:
-        # Keep Current Budget as the initial tier; derive Optimal Scale from
-        # Max Reach × Frequency ÷ 1,000 × CPM, matching Excel.
+    if at_full_utilization or high_utilization:
+        # Current Investment and Optimal Scale are fixed endpoints. There are
+        # no intermediate tiers once the account is already in the 90%+ range:
+        # intermediate tiers must never occupy the 91–100% Optimal band.
         labels = ["Current Investment", "Optimal Scale"]
         calculated_tier_values = [current_budget, max_investment]
-        minimum_tier_gap = 0.01
-    elif high_utilization:
-        midpoint = (current_budget + max_investment) / 2
-        labels = ["Current Investment", "Strategic Scale", "Optimal Scale"]
-        calculated_tier_values = [current_budget, midpoint, max_investment]
         minimum_tier_gap = 0.01
     else:
         interval = (max_investment - current_budget) / 5
@@ -3410,17 +3500,28 @@ if st.session_state.confirmed and active_tab == 1:
     tier_headroom = float(calculated_tier_values[-1]) - float(calculated_tier_values[0])
     has_tier_headroom = tier_headroom >= minimum_tier_gap
 
-    # Store individual adjustments for the editable middle tiers. Current Investment
-    # and Optimal Scale remain fixed reference points.
-    st.session_state.setdefault("tier_adjustments", {})
+    # Investment increase determines the fixed step between generated
+    # intermediate tiers. Current Investment and Optimal Scale always remain
+    # fixed; tiers are omitted rather than squeezed into the Optimal band.
     st.session_state.setdefault("manual_tier_mode", False)
     st.session_state.setdefault("manual_tier_values", {})
-    adjustment_key = "_tier_adjustment_step"
-    adjustment_version = "individual-tier-adjustment-v1"
-    if st.session_state.get("_tier_adjustment_mode") != adjustment_version:
-        st.session_state.tier_adjustments = {}
-        st.session_state[adjustment_key] = 50_000.0
-        st.session_state["_tier_adjustment_mode"] = adjustment_version
+    investment_increase_key = "_tier_adjustment_step"
+    has_adjustable_tier_range = (
+        len(calculated_tier_values) > 2
+        and not high_utilization
+        and not at_full_utilization
+    )
+
+    def _initial_investment_increase() -> float:
+        if not has_adjustable_tier_range:
+            return 0.0
+        span = float(calculated_tier_values[-1]) - float(calculated_tier_values[0])
+        return max(1_000.0, round(span / 5 / 1_000) * 1_000.0)
+
+    investment_increase_version = "investment-increase-per-tier-v2"
+    if st.session_state.get("_tier_adjustment_mode") != investment_increase_version:
+        st.session_state[investment_increase_key] = _initial_investment_increase()
+        st.session_state["_tier_adjustment_mode"] = investment_increase_version
 
     tier_scope_signature = (
         st.session_state.get("source_account"),
@@ -3440,8 +3541,7 @@ if st.session_state.confirmed and active_tab == 1:
         tuple(round(float(value), 6) for value in calculated_tier_values),
     )
     if st.session_state.get("tier_calculation_signature") != tier_calculation_signature:
-        st.session_state.tier_adjustments = {}
-        st.session_state[adjustment_key] = 50_000.0
+        st.session_state[investment_increase_key] = _initial_investment_increase()
         st.session_state.tier_calculation_signature = tier_calculation_signature
         if st.session_state.get("forecast") is not None:
             st.session_state.forecast = None
@@ -3465,41 +3565,45 @@ if st.session_state.confirmed and active_tab == 1:
         )
 
     def _reset_calculated_tiers() -> None:
-        st.session_state.tier_adjustments = {}
+        st.session_state[investment_increase_key] = _initial_investment_increase()
         _clear_stale_forecast(
             "Calculated tiers reset. Create a new forecast draft to update results."
         )
 
-    def _calculated_values_with_adjustments() -> list[float]:
-        values = [float(calculated_tier_values[0])]
-        for index in range(1, len(calculated_tier_values) - 1):
-            label = labels[index]
-            base_value = float(calculated_tier_values[index])
-            adjusted_value = base_value + float(
-                st.session_state.tier_adjustments.get(label, 0.0)
+    def _calculated_tier_plan() -> tuple[list[str], list[float]]:
+        """Build only meaningful tiers below the Optimal Scale utilization band."""
+        if not has_adjustable_tier_range:
+            return list(labels), [float(value) for value in calculated_tier_values]
+
+        current = float(calculated_tier_values[0])
+        optimal = float(calculated_tier_values[-1])
+        increase = float(
+            st.session_state.get(
+                investment_increase_key, _initial_investment_increase()
             )
-            values.append(_round_tier_investment(adjusted_value))
-        if len(calculated_tier_values) > 1:
-            values.append(float(calculated_tier_values[-1]))
-        return values
-
-    def _apply_tier_adjustment(tier_index: int, direction: int) -> None:
-        """Move exactly one editable tier by the selected manual adjustment step."""
-        if at_full_utilization or st.session_state.manual_tier_mode:
-            return
-        values = _calculated_values_with_adjustments()
-        if tier_index <= 0 or tier_index >= len(values) - 1:
-            return
-        step = float(st.session_state.get(adjustment_key, 50_000.0))
-        proposed = _round_tier_investment(values[tier_index] + direction * step)
-        if proposed <= values[tier_index - 1] or proposed >= values[tier_index + 1]:
-            return
-        st.session_state.tier_adjustments[labels[tier_index]] = (
-            proposed - float(calculated_tier_values[tier_index])
         )
-        _clear_stale_forecast("Tier adjustment applied. Create a new forecast draft.")
+        # A generated tier must stay at or below 90% utilization and leave at
+        # least one full investment increase before the fixed Optimal Scale.
+        intermediate_ceiling = min(optimal * 0.90, optimal - increase)
+        planned_labels = [labels[0]]
+        planned_values = [current]
 
-    control_edit, control_reset, control_step, _ = st.columns([2.1, 1.3, 3.5, 3.1])
+        for index, label in enumerate(labels[1:-1], start=1):
+            candidate = _round_tier_investment(current + (increase * index))
+            if (
+                candidate <= planned_values[-1] + minimum_tier_gap
+                or candidate > intermediate_ceiling + 0.01
+                or optimal - candidate + 0.01 < increase
+            ):
+                break
+            planned_labels.append(label)
+            planned_values.append(candidate)
+
+        planned_labels.append(labels[-1])
+        planned_values.append(optimal)
+        return planned_labels, planned_values
+
+    control_edit, control_reset, control_step = st.columns([1.8, 1.2, 2.5])
     with control_edit:
         st.markdown("<div style='height: 3.6rem'></div>", unsafe_allow_html=True)
         if at_full_utilization:
@@ -3518,7 +3622,7 @@ if st.session_state.confirmed and active_tab == 1:
                 st.rerun()
         else:
             if st.button("Edit tiers manually", key="edit_tiers_manually"):
-                current_values = _calculated_values_with_adjustments()
+                current_values = [float(value) for value in calculated_tier_values]
                 st.session_state.manual_tier_mode = True
                 st.session_state.manual_tier_values = {
                     label: float(value)
@@ -3540,29 +3644,57 @@ if st.session_state.confirmed and active_tab == 1:
             disabled=(
                 at_full_utilization
                 or st.session_state.manual_tier_mode
-                or not bool(st.session_state.tier_adjustments)
+                or not has_adjustable_tier_range
+                or abs(
+                    float(
+                        st.session_state.get(
+                            investment_increase_key,
+                            _initial_investment_increase(),
+                        )
+                    )
+                    - _initial_investment_increase()
+                ) < 0.01
             ),
-            help="Restore the original automatically calculated tier values.",
+            help="Restore the original calculated tier plan.",
         )
 
     with control_step:
-        st.markdown(
-            "<div class='adjustment-factor-label'>Adjustment Factor <span class='info-icon' title='Set the dollar amount used when adjusting an editable tier. Changing this value alone does not change a tier; use the tier − or + control to apply it.' aria-label='Adjustment Factor information'>i</span></div>",
-            unsafe_allow_html=True,
-        )
-        st.number_input(
-            "Adjustment factor",
-            min_value=1_000.0,
-            value=50_000.0,
-            step=10_000.0,
-            format="%.0f",
-            key=adjustment_key,
-            disabled=st.session_state.manual_tier_mode or at_full_utilization,
-            label_visibility="collapsed",
-            help="Enter the amount applied to an individual tier when its − or + button is selected. Changing this value alone does not change any tier.",
-        )
+        if has_adjustable_tier_range:
+            _tier_span = (
+                float(calculated_tier_values[-1])
+                - float(calculated_tier_values[0])
+            )
+            _max_increase = max(
+                1_000.0,
+                _round_tier_investment(_tier_span - minimum_tier_gap),
+            )
+            st.markdown(
+                '<div class="adjustment-factor-label">Investment increase for each tier '
+                '<span class="info-icon" title="Each generated intermediate tier increases by this amount. '
+                'Current Investment and Optimal Scale remain fixed. A tier is omitted when it would enter the '
+                '91–100% Optimal Scale utilization band or leave a smaller final increase." '
+                'aria-label="Investment increase information">i</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.number_input(
+                "Investment increase for each tier",
+                min_value=1_000.0,
+                max_value=float(_max_increase),
+                value=float(
+                    st.session_state.get(
+                        investment_increase_key,
+                        _initial_investment_increase(),
+                    )
+                ),
+                step=1_000.0,
+                format="%.0f",
+                key=investment_increase_key,
+                disabled=st.session_state.manual_tier_mode,
+                label_visibility="collapsed",
+            )
 
     show_expansion = True
+    tier_labels_for_forecast = list(labels)
     if st.session_state.manual_tier_mode and not at_full_utilization:
         st.caption("Manual values replace the calculated investment tiers for this forecast.")
         st.caption("Enter values in strictly increasing order from left to right.")
@@ -3597,28 +3729,28 @@ if st.session_state.confirmed and active_tab == 1:
                 "(the recommended value restores calculated headroom), or switch "
                 "to manual tier mode and enter a strictly increasing tier ladder."
             )
-        tier_values = _calculated_values_with_adjustments()
+        tier_labels_for_forecast, tier_values = _calculated_tier_plan()
+        if len(tier_labels_for_forecast) < len(labels):
+            st.info(
+                f"Investment increase of {money(st.session_state[investment_increase_key])} "
+                f"supports {len(tier_values)} meaningful tiers before Optimal Scale. "
+                "Additional tiers were omitted to avoid the 91–100% Optimal Scale band "
+                "or a smaller final increase."
+            )
         st.markdown("""<style>
-        .investment-journey-wrap{overflow-x:auto;padding:.25rem 0 .1rem}.investment-journey{min-width:820px;display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));position:relative;padding:.3rem 0}.investment-journey:before{content:'';position:absolute;left:8.3%;right:8.3%;top:4.35rem;height:2px;background:linear-gradient(90deg,#23496B,#2A9D8F,#0F9F7A);opacity:.42}.investment-stage{position:relative;z-index:1;text-align:center;font-family:Inter,Arial,sans-serif}.investment-stage-name{min-height:2rem;color:#64748B;font-size:.66rem;font-weight:800;letter-spacing:.075em;line-height:1.15;text-transform:uppercase}.investment-stage-value{margin:.2rem 0 .6rem;color:#172033;font-size:clamp(1.25rem,1.7vw,1.7rem);font-weight:750;letter-spacing:-.03em;white-space:nowrap}.investment-stage-node{width:.82rem;height:.82rem;margin:auto;border-radius:50%;background:#E2E8F0;border:3px solid #fff;box-shadow:0 0 0 1px #CBD5E1}.investment-stage.current .investment-stage-value{color:#23496B}.investment-stage.current .investment-stage-node{background:#23496B;box-shadow:0 0 0 1px #23496B}.investment-stage.optimal .investment-stage-value{color:#087F67}.investment-stage.optimal .investment-stage-node{width:1.06rem;height:1.06rem;margin-top:-.12rem;background:#0F9F7A;box-shadow:0 0 0 1px #0F9F7A,0 0 0 5px rgba(15,159,122,.12)}.investment-stage:nth-child(1) .investment-stage-value{color:#62A8D7!important}.investment-stage:nth-child(2) .investment-stage-value{color:#4D96CE!important}.investment-stage:nth-child(3) .investment-stage-value{color:#3C83BD!important}.investment-stage:nth-child(4) .investment-stage-value{color:#2D70A9!important}.investment-stage:nth-child(5) .investment-stage-value{color:#205D93!important}.investment-stage:nth-child(6) .investment-stage-value{color:#154B7F!important}.investment-stage-name .tier-info{display:inline-flex;align-items:center;justify-content:center;width:.82rem;height:.82rem;margin-left:.15rem;border:1px solid #94A3B8;border-radius:50%;color:#475569;font-size:.58rem;font-weight:800;text-transform:none;letter-spacing:0;vertical-align:middle;cursor:help}.investment-controls{min-width:820px;margin-top:.5rem}.investment-controls div[data-testid='stButton'] button{min-height:1.72rem;padding:0 .42rem;border:1px solid #D8E1EA;border-radius:999px;background:#fff;color:#465569;font-size:.85rem;box-shadow:none}.investment-controls div[data-testid='stButton'] button:hover:not(:disabled){border-color:#4AAE9B;color:#087F67;background:#F0FBF8}.investment-controls div[class*='st-key-decrease_tier_'] button{background:#EFF6FF;border-color:#BFDBFE;color:#2563EB}.investment-controls div[class*='st-key-decrease_tier_'] button:hover:not(:disabled){background:#DBEAFE;border-color:#93C5FD;color:#1D4ED8}.investment-controls div[class*='st-key-increase_tier_'] button{background:#ECFDF5;border-color:#A7F3D0;color:#059669}.investment-controls div[class*='st-key-increase_tier_'] button:hover:not(:disabled){background:#D1FAE5;border-color:#6EE7B7;color:#047857}.adjustment-factor-label{margin:0 0 .35rem;color:#374151;font-size:.72rem;font-weight:800;letter-spacing:.075em;text-transform:uppercase}.st-key-tier-decrease-wrap-1 button,.st-key-tier-decrease-wrap-2 button,.st-key-tier-decrease-wrap-3 button,.st-key-tier-decrease-wrap-4 button{background:#EAF4FF!important;border-color:#B6DAFE!important;color:#1D63B5!important}.st-key-tier-increase-wrap-1 button,.st-key-tier-increase-wrap-2 button,.st-key-tier-increase-wrap-3 button,.st-key-tier-increase-wrap-4 button{background:#E9FBF3!important;border-color:#A9E8CC!important;color:#07865D!important}.st-key-tier-decrease-wrap button,div[class*='decrease_tier'] button{background:#EAF4FF!important;border:1px solid #A9D5FF!important;color:#155E9E!important}.st-key-tier-increase-wrap button,div[class*='increase_tier'] button{background:#E9FBF3!important;border:1px solid #9DE3C6!important;color:#067653!important}@media(max-width:900px){.investment-journey,.investment-controls{min-width:720px}}</style>""",unsafe_allow_html=True)
+        .investment-journey-wrap{overflow-x:auto;padding:.25rem 0 .1rem}.investment-journey{min-width:var(--journey-min-width,820px);display:grid;grid-template-columns:repeat(var(--tier-count,6),minmax(120px,1fr));position:relative;padding:.3rem 0}.investment-journey:before{content:'';position:absolute;left:8.3%;right:8.3%;top:4.35rem;height:2px;background:linear-gradient(90deg,#23496B,#2A9D8F,#0F9F7A);opacity:.42}.investment-stage{position:relative;z-index:1;text-align:center;font-family:Inter,Arial,sans-serif}.investment-stage-name{min-height:2rem;color:#64748B;font-size:.66rem;font-weight:800;letter-spacing:.075em;line-height:1.15;text-transform:uppercase}.investment-stage-value{margin:.2rem 0 .6rem;color:#172033;font-size:clamp(1.25rem,1.7vw,1.7rem);font-weight:750;letter-spacing:-.03em;white-space:nowrap}.investment-stage-node{width:.82rem;height:.82rem;margin:auto;border-radius:50%;background:#E2E8F0;border:3px solid #fff;box-shadow:0 0 0 1px #CBD5E1}.investment-stage.current .investment-stage-value{color:#23496B}.investment-stage.current .investment-stage-node{background:#23496B;box-shadow:0 0 0 1px #23496B}.investment-stage.optimal .investment-stage-value{color:#087F67}.investment-stage.optimal .investment-stage-node{width:1.06rem;height:1.06rem;margin-top:-.12rem;background:#0F9F7A;box-shadow:0 0 0 1px #0F9F7A,0 0 0 5px rgba(15,159,122,.12)}.investment-stage:nth-child(1) .investment-stage-value{color:#62A8D7!important}.investment-stage:nth-child(2) .investment-stage-value{color:#4D96CE!important}.investment-stage:nth-child(3) .investment-stage-value{color:#3C83BD!important}.investment-stage:nth-child(4) .investment-stage-value{color:#2D70A9!important}.investment-stage:nth-child(5) .investment-stage-value{color:#205D93!important}.investment-stage:nth-child(6) .investment-stage-value{color:#154B7F!important}.investment-stage-name .tier-info{display:inline-flex;align-items:center;justify-content:center;width:.82rem;height:.82rem;margin-left:.15rem;border:1px solid #94A3B8;border-radius:50%;color:#475569;font-size:.58rem;font-weight:800;text-transform:none;letter-spacing:0;vertical-align:middle;cursor:help}.investment-controls{min-width:820px;margin-top:.5rem}.investment-controls div[data-testid='stButton'] button{min-height:1.72rem;padding:0 .42rem;border:1px solid #D8E1EA;border-radius:999px;background:#fff;color:#465569;font-size:.85rem;box-shadow:none}.investment-controls div[data-testid='stButton'] button:hover:not(:disabled){border-color:#4AAE9B;color:#087F67;background:#F0FBF8}.investment-controls div[class*='st-key-decrease_tier_'] button{background:#EFF6FF;border-color:#BFDBFE;color:#2563EB}.investment-controls div[class*='st-key-decrease_tier_'] button:hover:not(:disabled){background:#DBEAFE;border-color:#93C5FD;color:#1D4ED8}.investment-controls div[class*='st-key-increase_tier_'] button{background:#ECFDF5;border-color:#A7F3D0;color:#059669}.investment-controls div[class*='st-key-increase_tier_'] button:hover:not(:disabled){background:#D1FAE5;border-color:#6EE7B7;color:#047857}.adjustment-factor-label{margin:0 0 .35rem;color:#374151;font-size:.72rem;font-weight:800;letter-spacing:.075em;text-transform:uppercase}.st-key-tier-decrease-wrap-1 button,.st-key-tier-decrease-wrap-2 button,.st-key-tier-decrease-wrap-3 button,.st-key-tier-decrease-wrap-4 button{background:#EAF4FF!important;border-color:#B6DAFE!important;color:#1D63B5!important}.st-key-tier-increase-wrap-1 button,.st-key-tier-increase-wrap-2 button,.st-key-tier-increase-wrap-3 button,.st-key-tier-increase-wrap-4 button{background:#E9FBF3!important;border-color:#A9E8CC!important;color:#07865D!important}.st-key-tier-decrease-wrap button,div[class*='decrease_tier'] button{background:#EAF4FF!important;border:1px solid #A9D5FF!important;color:#155E9E!important}.st-key-tier-increase-wrap button,div[class*='increase_tier'] button{background:#E9FBF3!important;border:1px solid #9DE3C6!important;color:#067653!important}@media(max-width:900px){.investment-journey,.investment-controls{min-width:720px}}</style>""",unsafe_allow_html=True)
+        st.markdown("<style>.investment-journey:before,.investment-stage-node{display:none!important}.investment-journey{padding:.05rem 0!important}.investment-stage-value{margin:.25rem 0!important}</style>",unsafe_allow_html=True)
         _journey_markup=[]
-        for index,(label,value) in enumerate(zip(labels,tier_values)):
+        for index,(label,value) in enumerate(zip(tier_labels_for_forecast,tier_values)):
             _stage="current" if index==0 else "optimal" if index==len(tier_values)-1 else "middle"
-            _journey_markup.append(f'<div class="investment-stage {_stage}"><div class="investment-stage-name">{label} <span class="tier-info" title="{tier_help.get(label, "Calculated investment tier.")}" aria-label="Tier information">i</span></div><div class="investment-stage-value">{money(value)}</div><div class="investment-stage-node"></div></div>')
-        st.markdown('<div class="investment-journey-wrap"><div class="investment-journey">'+''.join(_journey_markup)+'</div></div>',unsafe_allow_html=True)
-        st.markdown('<div class="investment-journey-wrap investment-controls">',unsafe_allow_html=True)
-        tier_control_columns=st.columns(len(tier_values),gap="small")
-        for index,(label,value) in enumerate(zip(labels,tier_values)):
-            with tier_control_columns[index]:
-                if 0<index<len(tier_values)-1:
-                    minus_col,plus_col=st.columns(2,gap="small")
-                    adjustment_value=float(st.session_state.get(adjustment_key,50_000.0))
-                    with minus_col:
-                        with st.container(key=f"tier-decrease-wrap-{index}"):
-                            st.button("−",key=f"decrease_tier_{index}",on_click=_apply_tier_adjustment,args=(index,-1),disabled=value-adjustment_value<=tier_values[index-1],use_container_width=True)
-                    with plus_col:
-                        with st.container(key=f"tier-increase-wrap-{index}"):
-                            st.button("+",key=f"increase_tier_{index}",on_click=_apply_tier_adjustment,args=(index,1),disabled=value+adjustment_value>=tier_values[index+1],use_container_width=True)
-        st.markdown('</div>',unsafe_allow_html=True)
+            _journey_markup.append(f'<div class="investment-stage {_stage}"><div class="investment-stage-name">{label} <span class="tier-info" title="{tier_help.get(label, "Calculated investment tier.")}" aria-label="Tier information">i</span></div><div class="investment-stage-value">{_fmt_tier_compact(value)}</div><div class="investment-stage-node"></div></div>')
+        st.markdown(
+            '<div class="investment-journey-wrap"><div class="investment-journey" '
+            f'style="--tier-count:{len(tier_values)};--journey-min-width:{max(420, len(tier_values) * 140)}px">'
+            + ''.join(_journey_markup)
+            + '</div></div>',
+            unsafe_allow_html=True,
+        )
     st.divider()
 
     # --- Improvement Scenarios ---
@@ -3739,7 +3871,7 @@ if st.session_state.confirmed and active_tab == 1:
         calculate = st.form_submit_button(
             "Create forecast draft",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=not forecast_ready,
         )
 
@@ -3755,7 +3887,7 @@ if st.session_state.confirmed and active_tab == 1:
                 Decimal(str(frequency_at_max)),
                 tuple(
                     InvestmentTier(label, Decimal(str(round(val, 2))))
-                    for label, val in zip(labels, tier_values)
+                    for label, val in zip(tier_labels_for_forecast, tier_values)
                 ),
                 tuple(
                     HistoricalPerformance(
@@ -3824,7 +3956,7 @@ if st.session_state.forecast and active_tab == 2:
 
     try:
         _idx_session = get_session()
-        st.session_state["_cached_indexes"] = effective_monthly_indexes(seasonal_indexes(
+        st.session_state["_cached_indexes"] = effective_monthly_indexes(_cached_seasonal_indexes(
             _idx_session,
             st.session_state.selected_source,
             attribution_window=st.session_state.get("attribution_window", 30),
@@ -3923,7 +4055,7 @@ if st.session_state.forecast and active_tab == 2:
                  else "—"}
             for row in visible_ranges
         ])
-        st.dataframe(range_frame, hide_index=True, use_container_width=True, height=(len(range_frame) + 1) * 31 + 3)
+        st.dataframe(range_frame, hide_index=True, use_container_width=True)
 
     # --- Sub-content depends on projection mode ---
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
@@ -4000,7 +4132,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
                 })
             if scenario_rows:
-                st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True, height=(len(scenario_rows) + 1) * 31 + 3)
+                st.dataframe(_forecast_output_frame(scenario_rows), hide_index=True, use_container_width=True)
 
     if _is_quarterly_mode:
         # Quarterly mode: improvement scenarios inline with simple headers
@@ -4039,7 +4171,7 @@ if st.session_state.forecast and active_tab == 2:
              "% Utilization": f"{_sig_util_all.get(row.tier_label, 0):.0f}%"}
             for row in visible_ranges
         ])
-        st.dataframe(annual_frame, hide_index=True, use_container_width=True, height=(len(annual_frame) + 1) * 31 + 3)
+        st.dataframe(annual_frame, hide_index=True, use_container_width=True)
 
         # Annual improvement scenarios
         _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
@@ -4093,7 +4225,7 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_all.get(tier_label, 0):.0f}%",
                 })
             if imp_rows:
-                st.dataframe(pd.DataFrame(imp_rows), hide_index=True, use_container_width=True, height=(len(imp_rows) + 1) * 31 + 3)
+                st.dataframe(_forecast_output_frame(imp_rows), hide_index=True, use_container_width=True)
 
 
     _render_download_button("tab3a")
@@ -4158,7 +4290,7 @@ if (st.session_state.forecast
 
     try:
         session = get_session()
-        indexes = effective_monthly_indexes(seasonal_indexes(
+        indexes = effective_monthly_indexes(_cached_seasonal_indexes(
             session,
             st.session_state.selected_source,
             attribution_window=st.session_state.get("attribution_window", 30),
@@ -4212,42 +4344,7 @@ if (st.session_state.forecast
                     "iROAS": _range_str(_tot_rmin / _tot_inv if _tot_inv > 0 else 0, _tot_rmax / _tot_inv if _tot_inv > 0 else 0, _fmt_iroas),
                     "% Utilization": "",
                 })
-                _df_qs = pd.DataFrame(tier_qtr_rows)
-                def _qs_total_highlight(row):
-                    if row["Quarter"] == "Annual Total":
-                        return ["background-color: #DDEBF7; font-weight: 700"] * len(row)
-                    return [""] * len(row)
-                st.dataframe(_df_qs.style.apply(_qs_total_highlight, axis=1), hide_index=True, use_container_width=True, height=(len(tier_qtr_rows) + 1) * 31 + 3)
-        else:
-            for _rq_label in _rq_ui:
-                q_key = _q_key_fn(_rq_label)
-                o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
-                i_pct = indexes["quarterly_incremental"].get(q_key, 0.25)
-                st.subheader(_rq_label)
-                qtr_rows = []
-                for r in visible_ranges:
-                    label = r.tier_label
-                    inv = float(r.investment) * 4 * o_pct
-                    delivered = float(r.delivered_volume) * 4 * o_pct
-                    cust_min = float(r.incremental_customers.minimum) * 4 * i_pct * _imp_mult
-                    cust_max = float(r.incremental_customers.maximum) * 4 * i_pct * _imp_mult
-                    rev_min = float(r.incremental_revenue.minimum) * 4 * i_pct * _imp_mult
-                    rev_max = float(r.incremental_revenue.maximum) * 4 * i_pct * _imp_mult
-                    cpix_min = inv / cust_max if cust_max > 0 else 0
-                    cpix_max = inv / cust_min if cust_min > 0 else 0
-                    iroas_min = rev_min / inv if inv > 0 else 0
-                    iroas_max = rev_max / inv if inv > 0 else 0
-                    qtr_rows.append({
-                        "Tier": label,
-                        "Investment": _fmt_dollar_commas(inv),
-                        "Delivered": _fmt_int(delivered),
-                        "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
-                        "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
-                        "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
-                        "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
-                        "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
-                    })
-                st.dataframe(pd.DataFrame(qtr_rows), hide_index=True, use_container_width=True, height=(len(qtr_rows) + 1) * 31 + 3)
+            st.dataframe(_forecast_output_frame(qtr_rows), hide_index=True, use_container_width=True)
     except Exception as exc:
         st.warning(f"Could not compute quarterly split: {exc}")
 
@@ -4319,7 +4416,7 @@ if (st.session_state.forecast
 
     try:
         session = get_session()
-        indexes = effective_monthly_indexes(seasonal_indexes(
+        indexes = effective_monthly_indexes(_cached_seasonal_indexes(
             session,
             st.session_state.selected_source,
             attribution_window=st.session_state.get("attribution_window", 30),
@@ -4346,7 +4443,8 @@ if (st.session_state.forecast
                     inc_sum = sum(indexes["monthly_incremental"].get(m, 1/12) for m in months)
                     q_org = indexes["quarterly_organic"].get(_qk, 0.25)
                     q_inc = indexes["quarterly_incremental"].get(_qk, 0.25)
-                    _qt_inv = _qt_del = _qt_cmin = _qt_cmax = _qt_rmin = _qt_rmax = 0.0
+                    _qt_inv = _qt_del = _qt_prosp = 0.0
+                    _qt_cmin = _qt_cmax = _qt_rmin = _qt_rmax = 0.0
                     for month in months:
                         org_pct = q_org * (indexes["monthly_organic"].get(month, 1/12) / org_sum) if org_sum else q_org / 3
                         inc_pct = q_inc * (indexes["monthly_incremental"].get(month, 1/12) / inc_sum) if inc_sum else q_inc / 3
@@ -4360,7 +4458,7 @@ if (st.session_state.forecast
                         cpix_max = inv / cust_min if cust_min > 0 else 0
                         iroas_min = rev_min / inv if inv > 0 else 0
                         iroas_max = rev_max / inv if inv > 0 else 0
-                        _qt_inv += inv; _qt_del += delivered
+                        _qt_inv += inv; _qt_del += delivered; _qt_prosp += prospects
                         _qt_cmin += cust_min; _qt_cmax += cust_max
                         _qt_rmin += rev_min; _qt_rmax += rev_max
                         tier_month_rows.append({
@@ -4373,37 +4471,27 @@ if (st.session_state.forecast
                             "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                             "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                         })
-                    _an_inv += _qt_inv; _an_del += _qt_del
-                    _an_cmin += _qt_cmin; _an_cmax += _qt_cmax
-                    _an_rmin += _qt_rmin; _an_rmax += _qt_rmax
+                    _qt_cpix_min = _qt_inv / _qt_cmax if _qt_cmax > 0 else 0
+                    _qt_cpix_max = _qt_inv / _qt_cmin if _qt_cmin > 0 else 0
+                    _qt_iroas_min = _qt_rmin / _qt_inv if _qt_inv > 0 else 0
+                    _qt_iroas_max = _qt_rmax / _qt_inv if _qt_inv > 0 else 0
                     tier_month_rows.append({
                         "Month": f"{_ql} Total",
                         "Investment": _fmt_dollar_commas(_qt_inv),
-                        "Delivered": _fmt_int(_qt_del),
+                        "Delivered": f"{_qt_del:,.0f}",
+                        "Prospects": f"{_qt_prosp:,.0f}",
                         "Inc. Cust": _range_str(_qt_cmin, _qt_cmax, _fmt_compact_k),
                         "Inc. Rev": _range_str(_qt_rmin, _qt_rmax, _fmt_dollar_compact_m),
-                        "CPIx": _range_str(_qt_inv / _qt_cmax if _qt_cmax > 0 else 0, _qt_inv / _qt_cmin if _qt_cmin > 0 else 0, _fmt_dollar_0),
-                        "iROAS": _range_str(_qt_rmin / _qt_inv if _qt_inv > 0 else 0, _qt_rmax / _qt_inv if _qt_inv > 0 else 0, _fmt_iroas),
-                        "% Utilization": "",
+                        "CPIx": _range_str(_qt_cpix_min, _qt_cpix_max, _fmt_dollar_0),
+                        "iROAS": _range_str(_qt_iroas_min, _qt_iroas_max, _fmt_iroas),
+                        "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
-                tier_month_rows.append({
-                    "Month": "Annual Total",
-                    "Investment": _fmt_dollar_commas(_an_inv),
-                    "Delivered": _fmt_int(_an_del),
-                    "Inc. Cust": _range_str(_an_cmin, _an_cmax, _fmt_compact_k),
-                    "Inc. Rev": _range_str(_an_rmin, _an_rmax, _fmt_dollar_compact_m),
-                    "CPIx": _range_str(_an_inv / _an_cmax if _an_cmax > 0 else 0, _an_inv / _an_cmin if _an_cmin > 0 else 0, _fmt_dollar_0),
-                    "iROAS": _range_str(_an_rmin / _an_inv if _an_inv > 0 else 0, _an_rmax / _an_inv if _an_inv > 0 else 0, _fmt_iroas),
-                    "% Utilization": "",
-                })
-                _df_am = pd.DataFrame(tier_month_rows)
-                def _am_total_highlight(row):
-                    if row["Month"] == "Annual Total":
-                        return ["background-color: #DDEBF7; font-weight: 700"] * len(row)
-                    if str(row["Month"]).endswith("Total"):
-                        return ["background-color: #E2F0D9; font-weight: 700"] * len(row)
+                _am_df = _forecast_output_frame(tier_month_rows)
+                def _highlight_q_total(row):
+                    if "Total" in str(row["Month"]):
+                        return ["background-color: #d4edda; font-weight: bold"] * len(row)
                     return [""] * len(row)
-                st.dataframe(_df_am.style.apply(_am_total_highlight, axis=1), hide_index=True, use_container_width=True, height=(len(tier_month_rows) + 1) * 31 + 3)
+                st.dataframe(_am_df.style.apply(_highlight_q_total, axis=1), hide_index=True, use_container_width=True)
         else:
             _rq_ms2 = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
             for _ql2 in _rq_ms2:
@@ -4445,7 +4533,7 @@ if (st.session_state.forecast
                             "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                             "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                         })
-                    st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
+                    st.dataframe(_forecast_output_frame(month_rows), hide_index=True, use_container_width=True)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -4526,7 +4614,7 @@ if (st.session_state.forecast
 
     try:
         session = get_session()
-        indexes = effective_monthly_indexes(seasonal_indexes(
+        indexes = effective_monthly_indexes(_cached_seasonal_indexes(
             session,
             st.session_state.selected_source,
             attribution_window=st.session_state.get("attribution_window", 30),
@@ -4547,7 +4635,8 @@ if (st.session_state.forecast
                 label = r.tier_label
                 st.subheader(f"{label} ({_fmt_dollar_commas(float(r.investment))})")
                 tier_month_rows = []
-                _qt_inv = _qt_del = _qt_cmin = _qt_cmax = _qt_rmin = _qt_rmax = 0.0
+                _t_inv = _t_del = _t_prosp = 0.0
+                _t_cmin = _t_cmax = _t_rmin = _t_rmax = 0.0
                 for month in _proj_months:
                     m_org_pct = indexes["monthly_organic"].get(month, 1/12) / org_sum if org_sum else 1/3
                     m_inc_pct = indexes["monthly_incremental"].get(month, 1/12) / inc_sum if inc_sum else 1/3
@@ -4561,9 +4650,9 @@ if (st.session_state.forecast
                     cpix_max = inv / cust_min if cust_min > 0 else 0
                     iroas_min = rev_min / inv if inv > 0 else 0
                     iroas_max = rev_max / inv if inv > 0 else 0
-                    _qt_inv += inv; _qt_del += delivered
-                    _qt_cmin += cust_min; _qt_cmax += cust_max
-                    _qt_rmin += rev_min; _qt_rmax += rev_max
+                    _t_inv += inv; _t_del += delivered; _t_prosp += prospects
+                    _t_cmin += cust_min; _t_cmax += cust_max
+                    _t_rmin += rev_min; _t_rmax += rev_max
                     tier_month_rows.append({
                         "Month": month,
                         "Investment": _fmt_dollar_commas(inv),
@@ -4574,22 +4663,27 @@ if (st.session_state.forecast
                         "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                         "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
+                _qt_cpix_min = _t_inv / _t_cmax if _t_cmax > 0 else 0
+                _qt_cpix_max = _t_inv / _t_cmin if _t_cmin > 0 else 0
+                _qt_iroas_min = _t_rmin / _t_inv if _t_inv > 0 else 0
+                _qt_iroas_max = _t_rmax / _t_inv if _t_inv > 0 else 0
                 tier_month_rows.append({
                     "Month": "Quarter Total",
-                    "Investment": _fmt_dollar_commas(_qt_inv),
-                    "Delivered": _fmt_int(_qt_del),
-                    "Inc. Cust": _range_str(_qt_cmin, _qt_cmax, _fmt_compact_k),
-                    "Inc. Rev": _range_str(_qt_rmin, _qt_rmax, _fmt_dollar_compact_m),
-                    "CPIx": _range_str(_qt_inv / _qt_cmax if _qt_cmax > 0 else 0, _qt_inv / _qt_cmin if _qt_cmin > 0 else 0, _fmt_dollar_0),
-                    "iROAS": _range_str(_qt_rmin / _qt_inv if _qt_inv > 0 else 0, _qt_rmax / _qt_inv if _qt_inv > 0 else 0, _fmt_iroas),
-                    "% Utilization": "",
+                    "Investment": _fmt_dollar_commas(_t_inv),
+                    "Delivered": f"{_t_del:,.0f}",
+                    "Prospects": f"{_t_prosp:,.0f}",
+                    "Inc. Cust": _range_str(_t_cmin, _t_cmax, _fmt_compact_k),
+                    "Inc. Rev": _range_str(_t_rmin, _t_rmax, _fmt_dollar_compact_m),
+                    "CPIx": _range_str(_qt_cpix_min, _qt_cpix_max, _fmt_dollar_0),
+                    "iROAS": _range_str(_qt_iroas_min, _qt_iroas_max, _fmt_iroas),
+                    "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                 })
-                _df_qm = pd.DataFrame(tier_month_rows)
-                def _qm_total_highlight(row):
-                    if str(row["Month"]).endswith("Total"):
-                        return ["background-color: #E2F0D9; font-weight: 700"] * len(row)
+                _qm_df = _forecast_output_frame(tier_month_rows)
+                def _highlight_total(row):
+                    if row["Month"] == "Quarter Total":
+                        return ["background-color: #d4edda; font-weight: bold"] * len(row)
                     return [""] * len(row)
-                st.dataframe(_df_qm.style.apply(_qm_total_highlight, axis=1), hide_index=True, use_container_width=True, height=(len(tier_month_rows) + 1) * 31 + 3)
+                st.dataframe(_qm_df.style.apply(_highlight_total, axis=1), hide_index=True, use_container_width=True)
         else:
             for month in _proj_months:
                 org_pct = indexes["monthly_organic"].get(month, 1/12) / org_sum if org_sum else 1/3
@@ -4642,7 +4736,8 @@ if (st.session_state.forecast
                         "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
 
-                st.dataframe(pd.DataFrame(month_rows), hide_index=True, use_container_width=True, height=(len(month_rows) + 1) * 31 + 3)
+                _mm_df = _forecast_output_frame(month_rows)
+                st.dataframe(_mm_df, hide_index=True, use_container_width=True)
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -4710,7 +4805,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     )
     st.altair_chart(
         (_v_rules + cpix_band + cpix_line).properties(title="CPIx increases as investment exceeds Optimal Scale", height=380),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.divider()
@@ -4729,7 +4824,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     )
     st.altair_chart(
         (_v_rules + iroas_band + iroas_line).properties(title="iROAS declines with diminishing returns at higher investment", height=380),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.divider()
@@ -4748,7 +4843,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     )
     st.altair_chart(
         (_v_rules + cust_band + cust_line).properties(title="Customer growth flattens beyond Optimal Scale (decay curve effect)", height=380),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.divider()
@@ -4767,7 +4862,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
     )
     st.altair_chart(
         (_v_rules + rev_band + rev_line).properties(title="Revenue growth mirrors customer decay at higher tiers", height=380),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.divider()
@@ -4780,14 +4875,14 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
         y=alt.Y("Delivered:Q", title="Delivered Volume", axis=alt.Axis(format="~s")),
         tooltip=["Tier", alt.Tooltip("Delivered:Q", format=",.0f"), alt.Tooltip("Investment:Q", format="$,.0f")],
     ).properties(title="Delivered Volume (scales linearly with investment)", height=350)
-    vol_col.altair_chart(vol_chart, use_container_width=True)
+    vol_col.altair_chart(vol_chart, width="stretch")
 
     pros_chart = alt.Chart(chart_df).mark_bar(color="#f59e0b", opacity=0.8).encode(
         x=_x_axis,
         y=alt.Y("Prospects:Q", title="Prospects", axis=alt.Axis(format="~s")),
         tooltip=["Tier", alt.Tooltip("Prospects:Q", format=",.0f"), alt.Tooltip("Investment:Q", format="$,.0f")],
     ).properties(title="Prospects (scales linearly — not curve-affected)", height=350)
-    pros_col.altair_chart(pros_chart, use_container_width=True)
+    pros_col.altair_chart(pros_chart, width="stretch")
 
     st.divider()
 
@@ -4810,7 +4905,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
         ), title="Type"),
         tooltip=["Tier", alt.Tooltip("Investment:Q", format="$,.0f"), "Tier Type"],
     ).properties(title="Investment tiers — standard (blue) vs extension (orange)", height=380)
-    st.altair_chart(invest_chart, use_container_width=True)
+    st.altair_chart(invest_chart, width="stretch")
 
     # Export charts as PNG for the Excel workbook
     _chart_images = []
@@ -4867,13 +4962,42 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
     def _qa_float(value):
         return float(value) if value is not None else None
 
+    def _qa_display(value, column: str) -> str:
+        """Format QA output presentation without altering QA calculations."""
+        if value is None or pd.isna(value):
+            return "—"
+        numeric_value = float(value)
+        if column == "Investment":
+            return _fmt_dollar_commas(numeric_value)
+        if column == "Delivered Volume":
+            return number(numeric_value)
+        if "Customers" in column:
+            return _fmt_compact_k(numeric_value)
+        if "Revenue" in column:
+            return _fmt_dollar_compact_m(numeric_value)
+        if "Signal Utilization" in column:
+            return f"{numeric_value:.1%}"
+        if "CPIx" in column or "iROAS" in column:
+            return _fmt_iroas(numeric_value)
+        if column == "Adjustment Factor":
+            return f"{numeric_value:,.1f}"
+        return f"{numeric_value:,.1f}"
+
+    def _qa_format_frame(frame: pd.DataFrame) -> pd.DataFrame:
+        formatted = frame.copy()
+        for column in formatted.columns:
+            if column != "Tier":
+                formatted[column] = formatted[column].map(
+                    lambda value, col=column: _qa_display(value, col)
+                )
+        return formatted
+
     def _qa_actual_frame(rows):
         return pd.DataFrame([
             {
                 "Tier": row.tier_label,
                 "Investment": _qa_float(row.investment),
                 "Delivered Volume": _qa_float(row.delivered_volume),
-                "Prospects": _qa_float(row.prospects),
                 "Inc. Customers": _qa_float(row.incremental_customers),
                 "Incremental Revenue": _qa_float(row.incremental_revenue),
                 "CPIx": _qa_float(row.cpix),
@@ -4923,7 +5047,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
         {"Input": "One-Quarter Range Adjustment (%)", "Value": _qa_float(st.session_state.get("range_percent_input", 10))},
         {"Input": "Range Method", "Value": result.get("method", "—")},
     ]
-    st.dataframe(pd.DataFrame(qa_input_rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(qa_input_rows), hide_index=True, width="stretch")
 
     qa_tabs = st.tabs([*qa_quarters, "KPI Minimums", "KPI Maximums", "Final Ranges"])
     for qa_tab, quarter in zip(qa_tabs[:len(qa_quarters)], qa_quarters):
@@ -4944,25 +5068,24 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                 ]
             )
             with actual_tab:
-                st.dataframe(_qa_actual_frame(quarter_rows), hide_index=True, use_container_width=True)
+                st.dataframe(_qa_format_frame(_qa_actual_frame(quarter_rows)), hide_index=True, width="stretch")
             for scenario_tab, (scenario_name, scenario_factor, scenario_rows) in zip(
                 scenario_tabs, result.get("improvements", [])
             ):
                 with scenario_tab:
                     st.caption(f"Improvement factor: {float(scenario_factor) * 100:.1f}%")
                     st.dataframe(
-                        _qa_scenario_frame([
+                        _qa_format_frame(_qa_scenario_frame([
                             row for row in scenario_rows
                             if row.historical_quarter == quarter
-                        ]),
+                        ])),
                         hide_index=True,
-                        use_container_width=True,
+                        width="stretch",
                     )
 
     qa_metric_fields = [
         ("Investment", "investment"),
         ("Delivered Volume", "delivered_volume"),
-        ("Prospects", "prospects"),
         ("Inc. Customers", "incremental_customers"),
         ("Incremental Revenue", "incremental_revenue"),
         ("CPIx", "cpix"),
@@ -4994,10 +5117,10 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
 
     with qa_tabs[-3]:
         st.caption("Metric-by-metric minimum across the selected historical-quarter projection tables.")
-        st.dataframe(_qa_bound_frame(min), hide_index=True, use_container_width=True)
+        st.dataframe(_qa_format_frame(_qa_bound_frame(min)), hide_index=True, width="stretch")
     with qa_tabs[-2]:
         st.caption("Metric-by-metric maximum across the selected historical-quarter projection tables.")
-        st.dataframe(_qa_bound_frame(max), hide_index=True, use_container_width=True)
+        st.dataframe(_qa_format_frame(_qa_bound_frame(max)), hide_index=True, width="stretch")
     with qa_tabs[-1]:
         if result.get("method") == "single-quarter-exact":
             st.caption(
@@ -5018,12 +5141,11 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
             f"Historic Prospect Frequency = {historical_frequency:.1f}x"
         )
         st.dataframe(
-            pd.DataFrame([
+            _qa_format_frame(pd.DataFrame([
                 {
                     "Tier": row.tier_label,
                     "Investment": _qa_float(row.investment),
                     "Delivered Volume": _qa_float(row.delivered_volume),
-                    "Prospects": _qa_float(row.prospects),
                     "Inc. Customers Min": _qa_float(row.incremental_customers.minimum),
                     "Inc. Customers Max": _qa_float(row.incremental_customers.maximum),
                     "Incremental Revenue Min": _qa_float(row.incremental_revenue.minimum),
@@ -5033,9 +5155,9 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                     "iROAS Min": _qa_float(row.iroas.minimum),
                     "iROAS Max": _qa_float(row.iroas.maximum),
                 }
-                for row in result["ranges"]            ]),
+                for row in result["ranges"]            ])),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     tab_nav_buttons(tab_names, _qa_tab_idx)
@@ -5073,20 +5195,22 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
 
     _selected_scenarios: list[str] = []
     for _si, _so in enumerate(_scenario_opts):
-        if st.checkbox(_so, value=True, key=f"_sf_scen_{_si}"):
+        if st.checkbox(_so, value=True, key=f"_global_scen_{_si}"):
             _selected_scenarios.append(_so)
-
     if not _selected_scenarios:
-        st.error("Select at least one scenario to export.")
+        st.error("Select at least one scenario.")
 
-    _can_export = bool(_selected_scenarios)
-
-    # Derive per-table scenario lists from selection — all tables get the same scenarios
-    _annual_scenarios = list(_selected_scenarios) if not _is_quarterly_save else []
+    # All applicable tables are always exported — flags kept for downstream logic
+    _save_annual_chk = not _is_quarterly_save
+    _save_quarterly_chk = True
+    _save_monthly_chk = True
+    _annual_scenarios = list(_selected_scenarios) if _save_annual_chk else []
     _quarterly_scenarios = list(_selected_scenarios)
     _monthly_scenarios = list(_selected_scenarios)
 
     st.info("Historical input reference data (from Tab 2) is always saved alongside your outputs.")
+
+    _can_export = bool(_selected_scenarios)
 
     if st.button("Export to Snowflake", type="primary", key="_btn_export_sf", disabled=not _can_export):
         _export_status = st.empty()
