@@ -656,8 +656,22 @@ def render_mailops_editor(session) -> None:
             st.warning("No rows found in this table.")
             return
 
+        # Quarter filter
+        _all_quarters = sorted(_orig_df["Quarter"].dropna().unique().tolist())
+        _quarter_options = ["All Quarters"] + _all_quarters
+        _selected_quarter = st.selectbox(
+            "Filter by Quarter",
+            _quarter_options,
+            key="_mo_quarter_filter",
+        )
+        if _selected_quarter != "All Quarters":
+            _filter_mask = _orig_df["Quarter"] == _selected_quarter
+            _filtered_orig = _orig_df[_filter_mask].reset_index(drop=True)
+        else:
+            _filtered_orig = _orig_df
+
         _edited_df = st.data_editor(
-            _orig_df,
+            _filtered_orig,
             hide_index=False,
             use_container_width=True,
             num_rows="dynamic",
@@ -688,7 +702,7 @@ def render_mailops_editor(session) -> None:
                     changed.append(edited.iloc[idx])
             return pd.DataFrame(changed) if changed else pd.DataFrame()
 
-        _changed_df = _detect_changed_rows(_orig_df, _edited_df)
+        _changed_df = _detect_changed_rows(_filtered_orig, _edited_df)
         if not _changed_df.empty:
             st.info(f"{len(_changed_df)} row(s) changed or added.")
 
@@ -5067,32 +5081,6 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                     lambda value, col=column: _qa_display(value, col)
                 )
         return formatted
-
-    def _qa_copy_table(frame: pd.DataFrame, table_key: str) -> None:
-        """Copy raw QA values as TSV for direct paste into Excel."""
-        payload = base64.b64encode(
-            frame.to_csv(sep="\t", index=False, lineterminator="\n").encode("utf-8")
-        ).decode("ascii")
-        components.html(
-            f"""<button id="{table_key}" style="font:600 12px Inter,Arial,sans-serif;padding:6px 11px;
-                border:1px solid #BFDBFE;border-radius:8px;background:#EFF6FF;color:#1D4ED8;cursor:pointer;">
-                Copy table for Excel</button>
-                <span id="{table_key}-status" style="margin-left:8px;color:#64748B;font:12px Inter,Arial,sans-serif;"></span>
-                <script>
-                const button=document.getElementById("{table_key}");
-                button.onclick=async()=>{{
-                  try {{ await navigator.clipboard.writeText(atob("{payload}"));
-                    document.getElementById("{table_key}-status").textContent="Copied"; }}
-                  catch (error) {{ document.getElementById("{table_key}-status").textContent="Copy unavailable"; }}
-                }};
-                </script>""",
-            height=38,
-        )
-
-    def _qa_render_table(frame: pd.DataFrame, table_key: str) -> None:
-        st.dataframe(_qa_format_frame(frame), hide_index=True, width="stretch")
-        st.markdown("<div class=\"qa-copy-note\">Copies the underlying numeric table as tab-separated values for Excel.</div>", unsafe_allow_html=True)
-        _qa_copy_table(frame, table_key)
 
     def _qa_actual_frame(rows):
         return pd.DataFrame([
