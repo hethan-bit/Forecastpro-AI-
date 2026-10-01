@@ -39,15 +39,6 @@ from planning_source import planning_input, planning_quarters, PLANNING_INPUT_TA
 
 st.set_page_config(page_title="ForecastPro AI", page_icon="📈", layout="wide")
 
-def _scenario_factor_title(factor: Decimal | float) -> str:
-    """Return a user-facing label for either an upside or downside scenario."""
-    percentage = float(factor) * 100
-    if percentage > 0:
-        return f"+{percentage:.0f}% Improvement"
-    if percentage < 0:
-        return f"{percentage:.0f}% Reduction"
-    return "0% No Change"
-
 st.markdown(
     """
 <style>
@@ -1111,16 +1102,17 @@ def _fmt_tier_compact(v: float) -> str:
     return "$" + "{:,.0f}".format(float(v))
 
 def _fmt_iroas(v: float) -> str:
-    return f"${v:,.1f}"
+    abs_v = abs(v)
+    if abs_v >= 1_000_000:
+        return f"${v/1_000_000:.1f}M"
+    elif abs_v >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:.1f}"
 
 def _range_str(lo: float, hi: float, fmt_func) -> str:
     if abs(lo - hi) < 0.005:
         return fmt_func(lo)
     return f"{fmt_func(lo)} - {fmt_func(hi)}"
-
-def _forecast_output_frame(rows) -> pd.DataFrame:
-    """Remove prospect counts from user-facing forecast output only."""
-    return pd.DataFrame(rows).drop(columns=["Prospects", "# of Prospects"], errors="ignore")
 
 
 MONTH_NAMES = (
@@ -1455,6 +1447,7 @@ def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
     iroas = [float((row.iroas.minimum + row.iroas.maximum) / 2) for row in all_ranges]
     customers = [float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2) for row in all_ranges]
     revenue = [float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2) for row in all_ranges]
+    prospects = [float(row.prospects) for row in all_ranges]
 
     def _compact(value, currency=False, precision=0):
         prefix = "$" if currency else ""
@@ -1517,6 +1510,7 @@ def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
         ("iROAS by Investment Tier", _render_line("iROAS by Investment Tier", "Incremental revenue returned for each forecast dollar", iroas, currency=True, precision=2)),
         ("Incremental Customers by Investment Tier", _render_bar("Incremental Customers by Investment Tier", "Customer gain at each forecast investment level", customers)),
         ("Incremental Revenue by Investment Tier", _render_bar("Incremental Revenue by Investment Tier", "Projected incremental revenue at each investment level", revenue, currency=True)),
+        ("Prospects by Investment Tier", _render_bar("Prospects by Investment Tier", "Reachable prospects supporting each forecast tier", prospects)),
     ]
     rendered = []
     for title, figure in definitions:
@@ -1562,13 +1556,22 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
 
     def fmoney(v): return f"${v:,.0f}"
     def fint(v): return f"{v:,.0f}"
-    def firoas(v): return f"${v:,.1f}"
+    def firoas(v):
+        a = abs(v)
+        if a >= 1e6: return f"${v/1e6:.1f}M"
+        if a >= 1e3: return f"${v/1e3:.1f}K"
+        return f"${v:.1f}"
     def fk(v):
         a = abs(v)
-        if a >= 1e6: return f"{v/1e6:.0f}M"
-        if a >= 1e3: return f"{v/1e3:.0f}K"
-        return f"{v:.0f}"
+        if a >= 1e6: return f"{v/1e6:.1f}M"
+        if a >= 1e3: return f"{v/1e3:.1f}K"
+        return f"{v:.1f}"
     def fdk(v):
+        a = abs(v)
+        if a >= 1e6: return f"${v/1e6:.1f}M"
+        if a >= 1e3: return f"${v/1e3:.1f}K"
+        return f"${v:.1f}"
+    def fcpix(v):
         a = abs(v)
         if a >= 1e6: return f"${v/1e6:.1f}M"
         if a >= 1e3: return f"${v/1e3:.1f}K"
@@ -1600,7 +1603,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     sheets["Historical KPIs"] = h_rows
 
     # Tab 2: Forecast (matches 3a UI exactly)
-    f_header = ["Tier", "Investment Tier", "Delivered Volume", "# of Prospects",
+    f_header = ["Tier", "Investment Tier", "Delivered Volume",
                 "Inc. Customers", "Incremental Revenue", "CPIx", "iROAS",
                 "Marginal CPIx", "Marginal iROAS", "Signal Utilization"]
     nc = len(f_header)
@@ -1634,16 +1637,15 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                 )
         f_rows.append([
             export_tier_label(r.tier_label), fmoney(float(r.investment) * mult), fint(float(r.delivered_volume) * mult),
-            fint(float(r.prospects) * mult),
             rng(float(r.incremental_customers.minimum) * mult, float(r.incremental_customers.maximum) * mult, fk),
             rng(float(r.incremental_revenue.minimum) * mult, float(r.incremental_revenue.maximum) * mult, fdk),
-            rng(float(r.cpix.minimum), float(r.cpix.maximum), fmoney),
+            rng(float(r.cpix.minimum), float(r.cpix.maximum), fcpix),
             rng(float(r.iroas.minimum), float(r.iroas.maximum), firoas),
             marginal_cpix_display, marginal_iroas_display, f"{sig_util.get(r.tier_label, 0):.1f}%"])
         previous_baseline_tier = r
     for name, factor, imp_rows in improvements:
         f_rows.append([""] * nc)
-        f_rows.append([f"{_scenario_factor_title(factor)} ({name})"] + [""] * (nc - 1))
+        f_rows.append([f"{name}: +{float(factor)*100:.0f}% Improvement"] + [""] * (nc - 1))
         f_rows.append(f_header.copy())
         by_tier = _dd(list)
         for ir in imp_rows:
@@ -1661,29 +1663,28 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             if len(trows) == 1:
                 cr = rng(cs[0]*(1-ra), cs[0]*(1+ra), fk)
                 rvr = rng(rs[0]*(1-ra), rs[0]*(1+ra), fdk)
-                cxr = rng(cxs[0]/(1+ra), cxs[0]/(1-ra), fmoney)
+                cxr = rng(cxs[0]/(1+ra), cxs[0]/(1-ra), fcpix)
                 irr = rng(irs[0]*(1-ra), irs[0]*(1+ra), firoas)
-                mcr = rng(mcs[0]/(1+ra), mcs[0]/(1-ra), fmoney) if mcs else "—"
+                mcr = rng(mcs[0]/(1+ra), mcs[0]/(1-ra), fcpix) if mcs else "—"
                 mir = rng(mis[0]*(1-ra), mis[0]*(1+ra), firoas) if mis else "—"
             else:
                 cr = rng(min(cs), max(cs), fk)
                 rvr = rng(min(rs), max(rs), fdk)
-                cxr = rng(min(cxs), max(cxs), fmoney)
+                cxr = rng(min(cxs), max(cxs), fcpix)
                 irr = rng(min(irs), max(irs), firoas)
-                mcr = rng(min(mcs), max(mcs), fmoney) if mcs else "—"
+                mcr = rng(min(mcs), max(mcs), fcpix) if mcs else "—"
                 mir = rng(min(mis), max(mis), firoas) if mis else "—"
             if tl == first_tier:
                 mcr = "—"; mir = "—"
             f_rows.append([tl, fmoney(float(trows[0].investment)),
                 fint(float(rr.delivered_volume)) if rr else "—",
-                fint(float(rr.prospects)) if rr else "—",
                 cr, rvr, cxr, irr, mcr, mir, f"{sig_util.get(tl, 0):.1f}%"])
     sheets[forecast_sheet_name] = f_rows
 
     # Tab 3+: Splits
     _dbl_hdr_actual = set()
     QM = {1: ["Jan","Feb","Mar"], 2: ["Apr","May","Jun"], 3: ["Jul","Aug","Sep"], 4: ["Oct","Nov","Dec"]}
-    sp_header = ["Tier", "Investment", "Delivered", "Prospects", "Inc. Customers",
+    sp_header = ["Tier", "Investment", "Delivered", "Inc. Customers",
                  "Inc. Revenue", "CPIx", "iROAS"]
     snc = len(sp_header)
 
@@ -1696,14 +1697,14 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             rmn = float(r.incremental_revenue.minimum) * fac * ip * im
             rmx = float(r.incremental_revenue.maximum) * fac * ip * im
             out.append([export_tier_label(r.tier_label), fmoney(inv),
-                fint(float(r.delivered_volume) * fac * op), fint(float(r.prospects) * fac * op),
+                fint(float(r.delivered_volume) * fac * op),
                 rng(cmn, cmx, fk), rng(rmn, rmx, fdk),
-                rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fmoney),
+                rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fcpix),
                 rng(rmn/inv if inv > 0 else 0, rmx/inv if inv > 0 else 0, firoas)])
         return out
 
     def split_vals(vr, op, ip, im=1.0, fac=4):
-        """Like split_rows but returns only the 7 data columns (no tier label)."""
+        """Like split_rows but returns only the 6 data columns (no tier label)."""
         out = []
         for r in vr:
             inv = float(r.investment) * fac * op
@@ -1712,13 +1713,13 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             rmn = float(r.incremental_revenue.minimum) * fac * ip * im
             rmx = float(r.incremental_revenue.maximum) * fac * ip * im
             out.append([fmoney(inv),
-                fint(float(r.delivered_volume) * fac * op), fint(float(r.prospects) * fac * op),
+                fint(float(r.delivered_volume) * fac * op),
                 rng(cmn, cmx, fk), rng(rmn, rmx, fdk),
-                rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fmoney),
+                rng(inv/cmx if cmx > 0 else 0, inv/cmn if cmn > 0 else 0, fcpix),
                 rng(rmn/inv if inv > 0 else 0, rmx/inv if inv > 0 else 0, firoas)])
         return out
 
-    _data_cols = ["Investment", "Delivered", "Prospects", "Inc. Customers",
+    _data_cols = ["Investment", "Delivered", "Inc. Customers",
                   "Inc. Revenue", "CPIx", "iROAS"]
 
     if indexes and vis_ranges:
@@ -1729,14 +1730,43 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             months = QM[qn]
             osum = sum(indexes["monthly_organic"].get(m, 1/12) for m in months)
             isum = sum(indexes["monthly_incremental"].get(m, 1/12) for m in months)
-            ms_rows = [sp_header]
-            for mo in months:
-                op = indexes["monthly_organic"].get(mo, 1/12) / osum if osum else 1/3
-                ip = indexes["monthly_incremental"].get(mo, 1/12) / isum if isum else 1/3
-                ms_rows.append([mo] + [""] * (snc - 1))
-                ms_rows.append(sp_header.copy())
-                ms_rows.extend(split_rows(vis_ranges, op, ip, fac=1))
-            sheets["Monthly Split"] = ms_rows
+            if improvements:
+                # Side-by-side: Baseline | Scenario 1 | Scenario 2 ...
+                scenario_row = [""] + ["Baseline"] + [""] * 5
+                for nm, fc, _ in improvements:
+                    scenario_row += ["", f"{nm}: +{float(fc)*100:.0f}%"] + [""] * 5
+                col_row = ["Tier"] + _data_cols
+                for _ in improvements:
+                    col_row += [""] + _data_cols
+                ms_rows = [scenario_row, col_row]
+                for mo in months:
+                    op = indexes["monthly_organic"].get(mo, 1/12) / osum if osum else 1/3
+                    ip = indexes["monthly_incremental"].get(mo, 1/12) / isum if isum else 1/3
+                    sec = [mo] + [""] * 6
+                    for _ in improvements:
+                        sec += ["", mo] + [""] * 5
+                    ms_rows.append(sec)
+                    ms_rows.append(col_row.copy())
+                    base = split_vals(vis_ranges, op, ip, fac=1)
+                    imp_data = []
+                    for nm, fc, _ in improvements:
+                        imp_data.append(split_vals(vis_ranges, op, ip, 1 + float(fc), fac=1))
+                    for ti, r in enumerate(vis_ranges):
+                        row = [export_tier_label(r.tier_label)] + base[ti]
+                        for imp_v in imp_data:
+                            row += [""] + imp_v[ti]
+                        ms_rows.append(row)
+                sheets["Monthly Split"] = ms_rows
+                _dbl_hdr_actual.add("Monthly Split")
+            else:
+                ms_rows = [sp_header]
+                for mo in months:
+                    op = indexes["monthly_organic"].get(mo, 1/12) / osum if osum else 1/3
+                    ip = indexes["monthly_incremental"].get(mo, 1/12) / isum if isum else 1/3
+                    ms_rows.append([mo] + [""] * (snc - 1))
+                    ms_rows.append(sp_header.copy())
+                    ms_rows.extend(split_rows(vis_ranges, op, ip, fac=1))
+                sheets["Monthly Split"] = ms_rows
         else:
             # Build rolling quarter labels starting from projection quarter
             _rq = rolling_quarters(proj_quarter) if proj_quarter else [f"Q{n}" for n in range(1, 5)]
@@ -1755,9 +1785,9 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
 
             if improvements:
                 # --- Annual Quarterly Split: side-by-side scenarios ---
-                scenario_row = [""] + ["Baseline"] + [""] * 6
+                scenario_row = [""] + ["Baseline"] + [""] * 5
                 for nm, fc, _ in improvements:
-                    scenario_row += ["", f"{_scenario_factor_title(fc)} ({nm})"] + [""] * 6
+                    scenario_row += ["", f"{nm}: +{float(fc)*100:.0f}%"] + [""] * 5
                 col_row = ["Tier"] + _data_cols
                 for _ in improvements:
                     col_row += [""] + _data_cols
@@ -1769,9 +1799,9 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                     i = indexes["quarterly_incremental"].get(qk, 0.25)
                     total_cols = len(col_row)
                     # Section row: repeat quarter label above each scenario block
-                    sec = [ql] + [""] * 7
+                    sec = [ql] + [""] * 6
                     for _ in improvements:
-                        sec += ["", ql] + [""] * 6
+                        sec += ["", ql] + [""] * 5
                     qs_rows.append(sec)
                     qs_rows.append(col_row.copy())
                     base = split_vals(vis_ranges, o, i)
@@ -1802,9 +1832,9 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                         total_cols = len(col_row)
                         mo_label = f"{mo} {yr}" if yr else mo
                         # Section row: repeat month label above each scenario block
-                        sec = [mo_label] + [""] * 7
+                        sec = [mo_label] + [""] * 6
                         for _ in improvements:
-                            sec += ["", mo_label] + [""] * 6
+                            sec += ["", mo_label] + [""] * 5
                         ms_rows.append(sec)
                         ms_rows.append(col_row.copy())
                         base = split_vals(vis_ranges, op, ip)
@@ -1851,7 +1881,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     # Charts are rendered as premium report images; the exact source values stay hidden in Chart Data.
     native_charts = []
     if vis_ranges:
-        chart_rows = [["Tier", "Investment", "CPIx Midpoint", "iROAS Midpoint", "Incremental Customers", "Incremental Revenue", "Delivered Volume"]]
+        chart_rows = [["Tier", "Investment", "CPIx Midpoint", "iROAS Midpoint", "Incremental Customers", "Incremental Revenue", "Prospects", "Delivered Volume"]]
         for row in vis_ranges:
             chart_rows.append([
                 export_tier_label(row.tier_label), float(row.investment),
@@ -1859,7 +1889,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
                 float((row.iroas.minimum + row.iroas.maximum) / 2),
                 float((row.incremental_customers.minimum + row.incremental_customers.maximum) / 2),
                 float((row.incremental_revenue.minimum + row.incremental_revenue.maximum) / 2),
-                float(row.delivered_volume),
+                float(row.prospects), float(row.delivered_volume),
             ])
         sheets["Chart Data"] = chart_rows
         sheets["Charts"] = [[""]]
@@ -1869,22 +1899,10 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             ("iROAS by Investment Tier", 3, "1F77B4"),
             ("Incremental Customers by Investment Tier", 4, "06B6D4"),
             ("Incremental Revenue by Investment Tier", 5, "3B82F6"),
+            ("Prospects by Investment Tier", 6, "648FC2"),
         ]
 
         # --- Build xlsx from raw XML with formatting ---
-    # Remove prospect columns from forecast/split workbook sheets; historical KPIs stay intact.
-    for _sheet_name, _sheet_rows in sheets.items():
-        if _sheet_name in {"Historical KPIs", "Chart Data", "Charts"}:
-            continue
-        _prospect_columns = None
-        for _row in _sheet_rows:
-            _headers = [index for index, value in enumerate(_row) if str(value) in {"Prospects", "# of Prospects"}]
-            if _headers:
-                _prospect_columns = _headers
-            if _prospect_columns:
-                for index in reversed(_prospect_columns):
-                    if index < len(_row):
-                        _row.pop(index)
     def col_letter(idx):
         r = ""; i = idx
         while i >= 0: r = chr(65 + i % 26) + r; i = i // 26 - 1
@@ -2777,6 +2795,16 @@ if active_tab == 0:
                 "No current or future projection quarter has an approved preceding source-data quarter."
             )
 
+    def _projection_mode_changed():
+        """Invalidate loaded data when projection mode changes so the user must reload."""
+        st.session_state.preview = []
+        st.session_state.monthly_history = []
+        st.session_state.confirmed = False
+        st.session_state.forecast = None
+        st.session_state.pop("selected_history", None)
+        st.session_state.pop("applied_planning_key", None)
+        st.session_state.message = "Projection mode changed. Press 'Load Historical Data' to continue."
+
     with proj_row[2]:
         projection_mode = st.radio(
             "Projection Mode",
@@ -2784,6 +2812,7 @@ if active_tab == 0:
             index=0,
             horizontal=True,
             key="_widget_projection_mode",
+            on_change=_projection_mode_changed,
             help="Quarterly generates projections for the selected quarter. Annual scales the quarterly projection by 4× and applies seasonal indexes to provide a full-year projection by quarter.",
         )
 
@@ -3520,29 +3549,50 @@ if st.session_state.confirmed and active_tab == 1:
     scenario_factors = []
     scenario_names = []
 
-    for row_start in range(0, num_scenarios, 2):
-        row_end = min(row_start + 2, num_scenarios)
-        cols = st.columns(row_end - row_start, gap="large")
-        for idx, col in enumerate(cols):
-            scenario_idx = row_start + idx
-            default_factor = 15.0 if scenario_idx == 1 else 10.0
-            col.markdown(f'<div class="scenario-mini-caption">Scenario {scenario_idx + 1}</div>', unsafe_allow_html=True)
-            name = col.text_input(
-                f"Scenario {scenario_idx + 1} name",
-                value=f"Scenario {scenario_idx + 1}",
-                key=f"scenario_name_{scenario_idx}",
-                label_visibility="collapsed",
-            )
-            factor = col.number_input(
-                "Scenario Adjustment (%)",
-                min_value=-99.0,
-                max_value=99.0,
-                value=15.0 if scenario_idx == 1 else 10.0,
-                step=0.5,
-                key=f"scenario_factor_{scenario_idx}",
-            )
-            scenario_names.append(name)
-            scenario_factors.append(factor)
+    if num_scenarios == 0:
+        no_scen_col, btn_col = st.columns([5, 1])
+        with no_scen_col:
+            st.caption("No adjustment scenarios. Click + Add to create one.")
+        with btn_col:
+            st.button("+ Add", key="add_scenario_heading", on_click=_add_scenario,
+                       disabled=num_scenarios >= 10)
+    else:
+        for row_start in range(0, num_scenarios, 5):
+            row_end = min(row_start + 5, num_scenarios)
+            scenario_col_count = row_end - row_start
+            # On the last row of scenarios, append the Add/Remove button column
+            is_last_row = (row_start + 5 >= num_scenarios)
+            if is_last_row:
+                cols = st.columns(scenario_col_count + 1)
+            else:
+                cols = st.columns(scenario_col_count)
+            for idx in range(scenario_col_count):
+                col = cols[idx]
+                scenario_idx = row_start + idx
+                default_factor = 15.0 if scenario_idx == 1 else 10.0
+                name = col.text_input(
+                    f"Scenario {scenario_idx + 1} name",
+                    value=f"Scenario {scenario_idx + 1}",
+                    key=f"scenario_name_{scenario_idx}",
+                    label_visibility="collapsed",
+                )
+                factor = col.number_input(
+                    f"Improvement Factor (%)",
+                    min_value=0.0,
+                    max_value=99.0,
+                    value=15.0 if scenario_idx == 1 else 10.0,
+                    step=0.5,
+                    key=f"scenario_factor_{scenario_idx}",
+                )
+                scenario_names.append(name)
+                scenario_factors.append(factor)
+            if is_last_row:
+                with cols[scenario_col_count]:
+                    st.button("+ Add", key="add_scenario_heading", on_click=_add_scenario,
+                               disabled=num_scenarios >= 10, use_container_width=True)
+                    st.button("− Remove", key="remove_scenario_heading", on_click=_remove_scenario,
+                               disabled=num_scenarios <= 0, use_container_width=True,
+                               help="Remove the last improvement scenario.")
 
     st.divider()
 
@@ -3687,7 +3737,7 @@ if st.session_state.forecast and active_tab == 2:
     if not _is_quarterly_mode:
         _scenario_options = ["Baseline"]
         for _sn, _sf, _sr in result["improvements"]:
-            _scenario_options.append(_scenario_factor_title(_sf))
+            _scenario_options.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
         st.session_state.setdefault("annual_scenario", "Baseline")
         _selected_scenario = st.radio(
             "Scenario for Quarterly & Monthly Splits",
@@ -3703,7 +3753,7 @@ if st.session_state.forecast and active_tab == 2:
         if result["improvements"]:
             _scenario_options_q = ["Baseline"]
             for _sn, _sf, _sr in result["improvements"]:
-                _scenario_options_q.append(_scenario_factor_title(_sf))
+                _scenario_options_q.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
             st.session_state.setdefault("quarterly_scenario", "Baseline")
             _selected_q_scenario = st.radio(
                 "Scenario for Monthly Split",
@@ -3735,13 +3785,12 @@ if st.session_state.forecast and active_tab == 2:
 
     if _is_quarterly_mode:
         # --- Quarterly mode: show one-quarter baseline table ---
-        _proj_q_label = st.session_state.get("projection_quarter", "One Quarter")
+        _proj_q_label = st.session_state.get("projection_quarter") or "No Projection"
         st.subheader(f"{_proj_q_label} Projection")
-        range_frame = _forecast_output_frame([
+        range_frame = pd.DataFrame([
             {"Tier": row.tier_label,
              "Investment": _fmt_dollar_commas(float(row.investment)),
-             "Delivered": f"{float(row.delivered_volume):,.0f}",
-             "Prospects": f"{float(row.prospects):,.0f}",
+             "Delivered": _fmt_int(float(row.delivered_volume)),
              "Inc. Cust": _range_str(
                  float(row.incremental_customers.minimum),
                  float(row.incremental_customers.maximum),
@@ -3784,11 +3833,11 @@ if st.session_state.forecast and active_tab == 2:
         }
         for name, factor, rows in result["improvements"]:
             if simple_headers:
-                st.subheader(_scenario_factor_title(factor))
+                st.subheader(f"{name}: +{float(factor)*100:.0f}% Improvement")
             else:
                 st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
                     f'<div class="kpi-label">{name}</div>'
-                    f'<div class="kpi-value">{_scenario_factor_title(factor)}</div></div>', unsafe_allow_html=True)
+                    f'<div class="kpi-value">+{float(factor)*100:.0f}% improvement</div></div>', unsafe_allow_html=True)
             from collections import defaultdict as _dd
             _imp_by_tier: dict[str, list] = _dd(list)
             for r in rows:
@@ -3835,8 +3884,7 @@ if st.session_state.forecast and active_tab == 2:
                 scenario_rows.append({
                     "Tier": tier_label,
                     "Investment": _fmt_dollar_commas(float(tier_rows[0].investment)),
-                    "Delivered": f"{float(rng.delivered_volume):,.0f}" if rng else "—",
-                    "Prospects": f"{float(rng.prospects):,.0f}" if rng else "—",
+                    "Delivered": _fmt_int(float(rng.delivered_volume)) if rng else "—",
                     "Inc. Cust": cust_range,
                     "Inc. Rev": rev_range,
                     "CPIx": cpix_range,
@@ -3854,11 +3902,10 @@ if st.session_state.forecast and active_tab == 2:
     else:
         # Annual mode: show annual baseline + improvements inline (x4 multiplier)
         st.subheader("Annual Projection")
-        annual_frame = _forecast_output_frame([
+        annual_frame = pd.DataFrame([
             {"Tier": row.tier_label,
              "Investment": _fmt_dollar_commas(float(row.investment) * 4),
-             "Delivered": f"{float(row.delivered_volume) * 4:,.0f}",
-             "Prospects": f"{float(row.prospects) * 4:,.0f}",
+             "Delivered": _fmt_int(float(row.delivered_volume) * 4),
              "Inc. Cust": _range_str(
                  float(row.incremental_customers.minimum) * 4,
                  float(row.incremental_customers.maximum) * 4,
@@ -3891,7 +3938,7 @@ if st.session_state.forecast and active_tab == 2:
         # Annual improvement scenarios
         _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
         for name, factor, rows in result["improvements"]:
-            st.subheader(_scenario_factor_title(factor))
+            st.subheader(f"{name}: +{float(factor)*100:.0f}% Improvement")
             from collections import defaultdict as _dd_ann
             _imp_by_tier_ann: dict[str, list] = _dd_ann(list)
             for r in rows:
@@ -3930,8 +3977,7 @@ if st.session_state.forecast and active_tab == 2:
                 imp_rows.append({
                     "Tier": tier_label,
                     "Investment": _fmt_dollar_commas(float(tier_rows[0].investment) * 4),
-                    "Delivered": f"{float(rng.delivered_volume) * 4:,.0f}" if rng else "—",
-                    "Prospects": f"{float(rng.prospects) * 4:,.0f}" if rng else "—",
+                    "Delivered": _fmt_int(float(rng.delivered_volume) * 4) if rng else "—",
                     "Inc. Cust": cust_range,
                     "Inc. Rev": rev_range,
                     "CPIx": cpix_range,
@@ -3988,7 +4034,7 @@ if (st.session_state.forecast
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
-        if _scenario_factor_title(_factor) == _annual_scenario:
+        if f"{_name}: +{float(_factor)*100:.0f}% Improvement" == _annual_scenario:
             _imp_factor_val = float(_factor)
             break
     _imp_mult = 1 + _imp_factor_val
@@ -3996,6 +4042,8 @@ if (st.session_state.forecast
         st.caption(f"Annual forecast ({_annual_scenario}) distributed across Q1-Q4 using seasonal indexes.")
     else:
         st.caption("The annual forecast is distributed across Q1-Q4 using seasonal indexes.")
+
+    _qs_view_mode = st.radio("Group by", ("Quarter", "Tier"), horizontal=True, key="_qs_view_mode")
 
     def _q_key_fn(ql):
         _m = re.match(r"Q(\d)", ql)
@@ -4013,35 +4061,49 @@ if (st.session_state.forecast
             channel=st.session_state.get("selected_channel"),
         ))
         _rq_ui = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
-        for _rq_label in _rq_ui:
-            q_key = _q_key_fn(_rq_label)
-            o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
-            i_pct = indexes["quarterly_incremental"].get(q_key, 0.25)
-            st.subheader(_rq_label)
-            qtr_rows = []
+
+        if _qs_view_mode == "Tier":
             for r in visible_ranges:
                 label = r.tier_label
-                inv = float(r.investment) * 4 * o_pct
-                delivered = float(r.delivered_volume) * 4 * o_pct
-                prospects = float(r.prospects) * 4 * o_pct
-                cust_min = float(r.incremental_customers.minimum) * 4 * i_pct * _imp_mult
-                cust_max = float(r.incremental_customers.maximum) * 4 * i_pct * _imp_mult
-                rev_min = float(r.incremental_revenue.minimum) * 4 * i_pct * _imp_mult
-                rev_max = float(r.incremental_revenue.maximum) * 4 * i_pct * _imp_mult
-                cpix_min = inv / cust_max if cust_max > 0 else 0
-                cpix_max = inv / cust_min if cust_min > 0 else 0
-                iroas_min = rev_min / inv if inv > 0 else 0
-                iroas_max = rev_max / inv if inv > 0 else 0
-                qtr_rows.append({
-                    "Tier": label,
-                    "Investment": _fmt_dollar_commas(inv),
-                    "Delivered": f"{delivered:,.0f}",
-                    "Prospects": f"{prospects:,.0f}",
-                    "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
-                    "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
-                    "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
-                    "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
-                    "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
+                st.subheader(f"{label} ({_fmt_dollar_commas(float(r.investment) * 4)})")
+                tier_qtr_rows = []
+                _tot_inv = _tot_del = _tot_cmin = _tot_cmax = _tot_rmin = _tot_rmax = 0.0
+                for _rq_label in _rq_ui:
+                    q_key = _q_key_fn(_rq_label)
+                    o_pct = indexes["quarterly_organic"].get(q_key, 0.25)
+                    i_pct = indexes["quarterly_incremental"].get(q_key, 0.25)
+                    inv = float(r.investment) * 4 * o_pct
+                    delivered = float(r.delivered_volume) * 4 * o_pct
+                    cust_min = float(r.incremental_customers.minimum) * 4 * i_pct * _imp_mult
+                    cust_max = float(r.incremental_customers.maximum) * 4 * i_pct * _imp_mult
+                    rev_min = float(r.incremental_revenue.minimum) * 4 * i_pct * _imp_mult
+                    rev_max = float(r.incremental_revenue.maximum) * 4 * i_pct * _imp_mult
+                    cpix_min = inv / cust_max if cust_max > 0 else 0
+                    cpix_max = inv / cust_min if cust_min > 0 else 0
+                    iroas_min = rev_min / inv if inv > 0 else 0
+                    iroas_max = rev_max / inv if inv > 0 else 0
+                    _tot_inv += inv; _tot_del += delivered
+                    _tot_cmin += cust_min; _tot_cmax += cust_max
+                    _tot_rmin += rev_min; _tot_rmax += rev_max
+                    tier_qtr_rows.append({
+                        "Quarter": _rq_label,
+                        "Investment": _fmt_dollar_commas(inv),
+                        "Delivered": _fmt_int(delivered),
+                        "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
+                        "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
+                        "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
+                        "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
+                        "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
+                    })
+                tier_qtr_rows.append({
+                    "Quarter": "Annual Total",
+                    "Investment": _fmt_dollar_commas(_tot_inv),
+                    "Delivered": _fmt_int(_tot_del),
+                    "Inc. Cust": _range_str(_tot_cmin, _tot_cmax, _fmt_compact_k),
+                    "Inc. Rev": _range_str(_tot_rmin, _tot_rmax, _fmt_dollar_compact_m),
+                    "CPIx": _range_str(_tot_inv / _tot_cmax if _tot_cmax > 0 else 0, _tot_inv / _tot_cmin if _tot_cmin > 0 else 0, _fmt_dollar_0),
+                    "iROAS": _range_str(_tot_rmin / _tot_inv if _tot_inv > 0 else 0, _tot_rmax / _tot_inv if _tot_inv > 0 else 0, _fmt_iroas),
+                    "% Utilization": "",
                 })
             st.dataframe(_forecast_output_frame(qtr_rows), hide_index=True, use_container_width=True)
     except Exception as exc:
@@ -4097,7 +4159,7 @@ if (st.session_state.forecast
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
-        if _scenario_factor_title(_factor) == _annual_scenario:
+        if f"{_name}: +{float(_factor)*100:.0f}% Improvement" == _annual_scenario:
             _imp_factor_val = float(_factor)
             break
     _imp_mult = 1 + _imp_factor_val
@@ -4130,6 +4192,7 @@ if (st.session_state.forecast
                 st.subheader(f"{label} ({_fmt_dollar_commas(float(r.investment) * 4)})")
                 tier_month_rows = []
                 _rq_ms = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
+                _an_inv = _an_del = _an_cmin = _an_cmax = _an_rmin = _an_rmax = 0.0
                 for _ql in _rq_ms:
                     _qk = _q_key_fn(_ql)
                     _qyr = re.search(r"\d{4}", _ql)
@@ -4147,7 +4210,6 @@ if (st.session_state.forecast
                         inc_pct = q_inc * (indexes["monthly_incremental"].get(month, 1/12) / inc_sum) if inc_sum else q_inc / 3
                         inv = float(r.investment) * 4 * org_pct
                         delivered = float(r.delivered_volume) * 4 * org_pct
-                        prospects = float(r.prospects) * 4 * org_pct
                         cust_min = float(r.incremental_customers.minimum) * 4 * inc_pct * _imp_mult
                         cust_max = float(r.incremental_customers.maximum) * 4 * inc_pct * _imp_mult
                         rev_min = float(r.incremental_revenue.minimum) * 4 * inc_pct * _imp_mult
@@ -4162,8 +4224,7 @@ if (st.session_state.forecast
                         tier_month_rows.append({
                             "Month": f"{month} {_yr}",
                             "Investment": _fmt_dollar_commas(inv),
-                            "Delivered": f"{delivered:,.0f}",
-                            "Prospects": f"{prospects:,.0f}",
+                            "Delivered": _fmt_int(delivered),
                             "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                             "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                             "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4214,7 +4275,6 @@ if (st.session_state.forecast
                         label = r.tier_label
                         inv = float(r.investment) * 4 * org_pct
                         delivered = float(r.delivered_volume) * 4 * org_pct
-                        prospects = float(r.prospects) * 4 * org_pct
                         cust_min = float(r.incremental_customers.minimum) * 4 * inc_pct * _imp_mult
                         cust_max = float(r.incremental_customers.maximum) * 4 * inc_pct * _imp_mult
                         rev_min = float(r.incremental_revenue.minimum) * 4 * inc_pct * _imp_mult
@@ -4226,8 +4286,7 @@ if (st.session_state.forecast
                         month_rows.append({
 "Tier": label,
                             "Investment": _fmt_dollar_commas(inv),
-                            "Delivered": f"{delivered:,.0f}",
-                            "Prospects": f"{prospects:,.0f}",
+                            "Delivered": _fmt_int(delivered),
                             "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                             "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                             "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4301,7 +4360,7 @@ if (st.session_state.forecast
     _quarterly_scenario = st.session_state.get("quarterly_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
-        if _scenario_factor_title(_factor) == _quarterly_scenario:
+        if f"{_name}: +{float(_factor)*100:.0f}% Improvement" == _quarterly_scenario:
             _imp_factor_val = float(_factor)
             break
     _imp_mult = 1 + _imp_factor_val
@@ -4342,7 +4401,6 @@ if (st.session_state.forecast
                     m_inc_pct = indexes["monthly_incremental"].get(month, 1/12) / inc_sum if inc_sum else 1/3
                     inv = float(r.investment) * m_org_pct
                     delivered = float(r.delivered_volume) * m_org_pct
-                    prospects = float(r.prospects) * m_org_pct
                     cust_min = float(r.incremental_customers.minimum) * m_inc_pct * _imp_mult
                     cust_max = float(r.incremental_customers.maximum) * m_inc_pct * _imp_mult
                     rev_min = float(r.incremental_revenue.minimum) * m_inc_pct * _imp_mult
@@ -4357,8 +4415,7 @@ if (st.session_state.forecast
                     tier_month_rows.append({
                         "Month": month,
                         "Investment": _fmt_dollar_commas(inv),
-                        "Delivered": f"{delivered:,.0f}",
-                        "Prospects": f"{prospects:,.0f}",
+                        "Delivered": _fmt_int(delivered),
                         "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                         "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                         "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4398,7 +4455,6 @@ if (st.session_state.forecast
                     label = r.tier_label
                     inv = float(r.investment) * org_pct
                     delivered = float(r.delivered_volume) * org_pct
-                    prospects = float(r.prospects) * org_pct
 
                     cust_min = float(r.incremental_customers.minimum) * inc_pct * _imp_mult
                     cust_max = float(r.incremental_customers.maximum) * inc_pct * _imp_mult
@@ -4429,8 +4485,7 @@ if (st.session_state.forecast
                     month_rows.append({
 "Tier": label,
                         "Investment": _fmt_dollar_commas(inv),
-                        "Delivered": f"{delivered:,.0f}",
-                        "Prospects": f"{prospects:,.0f}",
+                        "Delivered": _fmt_int(delivered),
                         "Inc. Cust": _range_str(cust_min, cust_max, _fmt_compact_k),
                         "Inc. Rev": _range_str(rev_min, rev_max, _fmt_dollar_compact_m),
                         "CPIx": _range_str(cpix_min, cpix_max, _fmt_dollar_0),
@@ -4776,7 +4831,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                 scenario_tabs, result.get("improvements", [])
             ):
                 with scenario_tab:
-                    st.caption(f"Scenario adjustment: {_scenario_factor_title(scenario_factor)}")
+                    st.caption(f"Improvement factor: {float(scenario_factor) * 100:.1f}%")
                     st.dataframe(
                         _qa_format_frame(_qa_scenario_frame([
                             row for row in scenario_rows
@@ -4882,13 +4937,13 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     _sig_util_save = st.session_state.get("_cached_sig_util", {})
 
     st.header("Save Results to Snowflake")
-    st.caption("Select which forecast outputs to save to ZX.ANALYTICS. Input reference data is always included.")
 
     # Build scenario options
     _scenario_opts = ["Baseline"]
     for _sn, _sf, _sr in result["improvements"]:
-        _scenario_opts.append(f"{_scenario_factor_title(_sf)} ({_sn})")
+        _scenario_opts.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
 
+    # Scenario selection — each selected scenario exports all output tables
     st.subheader("Select Scenarios to Export")
     if _is_quarterly_save:
         st.caption("Each selected scenario will be exported to the Quarterly Forecast and Monthly Split tables, plus the input reference.")
@@ -4935,7 +4990,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
 
             _scenario_factors = {"Baseline": 0.0}
             for _sn, _sf, _sr in result["improvements"]:
-                _scenario_factors[f"{_scenario_factor_title(_sf)} ({_sn})"] = float(_sf)
+                _scenario_factors[f"{_sn}: +{float(_sf)*100:.0f}% Improvement"] = float(_sf)
 
             rows_saved = 0
 
@@ -4973,7 +5028,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                 return 1.0 + _scenario_factors.get(scenario_label, 0.0)
 
             # --- 2a. Annual table (annual mode only) ---
-            if _save_annual_chk and not _is_quarterly_save and _annual_scenarios:
+            if not _is_quarterly_save and _annual_scenarios:
                 _rqs = rolling_quarters(_proj_q_save)
                 _fq_m = re.match(r"Q(\d)\s+(\d{4})", _rqs[0])
                 _annual_start_quarter = f"Q{_fq_m.group(1)}" if _fq_m else ""
@@ -4992,17 +5047,17 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
                                 FORECAST_YEAR_START_QUARTER, FORECAST_YEAR_START_YEAR,
                                 SCENARIO, TIER,
-                                INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                INVESTMENT, DELIVERED_VOLUME,
                                 INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                 INC_REVENUE_MIN, INC_REVENUE_MAX,
                                 CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                 SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             params=[
                                 forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                 _annual_start_quarter, _annual_start_year,
                                 scenario_label, r.tier_label,
-                                inv, float(r.delivered_volume) * 4, float(r.prospects) * 4,
+                                inv, float(r.delivered_volume) * 4,
                                 cust_min, cust_max, rev_min, rev_max,
                                 inv / cust_max if cust_max > 0 else 0,
                                 inv / cust_min if cust_min > 0 else 0,
@@ -5014,7 +5069,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                         rows_saved += 1
 
             # --- 2b. Quarterly table ---
-            if _save_quarterly_chk and _quarterly_scenarios:
+            if _quarterly_scenarios:
                 for scenario_label in _quarterly_scenarios:
                     imp_mult = _imp_mult_for(scenario_label)
                     if _is_quarterly_save:
@@ -5028,17 +5083,17 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
                                    (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
                                     FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER,
-                                    INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                    INVESTMENT, DELIVERED_VOLUME,
                                     INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                     INC_REVENUE_MIN, INC_REVENUE_MAX,
                                     CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                     SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 params=[
                                     forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                     f"Q{_pq_num_save}", _pq_year_save,
                                     scenario_label, r.tier_label,
-                                    inv, float(r.delivered_volume), float(r.prospects),
+                                    inv, float(r.delivered_volume),
                                     cust_min, cust_max, rev_min, rev_max,
                                     inv / cust_max if cust_max > 0 else 0,
                                     inv / cust_min if cust_min > 0 else 0,
@@ -5067,18 +5122,17 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
                                        (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
                                         FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER,
-                                        INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                        INVESTMENT, DELIVERED_VOLUME,
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                         SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     params=[
                                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                         _q_key, _q_year,
                                         scenario_label, r.tier_label,
                                         inv, float(r.delivered_volume) * 4 * o_pct,
-                                        float(r.prospects) * 4 * o_pct,
                                         cust_min, cust_max, rev_min, rev_max,
                                         inv / cust_max if cust_max > 0 else 0,
                                         inv / cust_min if cust_min > 0 else 0,
@@ -5090,7 +5144,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 rows_saved += 1
 
             # --- 2c. Monthly table ---
-            if _save_monthly_chk and _monthly_scenarios:
+            if _monthly_scenarios:
                 for scenario_label in _monthly_scenarios:
                     imp_mult = _imp_mult_for(scenario_label)
                     if _is_quarterly_save:
@@ -5110,18 +5164,17 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
                                        (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
                                         FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER,
-                                        INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                        INVESTMENT, DELIVERED_VOLUME,
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                         SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     params=[
                                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                         month, _pq_year_save,
                                         scenario_label, r.tier_label,
                                         inv, float(r.delivered_volume) * m_org,
-                                        float(r.prospects) * m_org,
                                         cust_min, cust_max, rev_min, rev_max,
                                         inv / cust_max if cust_max > 0 else 0,
                                         inv / cust_min if cust_min > 0 else 0,
@@ -5157,18 +5210,17 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
                                            (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
                                             FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER,
-                                            INVESTMENT, DELIVERED_VOLUME, PROSPECTS,
+                                            INVESTMENT, DELIVERED_VOLUME,
                                             INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                             INC_REVENUE_MIN, INC_REVENUE_MAX,
                                             CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                             SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                         params=[
                                             forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                             month, _q_year,
                                             scenario_label, r.tier_label,
                                             inv, float(r.delivered_volume) * 4 * m_org,
-                                            float(r.prospects) * 4 * m_org,
                                             cust_min, cust_max, rev_min, rev_max,
                                             inv / cust_max if cust_max > 0 else 0,
                                             inv / cust_min if cust_min > 0 else 0,
@@ -5180,15 +5232,16 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     rows_saved += 1
 
             _tables_written = ["`ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE`"]
-            if _save_annual_chk and not _is_quarterly_save and _annual_scenarios:
+            if not _is_quarterly_save and _annual_scenarios:
                 _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY`")
-            if _save_quarterly_chk and _quarterly_scenarios:
+            if _quarterly_scenarios:
                 _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY`")
-            if _save_monthly_chk and _monthly_scenarios:
+            if _monthly_scenarios:
                 _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY`")
             _export_status.success(
                 f"Saved {rows_saved} rows to Snowflake.\n\n"
                 f"**Forecast Tag (unique ID):** `{forecast_tag}`\n\n"
+                f"**Scenarios exported:** {', '.join(_selected_scenarios)}\n\n"
                 f"**Tables written to:** {', '.join(_tables_written)}"
             )
         except Exception as exc:
