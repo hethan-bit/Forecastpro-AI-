@@ -578,17 +578,253 @@ st.markdown(
 
 def render_mailops_editor(session) -> None:
     """Full-page editor for the FORECASTING_INPUTS planning table."""
+    _MAILOPS_TEST_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS_TEST"
+
     st.markdown(
         '<h1 class="hero-title">Edit MailOps Data</h1>',
         unsafe_allow_html=True,
     )
-    if st.button("Back to Forecast Engine", key="_mailops_back"):
-        st.session_state.mailops_mode = False
-        st.rerun()
+    _top_cols = st.columns([2, 4, 2])
+    with _top_cols[0]:
+        if st.button("Back to Forecast Engine", key="_mailops_back"):
+            st.session_state.mailops_mode = False
+            st.rerun()
+    with _top_cols[2]:
+        _view_label = "Single-Row Editor" if st.session_state.get("_mo_excel_view") else "Excel View"
+        if st.button(_view_label, key="_mo_toggle_view"):
+            st.session_state["_mo_excel_view"] = not st.session_state.get("_mo_excel_view", False)
+            st.rerun()
 
     st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
 
-    # --- Cascading filters sourced from the measurement table ---
+    # =====================================================================
+    # EXCEL-STYLE BULK VIEW
+    # =====================================================================
+    if st.session_state.get("_mo_excel_view"):
+        _DISPLAY_COLS = [
+            "QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL",
+            "CAMPAIGN_BUDGET", "KPI_GOAL", "KPI_TYPE", "KPI_TARGET_VALUE",
+            "CPM", "IMPRESSIONS", "PLANNED_CAMPAIGN_REACH",
+            "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "SIGNAL_UTILIZATION", "FREQUENCY",
+        ]
+        _FRIENDLY_NAMES = {
+            "QUARTER": "Quarter", "ACCOUNT_NAME": "Client Name",
+            "CONVERSION_EVENT": "Conversion Event",
+            "SUB_ACCOUNT": "Campaign Name", "CHANNEL": "Marketing Channel",
+            "CAMPAIGN_BUDGET": "Budget", "KPI_GOAL": "KPI Goal",
+            "KPI_TYPE": "KPI Type", "KPI_TARGET_VALUE": "KPI Target",
+            "CPM": "CPM", "IMPRESSIONS": "Impressions",
+            "PLANNED_CAMPAIGN_REACH": "Planned Reach",
+            "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE": "Max Reach",
+            "SIGNAL_UTILIZATION": "Signal Util.", "FREQUENCY": "Frequency",
+        }
+        _NUM_COLS_SET = {
+            "CAMPAIGN_BUDGET", "KPI_TARGET_VALUE", "CPM", "IMPRESSIONS",
+            "PLANNED_CAMPAIGN_REACH", "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE",
+            "SIGNAL_UTILIZATION", "FREQUENCY",
+        }
+        _sel_cols = ", ".join(_DISPLAY_COLS)
+
+        _source_table_choice = _MAILOPS_TEST_TABLE
+        st.caption(f"Showing all rows from **{_source_table_choice}**")
+
+        @st.cache_data(ttl=30, show_spinner="Loading data...")
+        def _load_all_rows(_table: str) -> pd.DataFrame:
+            rows = session.sql(
+                f"SELECT {_sel_cols} FROM {_table} ORDER BY ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL, QUARTER"
+            ).collect()
+            data = []
+            for r in rows:
+                rd = r.as_dict()
+                row_out = {}
+                for c in _DISPLAY_COLS:
+                    v = rd.get(c)
+                    if c in _NUM_COLS_SET:
+                        row_out[_FRIENDLY_NAMES[c]] = float(v) if v is not None else 0.0
+                    else:
+                        row_out[_FRIENDLY_NAMES[c]] = str(v).strip() if v is not None else ""
+                data.append(row_out)
+            return pd.DataFrame(data) if data else pd.DataFrame(columns=[_FRIENDLY_NAMES[c] for c in _DISPLAY_COLS])
+
+        _orig_df = _load_all_rows(_source_table_choice)
+        if _orig_df.empty:
+            st.warning("No rows found in this table.")
+            return
+
+        _edited_df = st.data_editor(
+            _orig_df,
+            hide_index=False,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="_mo_excel_editor",
+            column_config={
+                "Budget": st.column_config.NumberColumn(format="%.2f"),
+                "KPI Target": st.column_config.NumberColumn(format="%.2f"),
+                "CPM": st.column_config.NumberColumn(format="%.2f"),
+                "Impressions": st.column_config.NumberColumn(format="%.0f"),
+                "Planned Reach": st.column_config.NumberColumn(format="%.0f"),
+                "Max Reach": st.column_config.NumberColumn(format="%.0f"),
+                "Signal Util.": st.column_config.NumberColumn(format="%.2f"),
+                "Frequency": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
+        # Detect changed or added rows
+        _friendly_to_db = {v: k for k, v in _FRIENDLY_NAMES.items()}
+        def _detect_changed_rows(orig: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
+            changed = []
+            # Existing rows that were modified
+            for idx in range(min(len(orig), len(edited))):
+                if not orig.iloc[idx].equals(edited.iloc[idx]):
+                    changed.append(edited.iloc[idx])
+            # Newly added rows
+            if len(edited) > len(orig):
+                for idx in range(len(orig), len(edited)):
+                    changed.append(edited.iloc[idx])
+            return pd.DataFrame(changed) if changed else pd.DataFrame()
+
+        _changed_df = _detect_changed_rows(_orig_df, _edited_df)
+        if not _changed_df.empty:
+            st.info(f"{len(_changed_df)} row(s) changed or added.")
+
+        st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
+        _btn_cols = st.columns(3)
+
+        # --- Download Excel ---
+        with _btn_cols[0]:
+            import io as _xl_io
+            import zipfile as _xl_zf
+            from xml.sax.saxutils import escape as _xl_esc
+            _xl_buf = _xl_io.BytesIO()
+            _xl_headers = list(_edited_df.columns)
+            _xl_ncols = len(_xl_headers)
+            def _xl_col_letter(idx):
+                r = ""; i = idx
+                while i >= 0: r = chr(65 + i % 26) + r; i = i // 26 - 1
+                return r
+            _xl_rows_xml = []
+            # header row
+            _xl_cells = "".join(
+                f'<c r="{_xl_col_letter(ci)}1" t="inlineStr"><is><t>{_xl_esc(str(h))}</t></is></c>'
+                for ci, h in enumerate(_xl_headers)
+            )
+            _xl_rows_xml.append(f'<row r="1">{_xl_cells}</row>')
+            for ri, (_, _xr) in enumerate(_edited_df.iterrows(), start=2):
+                _xl_cells = ""
+                for ci, h in enumerate(_xl_headers):
+                    v = _xr[h]
+                    ref = f"{_xl_col_letter(ci)}{ri}"
+                    if isinstance(v, (int, float)) and pd.notna(v):
+                        _xl_cells += f'<c r="{ref}" t="n"><v>{v}</v></c>'
+                    else:
+                        _xl_cells += f'<c r="{ref}" t="inlineStr"><is><t>{_xl_esc(str(v) if pd.notna(v) else "")}</t></is></c>'
+                _xl_rows_xml.append(f'<row r="{ri}">{_xl_cells}</row>')
+            _xl_sheet = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f'<sheetData>{"".join(_xl_rows_xml)}</sheetData></worksheet>'
+            )
+            with _xl_zf.ZipFile(_xl_buf, "w", _xl_zf.ZIP_DEFLATED) as _xz:
+                _xz.writestr("[Content_Types].xml",
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                    '<Default Extension="xml" ContentType="application/xml"/>'
+                    '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                    '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                    '</Types>')
+                _xz.writestr("_rels/.rels",
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                    '</Relationships>')
+                _xz.writestr("xl/workbook.xml",
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                    '<sheets><sheet name="MailOps Data" sheetId="1" r:id="rId1"/></sheets></workbook>')
+                _xz.writestr("xl/_rels/workbook.xml.rels",
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                    '</Relationships>')
+                _xz.writestr("xl/worksheets/sheet1.xml", _xl_sheet)
+            st.download_button(
+                "Download Excel",
+                _xl_buf.getvalue(),
+                file_name="mailops_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="_mo_dl_xlsx",
+            )
+
+        # --- Download CSV ---
+        with _btn_cols[1]:
+            _csv_bytes = _edited_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                _csv_bytes,
+                file_name="mailops_data.csv",
+                mime="text/csv",
+                key="_mo_dl_csv",
+            )
+
+        # --- Publish changed rows ---
+        with _btn_cols[2]:
+            _publish_disabled = _changed_df.empty
+            if st.button("Publish Changes to Snowflake", type="primary", key="_mo_publish", disabled=_publish_disabled):
+                try:
+                    _pub_count = 0
+                    _now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
+                    def _safe_float(v, default=0.0):
+                        try:
+                            f = float(v)
+                            return default if pd.isna(f) else f
+                        except (TypeError, ValueError):
+                            return default
+                    def _safe_str(v, default=""):
+                        if v is None or (isinstance(v, float) and pd.isna(v)):
+                            return default
+                        return str(v).strip()
+                    for _, _row in _changed_df.iterrows():
+                        session.sql(
+                            f"""INSERT INTO {_MAILOPS_TEST_TABLE}
+                                (QUARTER, ACCOUNT_NAME, CONVERSION_EVENT, SUB_ACCOUNT, CHANNEL,
+                                 CAMPAIGN_BUDGET, KPI_GOAL, KPI_TYPE, KPI_TARGET_VALUE,
+                                 CPM, IMPRESSIONS, PLANNED_CAMPAIGN_REACH,
+                                 MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE, SIGNAL_UTILIZATION, FREQUENCY,
+                                 UPDATED_AT, SUBMITTED_BY)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            params=[
+                                _safe_str(_row.get("Quarter")),
+                                _safe_str(_row.get("Client Name")),
+                                _safe_str(_row.get("Conversion Event")),
+                                _safe_str(_row.get("Campaign Name")),
+                                _safe_str(_row.get("Marketing Channel")),
+                                _safe_float(_row.get("Budget")),
+                                _safe_str(_row.get("KPI Goal")),
+                                _safe_str(_row.get("KPI Type")),
+                                _safe_float(_row.get("KPI Target")),
+                                _safe_float(_row.get("CPM")),
+                                _safe_float(_row.get("Impressions")),
+                                _safe_float(_row.get("Planned Reach")),
+                                _safe_float(_row.get("Max Reach")),
+                                _safe_float(_row.get("Signal Util.")),
+                                _safe_float(_row.get("Frequency")),
+                                _now_utc,
+                                _current_user,
+                            ],
+                        ).collect()
+                        _pub_count += 1
+                    st.success(f"Published {_pub_count} row(s) to {_MAILOPS_TEST_TABLE} by {_current_user} at {_now_utc} UTC.")
+                    _load_all_rows.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Publish failed: {exc}")
+        return
+
+    # =====================================================================
+    # SINGLE-ROW EDITOR (original view)
+    # =====================================================================
     _mo_accounts = sorted({
         str(r["ACCT_NAME"]).strip()
         for r in session.sql(
@@ -617,33 +853,33 @@ def render_mailops_editor(session) -> None:
         ).collect()
         if r["CHANNEL"]
     })
+    _mo_events = sorted({
+        str(r["EVT"]).strip()
+        for r in session.sql(
+            f"SELECT DISTINCT CONVERSION_TYPE AS EVT FROM {REFERENCE_HISTORICAL_TABLE} WHERE UPPER(TRIM(CLIENT_NAME))=UPPER(TRIM(?)) AND CONVERSION_TYPE IS NOT NULL AND AGGREGATION_LEVEL = 'OVERALL'",
+            params=[_mo_account],
+        ).collect()
+        if r["EVT"]
+    })
 
-    row1 = st.columns(3)
+    row1 = st.columns(4)
     with row1[0]:
         _mo_sub = st.selectbox("Campaign Name", _mo_subs or ["(none)"], key="_mo_sub")
     with row1[1]:
+        _mo_event = st.selectbox("Conversion Event", _mo_events or ["(none)"], key="_mo_event")
+    with row1[2]:
         _mo_channel = st.selectbox("Marketing Channel", _mo_channels or ["(none)"], key="_mo_channel")
 
-    # Quarters come from the planning table AND test table for this account/sub/channel combo
-    _MAILOPS_TEST_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS_TEST"
     _mo_filter_params = [_mo_account, _mo_sub if _mo_sub != "(none)" else "", _mo_channel if _mo_channel != "(none)" else ""]
     _mo_quarters = sorted({
         str(r["QUARTER"]).strip()
         for r in session.sql(
-            f"""SELECT DISTINCT QUARTER FROM (
-                    SELECT QUARTER FROM {PLANNING_INPUT_TABLE}
-                    WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
-                      AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
-                      AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
-                      AND QUARTER IS NOT NULL
-                    UNION
-                    SELECT QUARTER FROM {_MAILOPS_TEST_TABLE}
-                    WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
-                      AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
-                      AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
-                      AND QUARTER IS NOT NULL
-                )""",
-            params=_mo_filter_params + _mo_filter_params,
+            f"""SELECT DISTINCT QUARTER FROM {_MAILOPS_TEST_TABLE}
+                WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
+                  AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
+                  AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
+                  AND QUARTER IS NOT NULL""",
+            params=_mo_filter_params,
         ).collect()
         if r["QUARTER"]
     })
@@ -663,8 +899,6 @@ def render_mailops_editor(session) -> None:
 
     _mo_quarters_sorted = sorted(_mo_quarters, key=_quarter_sort_key, reverse=True)
 
-    # Compute a next-quarter option from the most recent existing quarter,
-    # or from today's date if no planning data exists yet for this combo.
     if _mo_quarters_sorted:
         _nq_label = _next_q(_mo_quarters_sorted[0])
     else:
@@ -678,7 +912,7 @@ def render_mailops_editor(session) -> None:
     else:
         _mo_quarter_options = _mo_quarters_sorted
 
-    with row1[2]:
+    with row1[3]:
         _mo_quarter = st.selectbox("Input Quarter", _mo_quarter_options or ["(none)"], key="_mo_quarter")
 
     _is_new_quarter = _mo_quarter.endswith(" (new)")
@@ -694,6 +928,7 @@ def render_mailops_editor(session) -> None:
     _EMPTY_ROW = {
         "QUARTER": _mo_quarter_clean,
         "ACCOUNT_NAME": _mo_account,
+        "CONVERSION_EVENT": _mo_event if _mo_event != "(none)" else "",
         "SUB_ACCOUNT": _mo_sub if _mo_sub != "(none)" else "",
         "CHANNEL": _mo_channel if _mo_channel != "(none)" else "",
         "CAMPAIGN_BUDGET": 0.0, "KPI_GOAL": "", "KPI_TYPE": "", "KPI_TARGET_VALUE": 0.0,
@@ -713,7 +948,6 @@ def render_mailops_editor(session) -> None:
     _has_planning_row = False
     _source_table = ""
 
-    # For non-new quarters, check the test table first
     if _ref_quarter and not _is_new_quarter:
         _test_rows = session.sql(
             f"""SELECT * FROM {_MAILOPS_TEST_TABLE}
@@ -730,14 +964,15 @@ def render_mailops_editor(session) -> None:
             _has_planning_row = True
             _source_table = "test"
 
-    # Fall back to planning table
     if _mo_row is None and _ref_quarter:
         _plan_rows = session.sql(
-            f"""SELECT * FROM {PLANNING_INPUT_TABLE}
+            f"""SELECT * FROM {_MAILOPS_TEST_TABLE}
                 WHERE UPPER(TRIM(QUARTER))=UPPER(TRIM(?))
                   AND UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
-                  AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))""",
+                  AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
+                ORDER BY UPDATED_AT DESC NULLS LAST
+                LIMIT 1""",
             params=[_ref_quarter, _mo_account, _mo_sub, _mo_channel],
         ).collect()
         if _plan_rows:
@@ -752,18 +987,21 @@ def render_mailops_editor(session) -> None:
 
     if _mo_row is None:
         _mo_row = _EMPTY_ROW
+    _mo_row.setdefault("CONVERSION_EVENT", _mo_event if _mo_event != "(none)" else "")
+
     _ALL_COLS = [
-        "QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL",
+        "QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL",
         "CAMPAIGN_BUDGET", "KPI_TYPE", "KPI_TARGET_VALUE",
         "CPM", "IMPRESSIONS", "PLANNED_CAMPAIGN_REACH",
         "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "SIGNAL_UTILIZATION", "FREQUENCY",
     ]
-    _KEY_COLS = {"QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL"}
-    _STR_COLS = {"QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL", "KPI_TYPE"}
+    _KEY_COLS = {"QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL"}
+    _STR_COLS = {"QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL", "KPI_TYPE"}
 
     _COL_RENAME = {
         "QUARTER": "Quarter",
         "ACCOUNT_NAME": "Client Name",
+        "CONVERSION_EVENT": "Conversion Event",
         "SUB_ACCOUNT": "Campaign Name",
         "CHANNEL": "Marketing Channel",
         "CAMPAIGN_BUDGET": "Budget",
@@ -776,7 +1014,7 @@ def render_mailops_editor(session) -> None:
         "SIGNAL_UTILIZATION": "Signal Util.",
         "FREQUENCY": "Frequency",
     }
-    _ROW1_COLS = ["QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL",
+    _ROW1_COLS = ["QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL",
                   "CAMPAIGN_BUDGET", "KPI_TYPE", "KPI_TARGET_VALUE"]
     _ROW2_COLS = ["CPM", "IMPRESSIONS", "PLANNED_CAMPAIGN_REACH",
                   "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "SIGNAL_UTILIZATION", "FREQUENCY"]
@@ -836,15 +1074,16 @@ def render_mailops_editor(session) -> None:
             _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
             session.sql(
                 f"""INSERT INTO {_MAILOPS_TEST_TABLE}
-                    (QUARTER, ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL,
+                    (QUARTER, ACCOUNT_NAME, CONVERSION_EVENT, SUB_ACCOUNT, CHANNEL,
                      CAMPAIGN_BUDGET, KPI_GOAL, KPI_TYPE, KPI_TARGET_VALUE,
                      CPM, IMPRESSIONS, PLANNED_CAMPAIGN_REACH,
                      MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE, SIGNAL_UTILIZATION, FREQUENCY,
                      UPDATED_AT, SUBMITTED_BY)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 params=[
                     str(new1["Quarter"]),
                     str(new1["Client Name"]),
+                    str(new1.get("Conversion Event", "")),
                     str(new1["Campaign Name"]),
                     str(new1["Marketing Channel"]),
                     float(new1["Budget"]),
@@ -867,6 +1106,55 @@ def render_mailops_editor(session) -> None:
             st.error(f"Save failed: {exc}")
 
 
+
+
+def render_input_data_section(key_suffix: str) -> None:
+    """Reusable section: toggle button showing client info + historical KPI table."""
+    selected_history = st.session_state.get("selected_history")
+    if not selected_history:
+        return
+    st.session_state.setdefault("show_input_data", False)
+    btn_label = "Hide Input Data" if st.session_state.show_input_data else "Show Input Data"
+    if st.button(btn_label, key=f"toggle_input_data_{key_suffix}"):
+        st.session_state.show_input_data = not st.session_state.show_input_data
+        st.rerun()
+    if st.session_state.show_input_data:
+        with st.container(border=True):
+            _id_cols = st.columns(4)
+            _id_cols[0].metric("Client Name", st.session_state.get("source_account") or "—")
+            _id_cols[1].metric("Conversion Event", st.session_state.get("selected_event") or "—")
+            _id_cols[2].metric("Campaign Name", st.session_state.get("selected_sub_account") or "—")
+            _id_cols[3].metric("Marketing Channel", st.session_state.get("selected_channel") or "—")
+            st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
+            st.markdown("**Historical Quarterly KPIs & Performance**")
+            _kpi_rows = []
+            for row in selected_history:
+                _kpi_rows.append({
+                    "Quarter": row["campaign_quarter"],
+                    "Delivered": f"{float(row['delivered_volume']):,.0f}",
+                    "Spend": f"${float(row['source_spend']):,.0f}",
+                    "Avg. Frequency": f"{float(row['frequency']):.1f}",
+                    "Prospects": f"{float(row['prospects']):,.0f}",
+                    "Inc. Customers": f"{float(row['incremental_customers']):,.0f}",
+                    "Inc. Revenue": f"${float(row['incremental_revenue']):,.0f}",
+                    "Avg. Inc. Rev": f"${float(row['average_incremental_revenue']):,.0f}",
+                    "CPIx": f"${float(row['cpix']):,.2f}",
+                    "iROAS": f"${float(row['iroas']):.3f}",
+                })
+            _n = len(selected_history)
+            _kpi_rows.append({
+                "Quarter": "Average",
+                "Delivered": f"{sum(float(r['delivered_volume']) for r in selected_history) / _n:,.0f}",
+                "Spend": f"${sum(float(r['source_spend']) for r in selected_history) / _n:,.0f}",
+                "Avg. Frequency": f"{sum(float(r['frequency']) for r in selected_history) / _n:.1f}",
+                "Prospects": f"{sum(float(r['prospects']) for r in selected_history) / _n:,.0f}",
+                "Inc. Customers": f"{sum(float(r['incremental_customers']) for r in selected_history) / _n:,.0f}",
+                "Inc. Revenue": f"${sum(float(r['incremental_revenue']) for r in selected_history) / _n:,.0f}",
+                "Avg. Inc. Rev": f"${sum(float(r['average_incremental_revenue']) for r in selected_history) / _n:,.0f}",
+                "CPIx": f"${sum(float(r['cpix']) for r in selected_history) / _n:,.2f}",
+                "iROAS": f"${sum(float(r['iroas']) for r in selected_history) / _n:.3f}",
+            })
+            st.dataframe(pd.DataFrame(_kpi_rows), hide_index=True, use_container_width=True)
 
 
 def initialize_state() -> None:
@@ -922,7 +1210,7 @@ def reset_for_new_account() -> None:
         "current_budget", "cpm", "planned_reach", "signal_utilization",
         "max_reach", "frequency_at_max", "_widget_frequency_at_max", "selected_source",
         "historical_scope_label", "selected_history", "tier_overrides",
-        "show_historical_kpis",
+        "show_input_data", "show_historical_kpis",
         "applied_planning_key", "active_tab", "num_scenarios",
         "attribution_window", "selected_sub_account", "selected_event",
         "selected_channel", "selected_planning_quarter",
@@ -2219,7 +2507,7 @@ with title_col:
         '</div>',
         unsafe_allow_html=True,
     )
-mailops_col, _spacer, reset_col = st.columns([1, 6, 1])
+mailops_col, _spacer, reset_col = st.columns([2, 4, 2])
 with mailops_col:
     if st.button("Change MailOps Data", key="_mailops_btn", help="Add MailOps data through this tool"):
         st.session_state.mailops_mode = True
@@ -2891,49 +3179,7 @@ if st.session_state.preview and active_tab == 0:
 if st.session_state.confirmed and active_tab == 1:
     selected_history = st.session_state.selected_history
     st.subheader("Mail Ops Data")
-    st.session_state.setdefault("show_historical_kpis", False)
-    kpi_button_label = (
-        "Hide historical quarterly KPIs"
-        if st.session_state.show_historical_kpis
-        else "Show historical quarterly KPIs"
-    )
-    if "show_historical_kpis" not in st.session_state:
-        st.session_state.show_historical_kpis = False
-    kpi_button_label = "Hide Historical KPIs" if st.session_state.show_historical_kpis else "Show Historical KPIs"
-    if st.button(kpi_button_label, key="toggle_historical_kpis"):
-        st.session_state.show_historical_kpis = not st.session_state.show_historical_kpis
-        st.rerun()
-
-    if st.session_state.show_historical_kpis:
-        st.header("Historical Quarterly KPIs & Performance")
-        _kpi_rows = []
-        for row in selected_history:
-            _kpi_rows.append({
-                "Quarter": row["campaign_quarter"],
-                "Delivered": f"{float(row['delivered_volume']):,.0f}",
-                "Spend": f"${float(row['source_spend']):,.0f}",
-                "Avg. Frequency": f"{float(row['frequency']):.1f}",
-                "Prospects": f"{float(row['prospects']):,.0f}",
-                "Inc. Customers": f"{float(row['incremental_customers']):,.0f}",
-                "Inc. Revenue": f"${float(row['incremental_revenue']):,.0f}",
-                "Avg. Inc. Rev": f"${float(row['average_incremental_revenue']):,.0f}",
-                "CPIx": f"${float(row['cpix']):,.2f}",
-                "iROAS": f"${float(row['iroas']):.3f}",
-            })
-        _n = len(selected_history)
-        _kpi_rows.append({
-            "Quarter": "Average",
-            "Delivered": f"{sum(float(r['delivered_volume']) for r in selected_history) / _n:,.0f}",
-            "Spend": f"${sum(float(r['source_spend']) for r in selected_history) / _n:,.0f}",
-            "Avg. Frequency": f"{sum(float(r['frequency']) for r in selected_history) / _n:.1f}",
-            "Prospects": f"{sum(float(r['prospects']) for r in selected_history) / _n:,.0f}",
-            "Inc. Customers": f"{sum(float(r['incremental_customers']) for r in selected_history) / _n:,.0f}",
-            "Inc. Revenue": f"${sum(float(r['incremental_revenue']) for r in selected_history) / _n:,.0f}",
-            "Avg. Inc. Rev": f"${sum(float(r['average_incremental_revenue']) for r in selected_history) / _n:,.0f}",
-            "CPIx": f"${sum(float(r['cpix']) for r in selected_history) / _n:,.2f}",
-            "iROAS": f"${sum(float(r['iroas']) for r in selected_history) / _n:.3f}",
-        })
-        st.dataframe(pd.DataFrame(_kpi_rows), hide_index=True, use_container_width=True)
+    render_input_data_section("tab2")
 
     historical_frequency = sum(
         float(row["frequency"]) for row in selected_history
@@ -3590,6 +3836,7 @@ if st.session_state.forecast and active_tab == 2:
     except Exception:
         pass
 
+    render_input_data_section("tab3a")
     st.header("Forecast Output Ranges")
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
 
@@ -3889,6 +4136,7 @@ if (st.session_state.forecast
     }
     _range_adj = st.session_state.get("range_percent_input", 10) / 100
 
+    render_input_data_section("tab3b_qs")
     st.header("Quarterly Split")
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
@@ -4049,6 +4297,7 @@ if (st.session_state.forecast
         4: ["Oct", "Nov", "Dec"],
     }
 
+    render_input_data_section("tab3c_ms")
     st.header("Monthly Split")
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
@@ -4259,6 +4508,7 @@ if (st.session_state.forecast
     }
     _proj_months = QUARTER_MONTHS_MAP[_pq_num]
 
+    render_input_data_section("tab3b_qm")
     st.header(f"Quarterly Monthly Split: {_proj_q}")
     _quarterly_scenario = st.session_state.get("quarterly_scenario", "Baseline")
     _imp_factor_val = 0.0
@@ -4413,6 +4663,7 @@ if st.session_state.forecast and active_tab == _charts_tab_idx:
         key=quarter_value,
     )
 
+    render_input_data_section("tab4_charts")
     st.header("Forecast Charts")
 
     # Build chart dataframe with ALL tiers
@@ -4805,6 +5056,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     _proj_q_save = st.session_state.get("projection_quarter", "")
     _sig_util_save = st.session_state.get("_cached_sig_util", {})
 
+    render_input_data_section("tab5_save")
     st.header("Save Results to Snowflake")
 
     # Build scenario options
