@@ -15,6 +15,9 @@ REFERENCE_HISTORICAL_TABLE = (
     "ZX.ACQUISITION.VW_ZX_ROI_MEASUREMENT_AGGREGATED_CUMULATIVE_PERFORMANCE"
 )
 ORGANIC_DAILY_TABLE = "ZX.ANALYTICS.ZX_ATTRIBUTION_DAILY_CONVERSION_SUMMARY"
+MONTHLY_PERFORMANCE_TABLE = (
+    "ZX.ACQUISITION.VW_ZX_ROI_MEASUREMENT_WEEKLY_MONTHLY_PERFORMANCE"
+)
 
 
 def active_session():
@@ -55,8 +58,8 @@ def account_dimensions(
     identifier = str(account_identifier or "").strip()
     if not identifier:
         return []
-    filters = ["CLIENT_NAME ILIKE ?"]
-    params: list[Any] = [f"%{identifier}%"]
+    filters = ["UPPER(TRIM(COALESCE(CLIENT_NAME, ''))) = UPPER(TRIM(?))"]
+    params: list[Any] = [identifier]
     if sub_account:
         filters.append("UPPER(TRIM(COALESCE(CAMPAIGN_NAME, ''))) = UPPER(TRIM(?))")
         params.append(sub_account)
@@ -233,9 +236,8 @@ def _dimension_filters(
     filters: list[str] = []
     params: list[Any] = []
     if account_name:
-        account_pattern = f"%{str(account_name).strip()}%"
-        filters.append("CLIENT_NAME ILIKE ?")
-        params.append(account_pattern)
+        filters.append("UPPER(TRIM(COALESCE(CLIENT_NAME, ''))) = UPPER(TRIM(?))")
+        params.append(str(account_name).strip())
     if sub_account and sub_account != "All":
         filters.append("UPPER(TRIM(COALESCE(CAMPAIGN_NAME, ''))) = UPPER(TRIM(?))")
         params.append(sub_account)
@@ -260,9 +262,8 @@ def _legacy_dimension_filters(
     filters: list[str] = []
     params: list[Any] = []
     if account_name:
-        account_pattern = f"%{str(account_name).strip()}%"
-        filters.append("(ACCT_NAME ILIKE ? OR TO_VARCHAR(ACCT_ID) ILIKE ?)")
-        params.extend([account_pattern, account_pattern])
+        filters.append("UPPER(TRIM(COALESCE(ACCT_NAME, ''))) = UPPER(TRIM(?))")
+        params.append(str(account_name).strip())
     if sub_account and sub_account != "All":
         filters.append("UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))")
         params.append(sub_account)
@@ -357,6 +358,25 @@ def historical_monthly_preview(
             account_name, sub_account, event, channel,
         ),
         period="month",
+    )
+
+
+def historical_previews(
+    session: Any,
+    table_name: str,
+    attribution_window: int = 30,
+    account_name: str | None = None,
+    sub_account: str | None = None,
+    event: str | None = None,
+    channel: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch the filtered history once and derive quarter and month previews."""
+    rows = _historical_cumulative_rows(
+        session, attribution_window, account_name, sub_account, event, channel
+    )
+    return (
+        _latest_historical_snapshots(rows, period="quarter"),
+        _latest_historical_snapshots(rows, period="month"),
     )
 
 
@@ -520,205 +540,142 @@ def seasonal_indexes(
     event: str | None = None,
     channel: str | None = None,
 ) -> dict[str, Any]:
-    """Compute quarterly and monthly organic + incremental seasonal indexes."""
-    incremental_monthly_rows = _try_monthly_from_cumulative(
-        session, attribution_window, account_name, sub_account, event, channel
-    )
-    incremental_by_month = {
-        str(row.get("MONTH", "")): float(row.get("INCREMENTAL", 0) or 0)
-        for row in incremental_monthly_rows
-    }
-    monthly_rows = [
-        {
-            "MONTH": row["MONTH"],
-            "ORGANIC": row.get("ORGANIC", 0),
-            "INCREMENTAL": incremental_by_month.get(str(row["MONTH"]), 0.0),
-        }
-        for row in _daily_organic_months(
-            session, account_name, sub_account, event, channel
-        )
-    ]
+    """Compute exact seasonal indexes from owned monthly source records.
 
+    The direct monthly-performance view supplies incremental conversions, gross
+    treatment conversions, and campaign-quarter ownership. Organic conversions
+    are joined to that ownership by both calendar month and campaign quarter so
+    attribution-window overlap is counted only once.
+    """
     month_names = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
-    total_organic_mo = sum(float(r.get("ORGANIC", 0) or 0) for r in monthly_rows)
-    total_inc_mo = sum(float(r.get("INCREMENTAL", 0) or 0) for r in monthly_rows)
+    monthly_rows = _seasonal_month_rows(
+        session, account_name, sub_account, event, channel
+    )
 
-    monthly_organic = {}
-    monthly_incremental = {}
-    if monthly_rows and total_organic_mo > 0:
-        for r in monthly_rows:
-            month_str = str(r.get("MONTH", ""))
-            mo_idx = _parse_month_index(month_str)
-            if mo_idx is not None:
-                mo_name = month_names[mo_idx]
-                monthly_organic[mo_name] = float(r.get("ORGANIC", 0) or 0) / total_organic_mo
-                monthly_incremental[mo_name] = (
-                    float(r.get("INCREMENTAL", 0) or 0) / total_inc_mo
-                    if total_inc_mo else 0.0
-                )
+    organic_values = {month: 0.0 for month in month_names}
+    incremental_values = {month: 0.0 for month in month_names}
+    quarter_organic_values = {f"Q{quarter}": 0.0 for quarter in range(1, 5)}
+    quarter_incremental_values = {f"Q{quarter}": 0.0 for quarter in range(1, 5)}
 
-    if len(monthly_organic) < 6:
-        monthly_organic = {
-            "Jan": 0.085, "Feb": 0.085, "Mar": 0.09,
-            "Apr": 0.08, "May": 0.09, "Jun": 0.08,
-            "Jul": 0.09, "Aug": 0.09, "Sep": 0.08,
-            "Oct": 0.08, "Nov": 0.08, "Dec": 0.07,
-        }
-        monthly_incremental = {
-            "Jan": 0.074, "Feb": 0.074, "Mar": 0.084,
-            "Apr": 0.075, "May": 0.086, "Jun": 0.094,
-            "Jul": 0.09, "Aug": 0.102, "Sep": 0.112,
-            "Oct": 0.085, "Nov": 0.062, "Dec": 0.062,
-        }
+    for row in monthly_rows:
+        month_index = _parse_month_index(str(row.get("MONTH", "")))
+        if month_index is None:
+            continue
+        month_name = month_names[month_index]
+        organic = float(row.get("ORGANIC", 0) or 0)
+        # Business rule: negative monthly incremental conversions contribute
+        # zero to the seasonal distribution and its denominator.
+        incremental = max(0.0, float(row.get("INCREMENTAL", 0) or 0))
+        organic_values[month_name] += organic
+        incremental_values[month_name] += incremental
 
-    quarter_months = {
-        "Q1": ("Jan", "Feb", "Mar"),
-        "Q2": ("Apr", "May", "Jun"),
-        "Q3": ("Jul", "Aug", "Sep"),
-        "Q4": ("Oct", "Nov", "Dec"),
-    }
-    quarterly_organic = {
-        q: sum(monthly_organic.get(m, 0.0) for m in ms)
-        for q, ms in quarter_months.items()
-    }
-    quarterly_incremental = {
-        q: sum(monthly_incremental.get(m, 0.0) for m in ms)
-        for q, ms in quarter_months.items()
-    }
+        quarter_match = re.fullmatch(
+            r"Q([1-4])(?:\s*\d{4})?",
+            str(row.get("CAMPAIGN_QUARTER", "")).strip().upper(),
+        )
+        if quarter_match:
+            quarter_name = f"Q{quarter_match.group(1)}"
+            quarter_organic_values[quarter_name] += organic
+            quarter_incremental_values[quarter_name] += incremental
+
+    def _normalize(values: dict[str, float]) -> dict[str, float]:
+        total = sum(values.values())
+        if total <= 0:
+            return {key: 0.0 for key in values}
+        return {key: value / total for key, value in values.items()}
+
+    monthly_organic = _normalize(organic_values)
+    monthly_incremental = _normalize(incremental_values)
+    quarterly_organic = _normalize(quarter_organic_values)
+    quarterly_incremental = _normalize(quarter_incremental_values)
+
     return {
         "quarterly_organic": quarterly_organic,
         "quarterly_incremental": quarterly_incremental,
         "monthly_organic": monthly_organic,
         "monthly_incremental": monthly_incremental,
+        "monthly_rows": monthly_rows,
     }
 
 
-def _daily_organic_quarters(
+def _seasonal_month_rows(
     session: Any,
     account_name: str | None = None,
     sub_account: str | None = None,
     event: str | None = None,
     channel: str | None = None,
 ) -> list[dict[str, Any]]:
-    where_clause, params = _legacy_dimension_filters(account_name, sub_account, event, channel)
+    """Return one campaign-owned record per calendar month for seasonal QA."""
+    monthly_where, monthly_params = _dimension_filters(
+        account_name, sub_account, event, channel
+    )
+    organic_where, organic_params = _legacy_dimension_filters(
+        account_name, sub_account, event, channel
+    )
     query = f"""
-        SELECT CONCAT('Q', DATE_PART('QUARTER', CONVERSION_DATE), ' ',
-                   DATE_PART('YEAR', CONVERSION_DATE)) AS CAMPAIGN_QUARTER,
-               SUM(COALESCE(RELEVANT_ORGANIC_CONVERSIONS, 0)) AS ORGANIC
-        FROM {ORGANIC_DAILY_TABLE}
-        WHERE {where_clause} AND CONVERSION_DATE IS NOT NULL
-        GROUP BY 1 ORDER BY 1
+        WITH monthly_rollup AS (
+            SELECT
+                CAMPAIGN_QUARTER,
+                MONTH_MARKER,
+                TO_DATE(MONTH_MARKER, 'MON, YY') AS CALENDAR_MONTH,
+                SUM(COALESCE(MONTHLY_INCREMENTAL_CONVERSIONS, 0)) AS INCREMENTAL,
+                SUM(COALESCE(MONTHLY_TREATMENT_CONVERSIONS, 0)) AS GROSS_TRT_CONVERSIONS
+            FROM {MONTHLY_PERFORMANCE_TABLE}
+            WHERE {monthly_where}
+              AND MONTHLY_DATE_RANGE IS NOT NULL
+              AND MONTH_MARKER IS NOT NULL
+            GROUP BY CAMPAIGN_QUARTER, MONTH_MARKER
+        ),
+        owned_months AS (
+            SELECT *
+            FROM monthly_rollup
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY CALENDAR_MONTH
+                ORDER BY
+                    TRY_TO_NUMBER(RIGHT(CAMPAIGN_QUARTER, 4)) DESC,
+                    TRY_TO_NUMBER(SUBSTR(CAMPAIGN_QUARTER, 2, 1)) DESC
+            ) = 1
+        ),
+        latest_months AS (
+            SELECT *
+            FROM owned_months
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY DATE_PART('MONTH', CALENDAR_MONTH)
+                ORDER BY CALENDAR_MONTH DESC
+            ) = 1
+        ),
+        organic AS (
+            SELECT
+                CAMPAIGN_QUARTER,
+                DATE_TRUNC('MONTH', CONVERSION_DATE)::DATE AS CALENDAR_MONTH,
+                SUM(COALESCE(RELEVANT_ORGANIC_CONVERSIONS, 0)) AS ORGANIC
+            FROM {ORGANIC_DAILY_TABLE}
+            WHERE {organic_where}
+              AND CONVERSION_DATE IS NOT NULL
+            GROUP BY CAMPAIGN_QUARTER, DATE_TRUNC('MONTH', CONVERSION_DATE)
+        )
+        SELECT
+            m.CAMPAIGN_QUARTER,
+            m.MONTH_MARKER,
+            TO_CHAR(m.CALENDAR_MONTH, 'Mon') AS MONTH,
+            COALESCE(o.ORGANIC, 0) AS ORGANIC,
+            GREATEST(COALESCE(m.INCREMENTAL, 0), 0) AS INCREMENTAL,
+            COALESCE(m.GROSS_TRT_CONVERSIONS, 0) AS GROSS_TRT_CONVERSIONS
+        FROM latest_months m
+        LEFT JOIN organic o
+          ON UPPER(TRIM(o.CAMPAIGN_QUARTER)) = UPPER(TRIM(m.CAMPAIGN_QUARTER))
+         AND o.CALENDAR_MONTH = m.CALENDAR_MONTH
+        ORDER BY DATE_PART('MONTH', m.CALENDAR_MONTH), m.CAMPAIGN_QUARTER
     """
-    return _rows(session.sql(query, params=params).collect())
-
-
-def _daily_organic_months(
-    session: Any,
-    account_name: str | None = None,
-    sub_account: str | None = None,
-    event: str | None = None,
-    channel: str | None = None,
-) -> list[dict[str, Any]]:
-    where_clause, params = _legacy_dimension_filters(account_name, sub_account, event, channel)
-    query = f"""
-        SELECT TO_CHAR(CONVERSION_DATE, 'Mon') AS MONTH,
-               SUM(COALESCE(RELEVANT_ORGANIC_CONVERSIONS, 0)) AS ORGANIC
-        FROM {ORGANIC_DAILY_TABLE}
-        WHERE {where_clause} AND CONVERSION_DATE IS NOT NULL
-        GROUP BY MONTH(CONVERSION_DATE), TO_CHAR(CONVERSION_DATE, 'Mon')
-        ORDER BY MONTH(CONVERSION_DATE)
-    """
-    return _rows(session.sql(query, params=params).collect())
-
-
-def _try_monthly_from_cumulative(
-    session: Any,
-    attribution_window: int,
-    account_name: str | None = None,
-    sub_account: str | None = None,
-    event: str | None = None,
-    channel: str | None = None,
-) -> list[dict[str, Any]]:
-    """Convert cumulative weekly rows to monthly deltas using LAG."""
-    try:
-        quarter_windows = _per_quarter_attribution_windows(
-            session, account_name, sub_account, event, channel
-        )
-        if not quarter_windows:
-            return []
-
-        where_clause, params = _dimension_filters(
-            account_name, sub_account, event, channel
-        )
-        quarter_filter_parts = []
-        quarter_params = []
-        for quarter, window in quarter_windows.items():
-            quarter_filter_parts.append("(CAMPAIGN_QUARTER = ? AND RESPONSE_WINDOW = ?)")
-            quarter_params.extend([quarter, str(window)])
-
-        full_where = (
-            f"AGGREGATION_LEVEL = 'OVERALL'"
-            f" AND ({' OR '.join(quarter_filter_parts)})"
-            f" AND {where_clause}"
-        )
-        all_params = quarter_params + params
-
-        query = f"""
-            WITH base AS (
-                SELECT CAMPAIGN_QUARTER,
-                       CAST(REPLACE(QUARTERLY_WEEK_NUMBER, 'W', '') AS INT) AS WEEK_NUM,
-                       TO_CHAR(LAST_DELIVERY_DATE, 'Mon') AS MONTH_NAME,
-                       SUM(TREATMENT_CONVERSIONS) AS TRT,
-                       SUM(CONTROL_CONVERSIONS) AS CTR,
-                       SUM(TREATMENT_PROSPECTS) AS TRT_P,
-                       SUM(CONTROL_PROSPECTS) AS CTR_P
-                FROM {REFERENCE_HISTORICAL_TABLE}
-                WHERE {full_where}
-                GROUP BY CAMPAIGN_QUARTER, QUARTERLY_WEEK_NUMBER, LAST_DELIVERY_DATE
-            ),
-            with_inc AS (
-                SELECT CAMPAIGN_QUARTER, WEEK_NUM, MONTH_NAME,
-                       TRT + CTR AS ORGANIC_CUM,
-                       CASE WHEN TRT_P > 0 AND CTR_P > 0
-                            THEN (TRT / TRT_P - CTR / CTR_P) * TRT_P
-                            ELSE TRT END AS INC_CUM
-                FROM base
-            ),
-            weekly_diffs AS (
-                SELECT CAMPAIGN_QUARTER, WEEK_NUM, MONTH_NAME,
-                       ORGANIC_CUM - LAG(ORGANIC_CUM, 1, 0)
-                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY WEEK_NUM) AS WEEK_ORGANIC,
-                       INC_CUM - LAG(INC_CUM, 1, 0)
-                           OVER (PARTITION BY CAMPAIGN_QUARTER ORDER BY WEEK_NUM) AS WEEK_INCREMENTAL
-                FROM with_inc
-            )
-            SELECT MONTH_NAME,
-                   SUM(WEEK_ORGANIC) AS MONTHLY_ORGANIC,
-                   SUM(WEEK_INCREMENTAL) AS MONTHLY_INCREMENTAL
-            FROM weekly_diffs
-            WHERE MONTH_NAME IS NOT NULL
-            GROUP BY MONTH_NAME
-            ORDER BY CASE MONTH_NAME
-                WHEN 'Jan' THEN 1 WHEN 'Feb' THEN 2 WHEN 'Mar' THEN 3
-                WHEN 'Apr' THEN 4 WHEN 'May' THEN 5 WHEN 'Jun' THEN 6
-                WHEN 'Jul' THEN 7 WHEN 'Aug' THEN 8 WHEN 'Sep' THEN 9
-                WHEN 'Oct' THEN 10 WHEN 'Nov' THEN 11 WHEN 'Dec' THEN 12
-            END
-        """
-        rows = _rows(session.sql(query, params=all_params).collect())
-        return [
-            {
-                "MONTH": str(row.get("MONTH_NAME", "")),
-                "ORGANIC": float(row.get("MONTHLY_ORGANIC", 0) or 0),
-                "INCREMENTAL": float(row.get("MONTHLY_INCREMENTAL", 0) or 0),
-            }
-            for row in rows
-        ]
-    except Exception:
-        return []
+    return _rows(
+        session.sql(
+            query,
+            params=[*monthly_params, *organic_params],
+        ).collect()
+    )
 
 
 def _parse_month_index(value: str) -> int | None:
