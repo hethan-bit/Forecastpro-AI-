@@ -587,17 +587,18 @@ st.markdown(
 
 def render_mailops_editor(session) -> None:
     """Full-page editor for the FORECASTING_INPUTS planning table."""
-    _MAILOPS_TEST_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS_TEST"
+    _MAILOPS_TEST_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS"
 
     st.markdown(
         '<h1 class="hero-title">Edit MailOps Data</h1>',
         unsafe_allow_html=True,
     )
-    _view_label = "Single-Row Editor" if st.session_state.get("_mo_excel_view") else "Excel View"
+    st.warning("All Q4 entries are temporary — they were duplicated from Q3 data and need to be updated with actual Q4 values.")
+    _view_label = "Single-Row Editor" if st.session_state.get("_mo_excel_view", True) else "Excel View"
     _top_cols = st.columns([2, 6])
     with _top_cols[0]:
         if st.button(_view_label, key="_mo_toggle_view"):
-            st.session_state["_mo_excel_view"] = not st.session_state.get("_mo_excel_view", False)
+            st.session_state["_mo_excel_view"] = not st.session_state.get("_mo_excel_view", True)
             st.rerun()
 
     st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
@@ -605,28 +606,29 @@ def render_mailops_editor(session) -> None:
     # =====================================================================
     # EXCEL-STYLE BULK VIEW
     # =====================================================================
-    if st.session_state.get("_mo_excel_view"):
+    if st.session_state.get("_mo_excel_view", True):
         _DISPLAY_COLS = [
-            "QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL",
-            "CAMPAIGN_BUDGET", "KPI_GOAL", "KPI_TYPE", "KPI_TARGET_VALUE",
+            "QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL",
+            "CAMPAIGN_BUDGET", "KPI_TYPE", "KPI_TARGET_VALUE",
             "CPM", "IMPRESSIONS", "PLANNED_CAMPAIGN_REACH",
-            "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "SIGNAL_UTILIZATION", "FREQUENCY",
+            "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "MAX_CONVERSIONS",
+            "SIGNAL_UTILIZATION", "FREQUENCY",
         ]
         _FRIENDLY_NAMES = {
             "QUARTER": "Quarter", "ACCOUNT_NAME": "Client Name",
-            "CONVERSION_EVENT": "Conversion Event",
             "SUB_ACCOUNT": "Campaign Name", "CHANNEL": "Marketing Channel",
-            "CAMPAIGN_BUDGET": "Budget", "KPI_GOAL": "KPI Goal",
+            "CAMPAIGN_BUDGET": "Budget",
             "KPI_TYPE": "KPI Type", "KPI_TARGET_VALUE": "KPI Target",
             "CPM": "CPM", "IMPRESSIONS": "Impressions",
             "PLANNED_CAMPAIGN_REACH": "Planned Reach",
             "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE": "Max Reach",
+            "MAX_CONVERSIONS": "Max Conversions",
             "SIGNAL_UTILIZATION": "Signal Util.", "FREQUENCY": "Frequency",
         }
         _NUM_COLS_SET = {
             "CAMPAIGN_BUDGET", "KPI_TARGET_VALUE", "CPM", "IMPRESSIONS",
             "PLANNED_CAMPAIGN_REACH", "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE",
-            "SIGNAL_UTILIZATION", "FREQUENCY",
+            "MAX_CONVERSIONS", "SIGNAL_UTILIZATION", "FREQUENCY",
         }
         _sel_cols = ", ".join(_DISPLAY_COLS)
 
@@ -657,7 +659,11 @@ def render_mailops_editor(session) -> None:
             return
 
         # Quarter filter
-        _all_quarters = sorted(_orig_df["Quarter"].dropna().unique().tolist())
+        def _qsort(label):
+            import re as _re
+            m = _re.match(r"Q(\d)\s+(\d{4})", str(label).strip())
+            return int(m.group(2)) * 4 + int(m.group(1)) if m else 0
+        _all_quarters = sorted(_orig_df["Quarter"].dropna().unique().tolist(), key=_qsort, reverse=True)
         _quarter_options = ["All Quarters"] + _all_quarters
         _selected_quarter = st.selectbox(
             "Filter by Quarter",
@@ -674,16 +680,21 @@ def render_mailops_editor(session) -> None:
             _filtered_orig,
             hide_index=False,
             use_container_width=True,
-            num_rows="dynamic",
+            num_rows="fixed",
             key="_mo_excel_editor",
             column_config={
-                "Budget": st.column_config.NumberColumn(format="%.2f"),
-                "KPI Target": st.column_config.NumberColumn(format="%.2f"),
-                "CPM": st.column_config.NumberColumn(format="%.2f"),
-                "Impressions": st.column_config.NumberColumn(format="%.0f"),
-                "Planned Reach": st.column_config.NumberColumn(format="%.0f"),
-                "Max Reach": st.column_config.NumberColumn(format="%.0f"),
-                "Signal Util.": st.column_config.NumberColumn(format="%.2f"),
+                "Quarter": st.column_config.TextColumn(disabled=True),
+                "Client Name": st.column_config.TextColumn(disabled=True),
+                "Campaign Name": st.column_config.TextColumn(disabled=True),
+                "Marketing Channel": st.column_config.TextColumn(disabled=True),
+                "Budget": st.column_config.NumberColumn(format="$%,.0f"),
+                "KPI Target": st.column_config.NumberColumn(format="$%.2f"),
+                "CPM": st.column_config.NumberColumn(format="$%.2f"),
+                "Impressions": st.column_config.NumberColumn(format="%,.0f"),
+                "Planned Reach": st.column_config.NumberColumn(format="%,.0f"),
+                "Max Reach": st.column_config.NumberColumn(format="%,.0f"),
+                "Max Conversions": st.column_config.NumberColumn(format="%,.0f"),
+                "Signal Util.": st.column_config.NumberColumn(format="%.1f%%"),
                 "Frequency": st.column_config.NumberColumn(format="%.2f"),
             },
         )
@@ -807,26 +818,26 @@ def render_mailops_editor(session) -> None:
                     for _, _row in _changed_df.iterrows():
                         session.sql(
                             f"""INSERT INTO {_MAILOPS_TEST_TABLE}
-                                (QUARTER, ACCOUNT_NAME, CONVERSION_EVENT, SUB_ACCOUNT, CHANNEL,
-                                 CAMPAIGN_BUDGET, KPI_GOAL, KPI_TYPE, KPI_TARGET_VALUE,
+                                (QUARTER, ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL,
+                                 CAMPAIGN_BUDGET, KPI_TYPE, KPI_TARGET_VALUE,
                                  CPM, IMPRESSIONS, PLANNED_CAMPAIGN_REACH,
-                                 MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE, SIGNAL_UTILIZATION, FREQUENCY,
+                                 MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE, MAX_CONVERSIONS,
+                                 SIGNAL_UTILIZATION, FREQUENCY,
                                  UPDATED_AT, SUBMITTED_BY)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             params=[
                                 _safe_str(_row.get("Quarter")),
                                 _safe_str(_row.get("Client Name")),
-                                _safe_str(_row.get("Conversion Event")),
                                 _safe_str(_row.get("Campaign Name")),
                                 _safe_str(_row.get("Marketing Channel")),
                                 _safe_float(_row.get("Budget")),
-                                _safe_str(_row.get("KPI Goal")),
                                 _safe_str(_row.get("KPI Type")),
                                 _safe_float(_row.get("KPI Target")),
                                 _safe_float(_row.get("CPM")),
                                 _safe_float(_row.get("Impressions")),
                                 _safe_float(_row.get("Planned Reach")),
                                 _safe_float(_row.get("Max Reach")),
+                                _safe_float(_row.get("Max Conversions")),
                                 _safe_float(_row.get("Signal Util.")),
                                 _safe_float(_row.get("Frequency")),
                                 _now_utc,
@@ -947,12 +958,12 @@ def render_mailops_editor(session) -> None:
     _EMPTY_ROW = {
         "QUARTER": _mo_quarter_clean,
         "ACCOUNT_NAME": _mo_account,
-        "CONVERSION_EVENT": _mo_event if _mo_event != "(none)" else "",
         "SUB_ACCOUNT": _mo_sub if _mo_sub != "(none)" else "",
         "CHANNEL": _mo_channel if _mo_channel != "(none)" else "",
-        "CAMPAIGN_BUDGET": 0.0, "KPI_GOAL": "", "KPI_TYPE": "", "KPI_TARGET_VALUE": 0.0,
+        "CAMPAIGN_BUDGET": 0.0, "KPI_TYPE": "", "KPI_TARGET_VALUE": 0.0,
         "CPM": 0.0, "IMPRESSIONS": 0.0, "PLANNED_CAMPAIGN_REACH": 0.0,
-        "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE": 0.0, "SIGNAL_UTILIZATION": 0.0, "FREQUENCY": 0.0,
+        "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE": 0.0, "MAX_CONVERSIONS": 0.0,
+        "SIGNAL_UTILIZATION": 0.0, "FREQUENCY": 0.0,
         "SUBMITTED_BY": "",
     }
 
@@ -1006,21 +1017,20 @@ def render_mailops_editor(session) -> None:
 
     if _mo_row is None:
         _mo_row = _EMPTY_ROW
-    _mo_row.setdefault("CONVERSION_EVENT", _mo_event if _mo_event != "(none)" else "")
 
     _ALL_COLS = [
-        "QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL",
+        "QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL",
         "CAMPAIGN_BUDGET", "KPI_TYPE", "KPI_TARGET_VALUE",
         "CPM", "IMPRESSIONS", "PLANNED_CAMPAIGN_REACH",
-        "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "SIGNAL_UTILIZATION", "FREQUENCY",
+        "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "MAX_CONVERSIONS",
+        "SIGNAL_UTILIZATION", "FREQUENCY",
     ]
-    _KEY_COLS = {"QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL"}
-    _STR_COLS = {"QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL", "KPI_TYPE"}
+    _KEY_COLS = {"QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL"}
+    _STR_COLS = {"QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL", "KPI_TYPE"}
 
     _COL_RENAME = {
         "QUARTER": "Quarter",
         "ACCOUNT_NAME": "Client Name",
-        "CONVERSION_EVENT": "Conversion Event",
         "SUB_ACCOUNT": "Campaign Name",
         "CHANNEL": "Marketing Channel",
         "CAMPAIGN_BUDGET": "Budget",
@@ -1030,13 +1040,15 @@ def render_mailops_editor(session) -> None:
         "IMPRESSIONS": "Impressions",
         "PLANNED_CAMPAIGN_REACH": "Planned Reach",
         "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE": "Max Reach",
+        "MAX_CONVERSIONS": "Max Conversions",
         "SIGNAL_UTILIZATION": "Signal Util.",
         "FREQUENCY": "Frequency",
     }
-    _ROW1_COLS = ["QUARTER", "ACCOUNT_NAME", "CONVERSION_EVENT", "SUB_ACCOUNT", "CHANNEL",
+    _ROW1_COLS = ["QUARTER", "ACCOUNT_NAME", "SUB_ACCOUNT", "CHANNEL",
                   "CAMPAIGN_BUDGET", "KPI_TYPE", "KPI_TARGET_VALUE"]
     _ROW2_COLS = ["CPM", "IMPRESSIONS", "PLANNED_CAMPAIGN_REACH",
-                  "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "SIGNAL_UTILIZATION", "FREQUENCY"]
+                  "MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE", "MAX_CONVERSIONS",
+                  "SIGNAL_UTILIZATION", "FREQUENCY"]
 
     def _build_row(cols):
         return {_COL_RENAME[c]: (str(_mo_row[c]) if _mo_row[c] is not None else "") if c in _STR_COLS
@@ -1066,8 +1078,8 @@ def render_mailops_editor(session) -> None:
         disabled=list(_DISPLAY_KEY_COLS),
         key="_mo_editor_1",
         column_config={
-            "Budget": st.column_config.NumberColumn(format="%.2f"),
-            "KPI Target": st.column_config.NumberColumn(format="%.2f"),
+            "Budget": st.column_config.NumberColumn(format="$%,.0f"),
+            "KPI Target": st.column_config.NumberColumn(format="$%.2f"),
         },
     )
     _edited2 = st.data_editor(
@@ -1076,11 +1088,12 @@ def render_mailops_editor(session) -> None:
         width="stretch",
         key="_mo_editor_2",
         column_config={
-            "CPM": st.column_config.NumberColumn(format="%.2f"),
-            "Impressions": st.column_config.NumberColumn(format="%.0f"),
-            "Planned Reach": st.column_config.NumberColumn(format="%.0f"),
-            "Max Reach": st.column_config.NumberColumn(format="%.0f"),
-            "Signal Util.": st.column_config.NumberColumn(format="%.2f"),
+            "CPM": st.column_config.NumberColumn(format="$%.2f"),
+            "Impressions": st.column_config.NumberColumn(format="%,.0f"),
+            "Planned Reach": st.column_config.NumberColumn(format="%,.0f"),
+            "Max Reach": st.column_config.NumberColumn(format="%,.0f"),
+            "Max Conversions": st.column_config.NumberColumn(format="%,.0f"),
+            "Signal Util.": st.column_config.NumberColumn(format="%.1f%%"),
             "Frequency": st.column_config.NumberColumn(format="%.2f"),
         },
     )
@@ -1093,26 +1106,26 @@ def render_mailops_editor(session) -> None:
             _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
             session.sql(
                 f"""INSERT INTO {_MAILOPS_TEST_TABLE}
-                    (QUARTER, ACCOUNT_NAME, CONVERSION_EVENT, SUB_ACCOUNT, CHANNEL,
-                     CAMPAIGN_BUDGET, KPI_GOAL, KPI_TYPE, KPI_TARGET_VALUE,
+                    (QUARTER, ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL,
+                     CAMPAIGN_BUDGET, KPI_TYPE, KPI_TARGET_VALUE,
                      CPM, IMPRESSIONS, PLANNED_CAMPAIGN_REACH,
-                     MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE, SIGNAL_UTILIZATION, FREQUENCY,
+                     MAXIMUM_REACH_TO_MAINTAIN_PERFORMANCE, MAX_CONVERSIONS,
+                     SIGNAL_UTILIZATION, FREQUENCY,
                      UPDATED_AT, SUBMITTED_BY)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 params=[
                     str(new1["Quarter"]),
                     str(new1["Client Name"]),
-                    str(new1.get("Conversion Event", "")),
                     str(new1["Campaign Name"]),
                     str(new1["Marketing Channel"]),
                     float(new1["Budget"]),
-                    str(_mo_row.get("KPI_GOAL", "") or ""),
                     str(new1["KPI Type"]),
                     float(new1["KPI Target"]),
                     float(new2["CPM"]),
                     float(new2["Impressions"]),
                     float(new2["Planned Reach"]),
                     float(new2["Max Reach"]),
+                    float(new2["Max Conversions"]),
                     float(new2["Signal Util."]),
                     float(new2["Frequency"]),
                     now_utc,
