@@ -893,27 +893,16 @@ def render_mailops_editor(session) -> None:
         ).collect()
         if r["CHANNEL"]
     })
-    _mo_events = sorted({
-        str(r["EVT"]).strip()
-        for r in session.sql(
-            f"SELECT DISTINCT CONVERSION_TYPE AS EVT FROM {REFERENCE_HISTORICAL_TABLE} WHERE UPPER(TRIM(CLIENT_NAME))=UPPER(TRIM(?)) AND CONVERSION_TYPE IS NOT NULL AND AGGREGATION_LEVEL = 'OVERALL'",
-            params=[_mo_account],
-        ).collect()
-        if r["EVT"]
-    })
 
-    row1 = st.columns(4)
+    row1 = st.columns(3)
     with row1[0]:
         _mo_sub = st.selectbox("Campaign Name", _mo_subs or ["(none)"], key="_mo_sub")
     with row1[1]:
-        _mo_event = st.selectbox("Conversion Event", _mo_events or ["(none)"], key="_mo_event")
-    with row1[2]:
         _mo_channel = st.selectbox("Marketing Channel", _mo_channels or ["(none)"], key="_mo_channel")
 
     _mo_filter_params = [
         _mo_account,
         _mo_sub if _mo_sub != "(none)" else "",
-        _mo_event if _mo_event != "(none)" else "",
         _mo_channel if _mo_channel != "(none)" else "",
     ]
     _mo_quarters = sorted({
@@ -922,7 +911,6 @@ def render_mailops_editor(session) -> None:
             f"""SELECT DISTINCT QUARTER FROM {_MAILOPS_TEST_TABLE}
                 WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
-                  AND UPPER(TRIM(COALESCE(CONVERSION_EVENT,'')))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
                   AND QUARTER IS NOT NULL""",
             params=_mo_filter_params,
@@ -958,7 +946,7 @@ def render_mailops_editor(session) -> None:
     else:
         _mo_quarter_options = _mo_quarters_sorted
 
-    with row1[3]:
+    with row1[2]:
         _mo_quarter = st.selectbox("Input Quarter", _mo_quarter_options or ["(none)"], key="_mo_quarter")
 
     _is_new_quarter = _mo_quarter.endswith(" (new)")
@@ -1003,7 +991,6 @@ def render_mailops_editor(session) -> None:
                 WHERE UPPER(TRIM(QUARTER))=UPPER(TRIM(?))
                   AND UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
-                  AND UPPER(TRIM(COALESCE(CONVERSION_EVENT,'')))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
                 ORDER BY UPDATED_AT DESC NULLS LAST
                 LIMIT 1""",
@@ -1011,7 +998,6 @@ def render_mailops_editor(session) -> None:
                 _ref_quarter,
                 _mo_account,
                 _mo_sub,
-                _mo_event if _mo_event != "(none)" else "",
                 _mo_channel,
             ],
         ).collect()
@@ -3608,7 +3594,6 @@ if active_tab == 0:
                 st.session_state.mailops_mode = True
                 st.session_state._mo_account = all_account_choice
                 st.session_state._mo_sub = sub_account_choice
-                st.session_state._mo_event = event_choice
                 st.session_state._mo_channel = channel_choice
                 st.rerun()
 
