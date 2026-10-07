@@ -1518,8 +1518,7 @@ def _copy_widget_markup(
       .copy-status { min-width:45px; color:#047857; font-size:11px; }
     </style>
     <div class="copy-actions">
-      <button type="button" onclick="copyShown()" title="Copy the table exactly as displayed">⧉ Copy shown</button>
-      <button type="button" onclick="copyExact()" title="Copy complete, unshortened numbers"># Copy exact</button>
+      <button type="button" onclick="copyShown()" title="Copy the table exactly as displayed">Copy</button>
       <span id="copy-status" class="copy-status"></span>
     </div>
     <script>
@@ -1558,7 +1557,7 @@ def _render_copy_controls(
 ) -> None:
     components.html(
         _copy_widget_markup(displayed_frame, exact_frame),
-        height=42,
+        height=32,
         scrolling=False,
     )
 
@@ -1570,12 +1569,23 @@ def _render_table_with_copy(
     exact_frame: pd.DataFrame | None = None,
     style=None,
     key: str | None = None,
+    heading: str | None = None,
 ) -> None:
-    """Render one results table with formatted and exact clipboard actions."""
+    """Render one results table with its Copy action aligned to the heading."""
     clipboard_exact = (
         exact_frame if exact_frame is not None else _raw_copy_frame(displayed_frame)
     )
-    _render_copy_controls(displayed_frame, clipboard_exact)
+    if heading:
+        heading_col, copy_col = st.columns(
+            [0.82, 0.18],
+            vertical_alignment="center",
+        )
+        with heading_col:
+            st.subheader(heading)
+        with copy_col:
+            _render_copy_controls(displayed_frame, clipboard_exact)
+    else:
+        _render_copy_controls(displayed_frame, clipboard_exact)
     st.dataframe(
         style if style is not None else displayed_frame,
         hide_index=True,
@@ -4565,7 +4575,7 @@ if st.session_state.forecast and active_tab == 2:
     if _is_quarterly_mode:
         # --- Quarterly mode: show one-quarter baseline table ---
         _proj_q_label = st.session_state.get("projection_quarter") or "No Projection"
-        st.subheader(f"{_proj_q_label} Projection")
+        _projection_heading = f"{_proj_q_label} Projection"
         range_frame = pd.DataFrame([
             {"Tier": row.tier_label,
              "Investment": _fmt_dollar_commas(float(row.investment)),
@@ -4596,7 +4606,7 @@ if st.session_state.forecast and active_tab == 2:
                  else "—"}
             for row in visible_ranges
         ])
-        _render_table_with_copy(range_frame)
+        _render_table_with_copy(range_frame, heading=_projection_heading)
 
     # --- Sub-content depends on projection mode ---
     _is_quarterly_mode = st.session_state.get("projection_mode", "Quarterly") == "Quarterly"
@@ -4611,8 +4621,9 @@ if st.session_state.forecast and active_tab == 2:
             if row.historical_quarter == latest_quarter
         }
         for name, factor, rows in result["improvements"]:
+            scenario_heading = None
             if simple_headers:
-                st.subheader(f"{name}: +{float(factor)*100:.0f}% Improvement")
+                scenario_heading = f"{name}: +{float(factor)*100:.0f}% Improvement"
             else:
                 st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
                     f'<div class="kpi-label">{name}</div>'
@@ -4673,14 +4684,17 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_by_tier.get(tier_label, 0):.1f}%",
                 })
             if scenario_rows:
-                _render_table_with_copy(_forecast_output_frame(scenario_rows))
+                _render_table_with_copy(
+                    _forecast_output_frame(scenario_rows),
+                    heading=scenario_heading,
+                )
 
     if _is_quarterly_mode:
         # Quarterly mode: improvement scenarios inline with simple headers
         _render_improvement_scenarios(simple_headers=True)
     else:
         # Annual mode: show annual baseline + improvements inline (x4 multiplier)
-        st.subheader("Annual Projection")
+        _annual_projection_heading = "Annual Projection"
         _annual_baseline_adjustment = (
             st.session_state.get("range_percent_input", 10) / 100
         )
@@ -4776,11 +4790,11 @@ if st.session_state.forecast and active_tab == 2:
                 "% Utilization": f"{_sig_util_all.get(row.tier_label, 0):.0f}%",
             })
         annual_frame = pd.DataFrame(annual_rows)
-        _render_table_with_copy(annual_frame)
+        _render_table_with_copy(annual_frame, heading=_annual_projection_heading)
         # Annual improvement scenarios
         _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
         for name, factor, rows in result["improvements"]:
-            st.subheader(f"{name}: +{float(factor)*100:.0f}% Improvement")
+            _annual_scenario_heading = f"{name}: +{float(factor)*100:.0f}% Improvement"
             from collections import defaultdict as _dd_ann
             _imp_by_tier_ann: dict[str, list] = _dd_ann(list)
             for r in rows:
@@ -4829,7 +4843,10 @@ if st.session_state.forecast and active_tab == 2:
                     "% Utilization": f"{_sig_util_all.get(tier_label, 0):.0f}%",
                 })
             if imp_rows:
-                _render_table_with_copy(_forecast_output_frame(imp_rows))
+                _render_table_with_copy(
+                    _forecast_output_frame(imp_rows),
+                    heading=_annual_scenario_heading,
+                )
 
 
     _render_download_button("tab3a")
@@ -4908,7 +4925,7 @@ if (st.session_state.forecast
         if _qs_view_mode == "Tier":
             for r in visible_ranges:
                 label = r.tier_label
-                st.subheader(f"{label} ({_fmt_dollar_commas(float(r.investment) * 4)})")
+                _tier_quarter_heading = f"{label} ({_fmt_dollar_commas(float(r.investment) * 4)})"
                 tier_qtr_rows = []
                 _tot_inv = _tot_del = _tot_cmin = _tot_cmax = _tot_rmin = _tot_rmax = 0.0
                 for _rq_label in _rq_ui:
@@ -4948,7 +4965,10 @@ if (st.session_state.forecast
                     "iROAS": _range_str(_tot_rmin / _tot_inv if _tot_inv > 0 else 0, _tot_rmax / _tot_inv if _tot_inv > 0 else 0, _fmt_iroas),
                     "% Utilization": "",
                 })
-                _render_table_with_copy(_forecast_output_frame(tier_qtr_rows))
+                _render_table_with_copy(
+                    _forecast_output_frame(tier_qtr_rows),
+                    heading=_tier_quarter_heading,
+                )
         else:
             for _rq_label in _rq_ui:
                 q_key = _q_key_fn(_rq_label)
@@ -4957,9 +4977,9 @@ if (st.session_state.forecast
                 _quarter_parts = str(_rq_label).split()
                 if len(_quarter_parts) >= 2:
                     st.caption(_quarter_parts[1])
-                    st.subheader(_quarter_parts[0])
+                    _quarter_heading = _quarter_parts[0]
                 else:
-                    st.subheader(_rq_label)
+                    _quarter_heading = _rq_label
                 qtr_rows = []
                 for r in visible_ranges:
                     label = r.tier_label
@@ -4983,7 +5003,10 @@ if (st.session_state.forecast
                         "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                         "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                     })
-                _render_table_with_copy(_forecast_output_frame(qtr_rows))
+                _render_table_with_copy(
+                    _forecast_output_frame(qtr_rows),
+                    heading=_quarter_heading,
+                )
     except Exception as exc:
         st.warning(f"Could not compute quarterly split: {exc}")
 
@@ -5068,7 +5091,7 @@ if (st.session_state.forecast
         if _am_view_mode == "Tier":
             for r in visible_ranges:
                 label = r.tier_label
-                st.subheader(f"{label} ({_fmt_dollar_commas(float(r.investment) * 4)})")
+                _tier_month_heading = f"{label} ({_fmt_dollar_commas(float(r.investment) * 4)})"
                 tier_month_rows = []
                 _rq_ms = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
                 _an_inv = _an_del = _an_cmin = _an_cmax = _an_rmin = _an_rmax = 0.0
@@ -5129,7 +5152,11 @@ if (st.session_state.forecast
                     if "Total" in str(row["Month"]):
                         return ["background-color: #d4edda; font-weight: bold"] * len(row)
                     return [""] * len(row)
-                _render_table_with_copy(_am_df, style=_am_df.style.apply(_highlight_q_total, axis=1))
+                _render_table_with_copy(
+                    _am_df,
+                    style=_am_df.style.apply(_highlight_q_total, axis=1),
+                    heading=_tier_month_heading,
+                )
         else:
             _rq_ms2 = rolling_quarters(st.session_state.get("projection_quarter", "Q1 2026"))
             for _ql2 in _rq_ms2:
@@ -5147,7 +5174,7 @@ if (st.session_state.forecast
                     org_pct = q_org * (indexes["monthly_organic"].get(month, 0.0) / org_sum) if org_sum else 0.0
                     inc_pct = q_inc * (indexes["monthly_incremental"].get(month, 0.0) / inc_sum) if inc_sum else 0.0
 
-                    st.subheader(f"{month} {_yr2}")
+                    _annual_month_heading = f"{month} {_yr2}"
                     month_rows = []
                     for r in visible_ranges:
                         label = r.tier_label
@@ -5171,7 +5198,10 @@ if (st.session_state.forecast
                             "iROAS": _range_str(iroas_min, iroas_max, _fmt_iroas),
                             "% Utilization": f"{_sig_util_by_tier.get(label, 0):.0f}%",
                         })
-                    _render_table_with_copy(_forecast_output_frame(month_rows))
+                    _render_table_with_copy(
+                        _forecast_output_frame(month_rows),
+                        heading=_annual_month_heading,
+                    )
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -5271,7 +5301,7 @@ if (st.session_state.forecast
         if _qm_view_mode == "Tier":
             for r in visible_ranges:
                 label = r.tier_label
-                st.subheader(f"{label} ({_fmt_dollar_commas(float(r.investment))})")
+                _quarter_tier_heading = f"{label} ({_fmt_dollar_commas(float(r.investment))})"
                 tier_month_rows = []
                 _t_inv = _t_del = 0.0
                 _t_cmin = _t_cmax = _t_rmin = _t_rmax = 0.0
@@ -5320,13 +5350,20 @@ if (st.session_state.forecast
                     if row["Month"] == "Quarter Total":
                         return ["background-color: #d4edda; font-weight: bold"] * len(row)
                     return [""] * len(row)
-                _render_table_with_copy(_qm_df, style=_qm_df.style.apply(_highlight_total, axis=1))
+                _render_table_with_copy(
+                    _qm_df,
+                    style=_qm_df.style.apply(_highlight_total, axis=1),
+                    heading=_quarter_tier_heading,
+                )
         else:
             for month in _proj_months:
                 org_pct = indexes["monthly_organic"].get(month, 0.0) / org_sum if org_sum else 0.0
                 inc_pct = indexes["monthly_incremental"].get(month, 0.0) / inc_sum if inc_sum else 0.0
 
-                st.subheader(f"{month} (Organic: {org_pct*100:.1f}%, Incremental: {inc_pct*100:.1f}%)")
+                _quarter_month_heading = (
+                    f"{month} (Organic: {org_pct*100:.1f}%, "
+                    f"Incremental: {inc_pct*100:.1f}%)"
+                )
 
                 month_rows = []
                 for r in visible_ranges:
@@ -5378,7 +5415,10 @@ if (st.session_state.forecast
                     })
 
                 _mm_df = _forecast_output_frame(month_rows)
-                _render_table_with_copy(_mm_df)
+                _render_table_with_copy(
+                    _mm_df,
+                    heading=_quarter_month_heading,
+                )
 
     except Exception as exc:
         st.warning(f"Could not compute monthly split: {exc}")
@@ -5624,7 +5664,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
             return _fmt_dollar_commas(numeric_value)
         if column_key in {"delivered", "delivered volume"}:
             return number(numeric_value)
-        if column_key == "marginal inc. customers":
+        if column_key in {"inc customers", "marginal inc. customers"}:
             return f"{numeric_value:,.2f}"
         if "customers" in column_key:
             return _fmt_compact_k(numeric_value)
