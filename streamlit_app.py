@@ -646,7 +646,17 @@ def render_mailops_editor(session) -> None:
         @st.cache_data(ttl=30, show_spinner="Loading data...")
         def _load_all_rows(_table: str) -> pd.DataFrame:
             rows = session.sql(
-                f"SELECT {_sel_cols} FROM {_table} ORDER BY ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL, QUARTER"
+                f"""SELECT {_sel_cols}
+                    FROM {_table}
+                    QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY
+                            UPPER(TRIM(QUARTER)), UPPER(TRIM(ACCOUNT_NAME)),
+                            UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))),
+                            UPPER(TRIM(COALESCE(CHANNEL, '')))
+                        ORDER BY UPDATED_AT DESC NULLS LAST,
+                                 TIMERANK ASC NULLS LAST
+                    ) = 1
+                    ORDER BY ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL, QUARTER"""
             ).collect()
             data = []
             for r in rows:
@@ -811,7 +821,7 @@ def render_mailops_editor(session) -> None:
             if st.button("Publish Changes to Snowflake", type="primary", key="_mo_publish", disabled=_publish_disabled):
                 try:
                     _pub_count = 0
-                    _now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    _now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
                     _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
                     def _safe_float(v, default=0.0):
                         try:
@@ -912,7 +922,15 @@ def render_mailops_editor(session) -> None:
                 WHERE UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
-                  AND QUARTER IS NOT NULL""",
+                  AND QUARTER IS NOT NULL
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY
+                        UPPER(TRIM(QUARTER)), UPPER(TRIM(ACCOUNT_NAME)),
+                        UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))),
+                        UPPER(TRIM(COALESCE(CHANNEL, '')))
+                    ORDER BY UPDATED_AT DESC NULLS LAST,
+                             TIMERANK ASC NULLS LAST
+                ) = 1""",
             params=_mo_filter_params,
         ).collect()
         if r["QUARTER"]
@@ -992,7 +1010,14 @@ def render_mailops_editor(session) -> None:
                   AND UPPER(TRIM(ACCOUNT_NAME))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(SUB_ACCOUNT,'')))=UPPER(TRIM(?))
                   AND UPPER(TRIM(COALESCE(CHANNEL,'')))=UPPER(TRIM(?))
-                ORDER BY UPDATED_AT DESC NULLS LAST
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY
+                        UPPER(TRIM(QUARTER)), UPPER(TRIM(ACCOUNT_NAME)),
+                        UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))),
+                        UPPER(TRIM(COALESCE(CHANNEL, '')))
+                    ORDER BY UPDATED_AT DESC NULLS LAST,
+                             TIMERANK ASC NULLS LAST
+                ) = 1
                 LIMIT 1""",
             params=[
                 _ref_quarter,
@@ -1097,7 +1122,7 @@ def render_mailops_editor(session) -> None:
         try:
             new1 = _edited1.iloc[0]
             new2 = _edited2.iloc[0]
-            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
             _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
             session.sql(
                 f"""INSERT INTO {_MAILOPS_TEST_TABLE}
@@ -1740,23 +1765,60 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
     quarterly_incremental = indexes["quarterly_incremental"]
 
     source_rows = automatic_indexes.get("monthly_rows", [])
-    quarter_year_by_quarter: dict[str, str] = {}
-    for source_row in source_rows:
-        quarter_year = str(source_row.get("CAMPAIGN_QUARTER", "")).strip().upper()
-        quarter_match = re.fullmatch(r"Q([1-4])(?:\\s*(\\d{4}))?", quarter_year)
-        if not quarter_match:
-            continue
-        quarter = f"Q{quarter_match.group(1)}"
-        prior_label = quarter_year_by_quarter.get(quarter)
-        prior_year = int(prior_label[-4:]) if prior_label and prior_label[-4:].isdigit() else -1
-        current_year = int(quarter_match.group(2)) if quarter_match.group(2) else -1
-        if prior_label is None or current_year >= prior_year:
-            quarter_year_by_quarter[quarter] = quarter_year
 
-    total_columns = {
-        quarter: f"{quarter_year_by_quarter.get(quarter, quarter)} Total"
+    def _source_month(row: dict) -> str:
+        month = str(row.get("MONTH", "")).strip().title()[:3]
+        if month not in MONTH_NAMES:
+            month = str(row.get("MONTH_MARKER", "")).split(",")[0].strip().title()[:3]
+        return month if month in MONTH_NAMES else ""
+
+    def _month_year_label(row: dict) -> str:
+        month = _source_month(row)
+        marker = str(row.get("MONTH_MARKER", "")).strip()
+        marker_match = re.search(r"([A-Za-z]{3,9})\s*,?\s*(\d{2}|\d{4})", marker)
+        if marker_match:
+            marker_month = marker_match.group(1).title()[:3]
+            if marker_month in MONTH_NAMES:
+                return f"{marker_month} {marker_match.group(2)[-2:]}"
+        quarter_match = re.fullmatch(
+            r"Q[1-4](?:\s*(\d{4}))?",
+            str(row.get("CAMPAIGN_QUARTER", "")).strip().upper(),
+        )
+        if month and quarter_match and quarter_match.group(1):
+            return f"{month} {quarter_match.group(1)[-2:]}"
+        return month or "Month"
+
+    month_label_by_month = {month: month for month in MONTH_NAMES}
+    quarter_month_names = {quarter: set() for quarter in QUARTER_MONTHS}
+    for source_row in source_rows:
+        month = _source_month(source_row)
+        if month:
+            month_label_by_month[month] = _month_year_label(source_row)
+        quarter_match = re.match(
+            r"Q([1-4])",
+            str(source_row.get("CAMPAIGN_QUARTER", "")).strip().upper(),
+        )
+        if month and quarter_match:
+            quarter_month_names[f"Q{quarter_match.group(1)}"].add(month)
+
+    def _ordered_campaign_month_labels(quarter: str) -> list[str]:
+        month_indexes = sorted(MONTH_NAMES.index(month) for month in quarter_month_names[quarter])
+        if not month_indexes:
+            month_indexes = [MONTH_NAMES.index(month) for month in QUARTER_MONTHS[quarter]]
+        if len(month_indexes) > 1:
+            gaps = [
+                (month_indexes[(index + 1) % len(month_indexes)] - month_indexes[index]) % 12
+                for index in range(len(month_indexes))
+            ]
+            start = (gaps.index(max(gaps)) + 1) % len(month_indexes)
+            month_indexes = month_indexes[start:] + month_indexes[:start]
+        return [month_label_by_month[MONTH_NAMES[index]] for index in month_indexes]
+
+    quarter_hover_text = {
+        quarter: "Includes " + " + ".join(_ordered_campaign_month_labels(quarter))
         for quarter in QUARTER_MONTHS
     }
+    total_columns = {quarter: f"{quarter} Total" for quarter in QUARTER_MONTHS}
     ordered_columns = []
     for quarter, months in QUARTER_MONTHS.items():
         ordered_columns.extend(months)
@@ -1789,12 +1851,17 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
     seasonal_columns = {
         "Metric": st.column_config.TextColumn("Metric", width="medium"),
         **{
-            month: st.column_config.NumberColumn(step=0.1, format="%.1f%%")
+            month: st.column_config.NumberColumn(
+                label=month_label_by_month[month],
+                step=0.1,
+                format="%.1f%%",
+            )
             for month in MONTH_NAMES
         },
         **{
             total_columns[quarter]: st.column_config.NumberColumn(
                 label=total_columns[quarter],
+                help=quarter_hover_text[quarter],
                 format="%.1f%%",
             )
             for quarter in QUARTER_MONTHS
@@ -1879,11 +1946,14 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
             "Incremental %": total_incremental,
             "Gross TRT %": total_gross,
         }
-        column_definitions: list[tuple[str, str, str]] = []
-        displayed_cells = {metric: {} for metric in totals_by_metric}
-        exact_cells = {metric: {} for metric in totals_by_metric}
-        current_quarter = None
-        quarter_values = {metric: 0.0 for metric in totals_by_metric}
+        monthly_values = {
+            metric: {month: 0.0 for month in MONTH_NAMES}
+            for metric in totals_by_metric
+        }
+        campaign_quarter_values = {
+            quarter: {metric: 0.0 for metric in totals_by_metric}
+            for quarter in QUARTER_MONTHS
+        }
 
         def _percentage(value: float, total: float) -> float:
             return value / total * 100 if total > 0 else 0.0
@@ -1893,46 +1963,55 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
                 return f"{value:,.0f}"
             return f"{value:,.1f}"
 
-        for position, row in enumerate(source_rows):
-            quarter_year = str(row.get("CAMPAIGN_QUARTER", "")).strip()
-            if current_quarter is None:
-                current_quarter = quarter_year
-            month = str(row.get("MONTH", "")).strip().title()[:3]
-            if not month:
-                month = str(row.get("MONTH_MARKER", "")).split(",")[0].strip().title()[:3]
-            month_key = f"month_{position}"
-            column_definitions.append((month_key, month or "Month", "month"))
+        for row in source_rows:
+            month = _source_month(row)
+            quarter_match = re.match(
+                r"Q([1-4])",
+                str(row.get("CAMPAIGN_QUARTER", "")).strip().upper(),
+            )
+            quarter = f"Q{quarter_match.group(1)}" if quarter_match else ""
             values = {
                 "Organic %": float(row.get("ORGANIC", 0) or 0),
                 "Incremental %": max(0.0, float(row.get("INCREMENTAL", 0) or 0)),
                 "Gross TRT %": float(row.get("GROSS_TRT_CONVERSIONS", 0) or 0),
             }
             for metric, value in values.items():
-                displayed_cells[metric][month_key] = (
-                    f"{_percentage(value, totals_by_metric[metric]):.1f}%"
-                )
-                exact_cells[metric][month_key] = _count_text(value)
-                quarter_values[metric] += value
+                if month:
+                    monthly_values[metric][month] += value
+                if quarter in campaign_quarter_values:
+                    campaign_quarter_values[quarter][metric] += value
 
-            next_quarter = (
-                str(source_rows[position + 1].get("CAMPAIGN_QUARTER", "")).strip()
-                if position + 1 < len(source_rows) else None
-            )
-            if next_quarter != current_quarter:
-                total_key = f"quarter_total_{position}"
+        column_definitions: list[tuple[str, str, str, str]] = []
+        displayed_cells = {metric: {} for metric in totals_by_metric}
+        exact_cells = {metric: {} for metric in totals_by_metric}
+        for quarter, months in QUARTER_MONTHS.items():
+            for month in months:
+                month_key = f"month_{month.lower()}"
                 column_definitions.append(
-                    (total_key, f"{current_quarter or 'Quarter'} Total", "quarter-total")
+                    (month_key, month_label_by_month[month], "month", "")
                 )
-                for metric, value in quarter_values.items():
-                    displayed_cells[metric][total_key] = (
+                for metric in totals_by_metric:
+                    value = monthly_values[metric][month]
+                    displayed_cells[metric][month_key] = (
                         f"{_percentage(value, totals_by_metric[metric]):.1f}%"
                     )
-                    exact_cells[metric][total_key] = _count_text(value)
-                quarter_values = {metric: 0.0 for metric in totals_by_metric}
-                current_quarter = next_quarter
+                    exact_cells[metric][month_key] = _count_text(value)
+
+            total_key = f"quarter_total_{quarter.lower()}"
+            column_definitions.append(
+                (total_key, total_columns[quarter], "quarter-total", quarter_hover_text[quarter])
+            )
+            for metric in totals_by_metric:
+                value = campaign_quarter_values[quarter][metric]
+                displayed_cells[metric][total_key] = (
+                    f"{_percentage(value, totals_by_metric[metric]):.1f}%"
+                )
+                exact_cells[metric][total_key] = _count_text(value)
 
         if source_rows:
-            column_definitions.append(("overall_total", "Overall Total", "overall-total"))
+            column_definitions.append(
+                ("overall_total", "Overall Total", "overall-total", "All displayed source months")
+            )
             for metric, total in totals_by_metric.items():
                 displayed_cells[metric]["overall_total"] = (
                     "100.0%" if total > 0 else "0.0%"
@@ -1944,7 +2023,7 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
                     "Metric": metric,
                     **{
                         label: displayed_cells[metric].get(key, "0.0%")
-                        for key, label, _ in column_definitions
+                        for key, label, _, _ in column_definitions
                     },
                 }
                 for metric in totals_by_metric
@@ -1954,30 +2033,34 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
                     "Metric": metric.replace(" %", " customers"),
                     **{
                         label: exact_cells[metric].get(key, "0")
-                        for key, label, _ in column_definitions
+                        for key, label, _, _ in column_definitions
                     },
                 }
                 for metric in totals_by_metric
             ])
 
             header_html = "".join(
-                "<th class=\"" + css_class + "\">" + _html_escape(label) + "</th>"
-                for _, label, css_class in column_definitions
+                '<th class="' + css_class + '" title="'
+                + _html_escape(hover_text) + '">' + _html_escape(label) + '</th>'
+                for _, label, css_class, hover_text in column_definitions
             )
             body_rows = []
             for metric in totals_by_metric:
                 cells = []
-                for key, _, css_class in column_definitions:
+                for key, _, css_class, hover_text in column_definitions:
                     percentage = displayed_cells[metric].get(key, "0.0%")
                     exact = exact_cells[metric].get(key, "0")
+                    tooltip = exact + " customers"
+                    if hover_text:
+                        tooltip += "; " + hover_text
                     cells.append(
-                        "<td class=\"" + css_class + "\"><span class=\"hover-value\" "
-                        "title=\"" + _html_escape(exact + " customers") + "\">"
-                        + _html_escape(percentage) + "</span></td>"
+                        '<td class="' + css_class + '"><span class="hover-value" '
+                        'title="' + _html_escape(tooltip) + '">'
+                        + _html_escape(percentage) + '</span></td>'
                     )
                 body_rows.append(
-                    "<tr><th class=\"metric-cell\">" + _html_escape(metric)
-                    + "</th>" + "".join(cells) + "</tr>"
+                    '<tr><th class="metric-cell">' + _html_escape(metric)
+                    + '</th>' + "".join(cells) + '</tr>'
                 )
 
             table_markup = """
@@ -2034,6 +2117,10 @@ def rolling_quarters(start_label: str) -> list[str]:
 
 
 def visible_tier(label: str, show_expansion: bool) -> bool:
+    # Sustainable Scale remains an internal calculation anchor for expansion tiers.
+    # Optimal Scale is the single product-facing endpoint shown in tables/exports.
+    if label.strip().casefold() == "sustainable scale":
+        return False
     if label.startswith("Extended Scale"):
         return False
     return show_expansion or not (
@@ -2088,7 +2175,13 @@ def _build_export_chart_images(result) -> list[tuple[str, bytes]]:
         # Native Excel charts remain available as a compatibility fallback.
         return []
 
-    all_ranges = sorted(result["ranges"], key=lambda row: float(row.investment))
+    all_ranges = sorted(
+        (
+            row for row in result["ranges"]
+            if visible_tier(row.tier_label, result["show_expansion"])
+        ),
+        key=lambda row: float(row.investment),
+    )
     if not all_ranges:
         return []
 
@@ -2274,7 +2367,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             f"{av('frequency'):.1f}", fint(av("prospects")), fint(av("incremental_customers")),
             fmoney(av("incremental_revenue")), fmoney(av("average_incremental_revenue")),
             fmoney(av("cpix")), firoas(av("iroas"))])
-    sheets["Historical KPIs"] = h_rows
+    # Historical rows are added to the consolidated Forecast Report below.
 
     # Tab 2: Forecast (matches 3a UI exactly)
     f_header = ["Tier", "Investment Tier", "Delivered Volume",
@@ -2353,7 +2446,47 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             f_rows.append([tl, fmoney(float(trows[0].investment)),
                 fint(float(rr.delivered_volume)) if rr else "—",
                 cr, rvr, cxr, irr, mcr, mir, f"{sig_util.get(tl, 0):.1f}%"])
-    sheets[forecast_sheet_name] = f_rows
+    # First worksheet: historical KPIs, Mail Ops inputs, and forecast output.
+    _mail_budget = float(st.session_state.get("current_budget") or 0.0)
+    _mail_cpm = float(st.session_state.get("cpm") or 0.0)
+    _mail_planned_reach = float(st.session_state.get("planned_reach") or 0.0)
+    _mail_signal_utilization = float(st.session_state.get("signal_utilization") or 0.0)
+    _mail_max_reach = float(st.session_state.get("max_reach") or 0.0)
+    _mail_frequency_at_max = float(st.session_state.get("frequency_at_max") or 0.0)
+    _mail_max_impressions = _mail_max_reach * _mail_frequency_at_max
+    _mail_max_investment = _mail_max_impressions * _mail_cpm / 1000
+    _mail_max_scale = _mail_max_reach * 1.25 * _mail_frequency_at_max * _mail_cpm / 1000
+    _mail_ops_rows = [
+        ["Current Quarterly Investment", fmoney(_mail_budget)],
+        ["Current Quarter CPM", f"${_mail_cpm:,.2f}"],
+        ["Current Quarter Planned Reach", fint(_mail_planned_reach)],
+        ["Current Quarter Signal Utilization", f"{_mail_signal_utilization * 100:.1f}%"],
+        ["Max Reach to Maintain Performance", fint(_mail_max_reach)],
+        ["Max Media Impressions at 100%", fint(_mail_max_impressions)],
+        ["Max Investment at 100%", fmoney(_mail_max_investment)],
+        ["Max-Max Scale", fmoney(_mail_max_scale)],
+    ]
+    _report_width = max(len(h_header), len(f_header))
+    _pad_report_row = lambda row: list(row) + [""] * (_report_width - len(row))
+    _selection_rows = [
+        ["Client Name", str(st.session_state.get("source_account") or account or "—")],
+        ["Campaign / Subaccount", str(st.session_state.get("selected_sub_account") or "—")],
+        ["Conversion Event", str(st.session_state.get("selected_event") or "—")],
+        ["Marketing Channel", str(st.session_state.get("selected_channel") or "—")],
+    ]
+    _report_rows = [["Campaign Selection"] + [""] * (_report_width - 1)]
+    _report_rows.extend(
+        _pad_report_row([label, value]) for label, value in _selection_rows
+    )
+    _report_rows.append(["Historical KPI Data"] + [""] * (_report_width - 1))
+    _report_rows.extend(_pad_report_row(row) for row in h_rows)
+    _report_rows.append(["Mail Ops Input Data"] + [""] * (_report_width - 1))
+    _report_rows.extend(
+        _pad_report_row([label, value]) for label, value in _mail_ops_rows
+    )
+    _report_rows.append([forecast_sheet_name] + [""] * (_report_width - 1))
+    _report_rows.extend(_pad_report_row(row) for row in f_rows)
+    sheets["Forecast Report"] = _report_rows
 
     # Tab 3+: Splits
     _dbl_hdr_actual = set()
@@ -2651,7 +2784,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
         data_row_idx = 0
         for row in data_rows:
             is_repeated_header = row == data_rows[0] or (double_header and row == data_rows[1])
-            is_header = (data_row_idx == 0) or (double_header and data_row_idx == 1) or (data_row_idx > 1 and is_repeated_header)
+            is_header = ((data_row_idx == 0) or (double_header and data_row_idx == 1) or (data_row_idx > 1 and is_repeated_header) or (data_row_idx > 0 and row and row[0] in {"Quarter", "Tier", "Input"}))
             _non_empty = [v for v in row if v != ""]
             is_section = (not is_header and len(row) > 1 and len(_non_empty) >= 1
                           and all(v == _non_empty[0] for v in _non_empty))
@@ -2792,6 +2925,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     snames = list(sheets.keys())
     chart_sheet_no = snames.index("Charts") + 1 if "Charts" in snames else None
     _sheet_titles = {
+        "Forecast Report": f"◆ ZETA | ForecastPro AI — Forecast Report  |  {account}",
         "Historical KPIs": f"◆ ZETA | ForecastPro AI — Historical KPIs  |  {account}",
         "Quarterly Forecast": f"◆ ZETA | ForecastPro AI — Quarterly Forecast  |  {account}",
         "Annual Forecast": f"◆ ZETA | ForecastPro AI — Annual Forecast  |  {account}",
@@ -2851,8 +2985,17 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
             dbl = n in _dbl_hdr_actual
             z.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml(sheets[n], sheet_title=t, double_header=dbl, with_drawing=bool(logo_bytes)))
 
-    _safe = re.sub(r"[^a-z0-9]+", "-", account.lower()).strip("-") or "forecast"
-    st.download_button("Download Excel Workbook", buf.getvalue(), f"{_safe}-forecast.xlsx",
+    def _filename_part(value):
+        return re.sub(r"[^A-Za-z0-9]+", "_", str(value or "")).strip("_") or "NA"
+
+    _download_name = "_".join([
+        _filename_part(st.session_state.get("source_account") or account),
+        _filename_part(st.session_state.get("selected_sub_account")),
+        _filename_part(st.session_state.get("selected_event")),
+        _filename_part(st.session_state.get("selected_channel")),
+        "FORECASTING",
+    ]) + ".xlsx"
+    st.download_button("Download Excel Workbook", buf.getvalue(), _download_name,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary", key=f"dl_excel_{key_suffix}")
 
