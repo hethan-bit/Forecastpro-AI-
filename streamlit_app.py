@@ -598,7 +598,7 @@ def render_mailops_editor(session) -> None:
     _MAILOPS_TEST_TABLE = "ZX.ANALYTICS.FORECASTING_INPUTS"
 
     st.markdown(
-        '<h1 class="hero-title">Edit MailOps Data</h1>',
+        '<h1 class="hero-title">Edit Mail-Ops Data</h1>',
         unsafe_allow_html=True,
     )
     st.warning("All Q4 entries are temporary — they were duplicated from Q3 data and need to be updated with actual Q4 values.")
@@ -682,15 +682,38 @@ def render_mailops_editor(session) -> None:
             m = _re.match(r"Q(\d)\s+(\d{4})", str(label).strip())
             return int(m.group(2)) * 4 + int(m.group(1)) if m else 0
         _all_quarters = sorted(_orig_df["Quarter"].dropna().unique().tolist(), key=_qsort, reverse=True)
+        _all_clients = sorted(_orig_df["Client Name"].dropna().unique().tolist(), key=_qsort, reverse=True)
         _quarter_options = ["All Quarters"] + _all_quarters
+        
+        _client_options = ["All Clients"] + _all_clients
+        
         _selected_quarter = st.selectbox(
             "Filter by Quarter",
             _quarter_options,
             key="_mo_quarter_filter",
         )
-        if _selected_quarter != "All Quarters":
+        
+        _selected_client = st.selectbox(
+            "Filter by Client",
+            _client_options,
+        )
+
+        #If specific quarter but all clients
+        if _selected_quarter != "All Quarters" and _selected_client == "All Clients":
             _filter_mask = _orig_df["Quarter"] == _selected_quarter
             _filtered_orig = _orig_df[_filter_mask].reset_index(drop=True)
+
+        ##case if specific client but all quarters
+        elif _selected_quarter == "All Quarters" and _selected_client != "All Clients":
+            _filter_mask = _orig_df["Client Name"] == _selected_client
+            _filtered_orig = _orig_df[_filter_mask].reset_index(drop=True)
+            
+        #case for both!
+
+        elif _selected_quarter != "All Quarters" and _selected_client != "All Clients":
+            _filter_mask = (_orig_df["Client Name"] == _selected_client) & (_orig_df["Quarter"] == _selected_quarter)
+            _filtered_orig = _orig_df[_filter_mask].reset_index(drop=True)
+            
         else:
             _filtered_orig = _orig_df
 
@@ -789,7 +812,7 @@ def render_mailops_editor(session) -> None:
                 _xz.writestr("xl/workbook.xml",
                     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                     '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-                    '<sheets><sheet name="MailOps Data" sheetId="1" r:id="rId1"/></sheets></workbook>')
+                    '<sheets><sheet name="Mail-Ops Data" sheetId="1" r:id="rId1"/></sheets></workbook>')
                 _xz.writestr("xl/_rels/workbook.xml.rels",
                     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -822,7 +845,7 @@ def render_mailops_editor(session) -> None:
                 try:
                     _pub_count = 0
                     _now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
-                    _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
+                    _current_user = st.user.user_name
                     def _safe_float(v, default=0.0):
                         try:
                             f = float(v)
@@ -1123,7 +1146,7 @@ def render_mailops_editor(session) -> None:
             new1 = _edited1.iloc[0]
             new2 = _edited2.iloc[0]
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
-            _current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
+            _current_user = st.user.user_name
             session.sql(
                 f"""INSERT INTO {_MAILOPS_TEST_TABLE}
                     (QUARTER, ACCOUNT_NAME, SUB_ACCOUNT, CHANNEL,
@@ -3042,7 +3065,7 @@ def render_user_guide() -> None:
         st.markdown("""
         Start on **Inputs** and select **Client Name**, **Campaign Name**, **Conversion Event**, and **Marketing Channel**. The choices come from approved multi-tenant historical data.
 
-        Then choose the **Projection Quarter** you want to forecast and **Using Data From** - the quarter that supplies the MailOps Max Reach and Signal Utilization planning inputs. Choose **Quarterly** for a single-quarter forecast or **Annual** for a four-quarter forecast, then select **Load Historical Data**.
+        Then choose the **Projection Quarter** you want to forecast and **Using Data From** - the quarter that supplies the Mail-Ops Max Reach and Signal Utilization planning inputs. Choose **Quarterly** for a single-quarter forecast or **Annual** for a four-quarter forecast, then select **Load Historical Data**.
         """)
     with st.expander("2. Select and confirm historical inputs"):
         st.markdown("""
@@ -3050,9 +3073,9 @@ def render_user_guide() -> None:
 
         The seasonal-index section shows Organic and Zeta-influenced Incremental conversion patterns by month and quarter. These indexes are used to split the forecast into quarterly and monthly outputs. Review the selections, then choose **Confirm Selected Historical Inputs**.
         """)
-    with st.expander("3. Review MailOps delivery inputs"):
+    with st.expander("3. Review Mail-Ops delivery inputs"):
         st.markdown("""
-        MailOps and media-plan values are populated from the **Using Data From** quarter. Review the delivery inputs before continuing.
+        Mail-Ops and media-plan values are populated from the **Using Data From** quarter. Review the delivery inputs before continuing.
 
         Where appropriate, **Frequency at Max Reach** can be adjusted. A one-quarter range control appears only when the selected history is limited to a single applicable quarter; it adjusts the uncertainty range around the projected result.
         """)
@@ -3066,7 +3089,7 @@ def render_user_guide() -> None:
         """)
     with st.expander("5. Create and review the forecast"):
         st.markdown("""
-        Before selecting **Create Forecast Draft**, validate the selected history, MailOps inputs, tier setup, and adjustment scenarios. The forecast includes the baseline and each selected scenario across the available tiers.
+        Before selecting **Create Forecast Draft**, validate the selected history, Mail-Ops inputs, tier setup, and adjustment scenarios. The forecast includes the baseline and each selected scenario across the available tiers.
 
         Annual forecasts can be reviewed by scenario, then distributed into quarterly and monthly views using the seasonal indexes. Use charts for internal review and validation rather than as a client-facing deliverable.
         """)
@@ -3175,8 +3198,8 @@ with title_col:
 mailops_col, _spacer, reset_col = st.columns([2, 7.2, 1.3])
 with mailops_col:
     _mailops_active = st.session_state.get("mailops_mode", False)
-    _mailops_label = "Back to Forecast Engine" if _mailops_active else "Change MailOps Data"
-    if st.button(_mailops_label, key="_mailops_btn", help="Add MailOps data through this tool"):
+    _mailops_label = "Back to Forecast Engine" if _mailops_active else "Change Mail-Ops Data"
+    if st.button(_mailops_label, key="_mailops_btn", help="Add Mail-Ops data through this tool"):
         st.session_state.mailops_mode = not _mailops_active
         st.rerun()
 with reset_col:
@@ -3185,7 +3208,7 @@ with reset_col:
         st.rerun()
 
 # =============================================================================
-# MAILOPS EDITOR — full-page mode, hides the forecast UI
+# MAIL-OPS EDITOR — full-page mode, hides the forecast UI
 # =============================================================================
 if st.session_state.get("mailops_mode"):
     render_mailops_editor(session)
@@ -3734,7 +3757,7 @@ if active_tab == 0:
             st.markdown(
                 "**No exact Forecasting Inputs row exists for the selected client, "
                 "campaign, conversion event, and marketing channel.** Create the "
-                "missing row in **Change MailOps Data**, then return here and select "
+                "missing row in **Change Mail-Ops Data**, then return here and select "
                 "the newly available source quarter."
             )
             if planning_lookup_error:
@@ -4032,7 +4055,7 @@ if st.session_state.confirmed and active_tab == 1:
             st.session_state.forecast = None
             st.error(
                 "Forecasting Inputs could not be loaded for this exact selection. "
-                "Return to Inputs and create or correct the row in Change MailOps Data."
+                "Return to Inputs and create or correct the row in Change Mail-Ops Data."
             )
             st.caption(f"Lookup detail: {exc}")
             st.stop()
@@ -6088,7 +6111,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
         try:
             session = get_session()
             forecast_tag = _uuid_save.uuid4().hex[:12]
-            current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
+            current_user = st.user.user_name
             selected_history = st.session_state.selected_history
             indexes = st.session_state.get("_cached_indexes", {})
             _client_name = st.session_state.get("source_account") or ""
