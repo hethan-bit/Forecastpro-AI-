@@ -58,7 +58,10 @@ def account_dimensions(
     identifier = str(account_identifier or "").strip()
     if not identifier:
         return []
-    filters = ["UPPER(TRIM(COALESCE(CLIENT_NAME, ''))) = UPPER(TRIM(?))"]
+    filters = [
+        "COALESCE(ZMP_SITE_ID, '') NOT ILIKE '%TEST%'",
+        "UPPER(TRIM(COALESCE(CLIENT_NAME, ''))) = UPPER(TRIM(?))",
+    ]
     params: list[Any] = [identifier]
     if sub_account:
         filters.append("UPPER(TRIM(COALESCE(CAMPAIGN_NAME, ''))) = UPPER(TRIM(?))")
@@ -232,8 +235,14 @@ def _dimension_filters(
     event: str | None = None,
     channel: str | None = None,
 ) -> tuple[str, list[Any]]:
-    """Build filters mapped to the new view's column names."""
-    filters: list[str] = []
+    """Build the authoritative slice for both acquisition performance views.
+
+    Production rows are kept separate from duplicated test-site rows. When a
+    reporting slice exposes several measurement-campaign variants, select the
+    channel-appropriate canonical campaign instead of summing Email/LI/Only
+    variants into the same forecast.
+    """
+    filters = ["COALESCE(ZMP_SITE_ID, '') NOT ILIKE '%TEST%'"]
     params: list[Any] = []
     if account_name:
         filters.append("UPPER(TRIM(COALESCE(CLIENT_NAME, ''))) = UPPER(TRIM(?))")
@@ -247,10 +256,52 @@ def _dimension_filters(
     if channel and channel != "All":
         filters.append("UPPER(TRIM(COALESCE(MARKETING_CHANNEL, ''))) = UPPER(TRIM(?))")
         params.append(channel)
-    if not filters:
+
+    account_key = str(account_name or "").strip().upper()
+    campaign_key = str(sub_account or "").strip().upper()
+    channel_key = str(channel or "").strip().upper()
+
+    # These two families have multiple legitimate measurement definitions.
+    # Use the forecasting definition agreed for each selected channel rather
+    # than relying on a name-pattern heuristic.
+    canonical_display_name: str | None = None
+    if account_key == "MEDIACOM" and campaign_key == "CORE" and channel_key == "EMAIL":
+        canonical_display_name = "Mediacom_Acquisition"
+    elif account_key == "NOTHING_BUNDT_CAKES" and campaign_key == "CORE":
+        canonical_display_name = {
+            "INBOX_AD": "Nothing Bundt Cakes",
+            "EMAIL": "Nothing Bundt Cakes_email",
+            "LI": "Nothing Bundt Cakes_li",
+        }.get(channel_key)
+
+    if canonical_display_name:
+        filters.append(
+            "UPPER(TRIM(COALESCE(MEASUREMENT_CAMPAIGN_DISPLAY_NAME, ''))) "
+            "= UPPER(TRIM(?))"
+        )
+        params.append(canonical_display_name)
+    elif channel_key == "INBOX_AD":
+        # INBOX_AD often contains a base measurement plus Email/LI variants.
+        # Keep the base campaign and prevent those variants from being summed.
+        filters.append(
+            "REGEXP_INSTR("
+            "UPPER(TRIM(COALESCE(MEASUREMENT_CAMPAIGN_DISPLAY_NAME, ''))), "
+            "'(^|[ _-])(EMAIL|LI|ONLY)([ _-]|$)'"
+            ") = 0"
+        )
+    elif channel_key in {"EMAIL", "LI"}:
+        # Channel-specific rows remain valid; only explicit *Only variants are
+        # removed so they do not overlap the broader channel measurement.
+        filters.append(
+            "REGEXP_INSTR("
+            "UPPER(TRIM(COALESCE(MEASUREMENT_CAMPAIGN_DISPLAY_NAME, ''))), "
+            "'(^|[ _-])ONLY([ _-]|$)'"
+            ") = 0"
+        )
+
+    if not any((account_name, sub_account, event, channel)):
         raise ValueError("Account, sub account, event, and channel are required.")
     return " AND ".join(filters), params
-
 
 def _legacy_dimension_filters(
     account_name: str | None = None,
@@ -539,64 +590,107 @@ def seasonal_indexes(
     sub_account: str | None = None,
     event: str | None = None,
     channel: str | None = None,
+    as_of_quarter: str | None = None,
 ) -> dict[str, Any]:
-    """Compute exact seasonal indexes from owned monthly source records.
+    """Compute raw and spend-normalized monthly conversion profiles.
 
-    The direct monthly-performance view supplies incremental conversions, gross
-    treatment conversions, and campaign-quarter ownership. Organic conversions
-    are joined to that ownership by both calendar month and campaign quarter so
-    attribution-window overlap is counted only once.
+    Organic remains the investment allocation. Raw Gross and Incremental
+    profiles use monthly conversion totals. Normalized profiles use conversions
+    per historical dollar spent, then normalize the twelve monthly rates to 100%.
+    Quarter totals are always derived from campaign-owned months.
     """
     month_names = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
     monthly_rows = _seasonal_month_rows(
-        session, account_name, sub_account, event, channel
+        session, account_name, sub_account, event, channel, as_of_quarter
     )
 
     organic_values = {month: 0.0 for month in month_names}
     incremental_values = {month: 0.0 for month in month_names}
-    quarter_organic_values = {f"Q{quarter}": 0.0 for quarter in range(1, 5)}
-    quarter_incremental_values = {f"Q{quarter}": 0.0 for quarter in range(1, 5)}
+    gross_values = {month: 0.0 for month in month_names}
+    incremental_adjusted_rates = {month: 0.0 for month in month_names}
+    gross_adjusted_rates = {month: 0.0 for month in month_names}
+    zero_spend_months: list[str] = []
+    quarter_by_month: dict[str, str] = {}
 
     for row in monthly_rows:
         month_index = _parse_month_index(str(row.get("MONTH", "")))
         if month_index is None:
             continue
         month_name = month_names[month_index]
-        organic = float(row.get("ORGANIC", 0) or 0)
-        # Business rule: negative monthly incremental conversions contribute
-        # zero to the seasonal distribution and its denominator.
+        organic = max(0.0, float(row.get("ORGANIC", 0) or 0))
         incremental = max(0.0, float(row.get("INCREMENTAL", 0) or 0))
+        gross = max(0.0, float(row.get("GROSS_TRT_CONVERSIONS", 0) or 0))
+        spend = max(0.0, float(row.get("SPEND", 0) or 0))
+
         organic_values[month_name] += organic
         incremental_values[month_name] += incremental
+        gross_values[month_name] += gross
+        if spend > 0:
+            incremental_adjusted_rates[month_name] += incremental / spend
+            gross_adjusted_rates[month_name] += gross / spend
+        elif incremental > 0 or gross > 0:
+            zero_spend_months.append(month_name)
 
         quarter_match = re.fullmatch(
             r"Q([1-4])(?:\s*\d{4})?",
             str(row.get("CAMPAIGN_QUARTER", "")).strip().upper(),
         )
         if quarter_match:
-            quarter_name = f"Q{quarter_match.group(1)}"
-            quarter_organic_values[quarter_name] += organic
-            quarter_incremental_values[quarter_name] += incremental
+            quarter_by_month.setdefault(month_name, f"Q{quarter_match.group(1)}")
+
+    for quarter, months in {
+        "Q1": ("Jan", "Feb", "Mar"),
+        "Q2": ("Apr", "May", "Jun"),
+        "Q3": ("Jul", "Aug", "Sep"),
+        "Q4": ("Oct", "Nov", "Dec"),
+    }.items():
+        for month in months:
+            quarter_by_month.setdefault(month, quarter)
 
     def _normalize(values: dict[str, float]) -> dict[str, float]:
-        total = sum(values.values())
+        total = sum(max(0.0, float(value)) for value in values.values())
         if total <= 0:
             return {key: 0.0 for key in values}
-        return {key: value / total for key, value in values.items()}
+        return {key: max(0.0, float(value)) / total for key, value in values.items()}
+
+    def _quarterize(monthly: dict[str, float]) -> dict[str, float]:
+        quarterly = {f"Q{quarter}": 0.0 for quarter in range(1, 5)}
+        for month in month_names:
+            quarterly[quarter_by_month[month]] += monthly.get(month, 0.0)
+        return quarterly
 
     monthly_organic = _normalize(organic_values)
     monthly_incremental = _normalize(incremental_values)
-    quarterly_organic = _normalize(quarter_organic_values)
-    quarterly_incremental = _normalize(quarter_incremental_values)
+    monthly_gross = _normalize(gross_values)
+    monthly_incremental_normalized = _normalize(incremental_adjusted_rates)
+    monthly_gross_normalized = _normalize(gross_adjusted_rates)
+
+    warnings = []
+    if zero_spend_months:
+        warnings.append(
+            "Spend-normalized profiles exclude months with conversions but no positive "
+            "historical spend: " + ", ".join(sorted(set(zero_spend_months))) + "."
+        )
+    if sum(incremental_adjusted_rates.values()) <= 0:
+        warnings.append("Normalized Incremental seasonality is unavailable because no positive conversion-per-spend rates exist.")
+    if sum(gross_adjusted_rates.values()) <= 0:
+        warnings.append("Normalized Gross seasonality is unavailable because no positive conversion-per-spend rates exist.")
 
     return {
-        "quarterly_organic": quarterly_organic,
-        "quarterly_incremental": quarterly_incremental,
+        "quarterly_organic": _quarterize(monthly_organic),
+        "quarterly_incremental": _quarterize(monthly_incremental),
+        "quarterly_gross": _quarterize(monthly_gross),
+        "quarterly_incremental_normalized": _quarterize(monthly_incremental_normalized),
+        "quarterly_gross_normalized": _quarterize(monthly_gross_normalized),
         "monthly_organic": monthly_organic,
         "monthly_incremental": monthly_incremental,
+        "monthly_gross": monthly_gross,
+        "monthly_incremental_normalized": monthly_incremental_normalized,
+        "monthly_gross_normalized": monthly_gross_normalized,
+        "seasonality_warnings": warnings,
         "monthly_rows": monthly_rows,
     }
 
@@ -607,6 +701,7 @@ def _seasonal_month_rows(
     sub_account: str | None = None,
     event: str | None = None,
     channel: str | None = None,
+    as_of_quarter: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return one campaign-owned record per calendar month for seasonal QA."""
     monthly_where, monthly_params = _dimension_filters(
@@ -615,18 +710,27 @@ def _seasonal_month_rows(
     organic_where, organic_params = _legacy_dimension_filters(
         account_name, sub_account, event, channel
     )
+    as_of_end = _quarter_end(as_of_quarter) if as_of_quarter else None
+    monthly_cutoff = (
+        "AND TRY_TO_DATE(REGEXP_REPLACE(TRIM(MONTH_MARKER), "
+        "'^[0-9]+[[:space:]]*-[[:space:]]*', ''), 'MON, YY') <= ?"
+        if as_of_end else ""
+    )
+    organic_cutoff = "AND CONVERSION_DATE::DATE <= ?" if as_of_end else ""
     query = f"""
         WITH monthly_rollup AS (
             SELECT
                 CAMPAIGN_QUARTER,
                 MONTH_MARKER,
-                TO_DATE(MONTH_MARKER, 'MON, YY') AS CALENDAR_MONTH,
+                TRY_TO_DATE(REGEXP_REPLACE(TRIM(MONTH_MARKER), '^[0-9]+[[:space:]]*-[[:space:]]*', ''), 'MON, YY') AS CALENDAR_MONTH,
                 SUM(COALESCE(MONTHLY_INCREMENTAL_CONVERSIONS, 0)) AS INCREMENTAL,
-                SUM(COALESCE(MONTHLY_TREATMENT_CONVERSIONS, 0)) AS GROSS_TRT_CONVERSIONS
+                SUM(COALESCE(MONTHLY_TREATMENT_CONVERSIONS, 0)) AS GROSS_TRT_CONVERSIONS,
+                SUM(COALESCE(MONTHLY_INVESTMENT, 0)) AS SPEND
             FROM {MONTHLY_PERFORMANCE_TABLE}
             WHERE {monthly_where}
               AND MONTHLY_DATE_RANGE IS NOT NULL
               AND MONTH_MARKER IS NOT NULL
+              {monthly_cutoff}
             GROUP BY CAMPAIGN_QUARTER, MONTH_MARKER
         ),
         owned_months AS (
@@ -655,6 +759,7 @@ def _seasonal_month_rows(
             FROM {ORGANIC_DAILY_TABLE}
             WHERE {organic_where}
               AND CONVERSION_DATE IS NOT NULL
+              {organic_cutoff}
             GROUP BY CAMPAIGN_QUARTER, DATE_TRUNC('MONTH', CONVERSION_DATE)
         )
         SELECT
@@ -663,7 +768,8 @@ def _seasonal_month_rows(
             TO_CHAR(m.CALENDAR_MONTH, 'Mon') AS MONTH,
             COALESCE(o.ORGANIC, 0) AS ORGANIC,
             GREATEST(COALESCE(m.INCREMENTAL, 0), 0) AS INCREMENTAL,
-            COALESCE(m.GROSS_TRT_CONVERSIONS, 0) AS GROSS_TRT_CONVERSIONS
+            COALESCE(m.GROSS_TRT_CONVERSIONS, 0) AS GROSS_TRT_CONVERSIONS,
+            COALESCE(m.SPEND, 0) AS SPEND
         FROM latest_months m
         LEFT JOIN organic o
           ON UPPER(TRIM(o.CAMPAIGN_QUARTER)) = UPPER(TRIM(m.CAMPAIGN_QUARTER))
@@ -673,7 +779,12 @@ def _seasonal_month_rows(
     return _rows(
         session.sql(
             query,
-            params=[*monthly_params, *organic_params],
+            params=[
+                *monthly_params,
+                *([as_of_end] if as_of_end else []),
+                *organic_params,
+                *([as_of_end] if as_of_end else []),
+            ],
         ).collect()
     )
 
