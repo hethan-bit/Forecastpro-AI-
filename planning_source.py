@@ -17,7 +17,7 @@ def planning_mappings(session: Any) -> list[dict[str, str]]:
         FROM (
             SELECT TRIM(ACCOUNT_NAME) AS ACCOUNT_NAME,
                    TRIM(COALESCE(SUB_ACCOUNT, '')) AS SUB_ACCOUNT,
-                   TRIM(COALESCE(CONVERSION_EVENT, '')) AS CONVERSION_EVENT,
+                   '' AS CONVERSION_EVENT,
                    TRIM(COALESCE(CHANNEL, '')) AS CHANNEL
             FROM {PLANNING_INPUT_TEST_TABLE}
             UNION ALL
@@ -58,7 +58,6 @@ def planning_quarters(
             FROM {PLANNING_INPUT_TEST_TABLE}
             WHERE UPPER(TRIM(ACCOUNT_NAME)) = UPPER(TRIM(?))
               AND UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))
-              AND UPPER(TRIM(COALESCE(CONVERSION_EVENT, ''))) = UPPER(TRIM(?))
               AND UPPER(TRIM(COALESCE(CHANNEL, ''))) = UPPER(TRIM(?))
             UNION ALL
             SELECT QUARTER
@@ -71,7 +70,7 @@ def planning_quarters(
         ORDER BY QUARTER
         """,
         params=[
-            account_name, sub_account, event, channel,
+            account_name, sub_account, channel,
             account_name, sub_account, channel,
         ],
     ).collect()
@@ -101,7 +100,6 @@ def planning_input(
             WHERE UPPER(TRIM(QUARTER)) = UPPER(TRIM(?))
               AND UPPER(TRIM(ACCOUNT_NAME)) = UPPER(TRIM(?))
               AND UPPER(TRIM(COALESCE(SUB_ACCOUNT, ''))) = UPPER(TRIM(?))
-              AND UPPER(TRIM(COALESCE(CONVERSION_EVENT, ''))) = UPPER(TRIM(?))
               AND UPPER(TRIM(COALESCE(CHANNEL, ''))) = UPPER(TRIM(?))
             UNION ALL
             SELECT CAMPAIGN_BUDGET, CPM, PLANNED_CAMPAIGN_REACH,
@@ -118,7 +116,7 @@ def planning_input(
         LIMIT 1
         """,
         params=[
-            quarter, account_name, sub_account, event, channel,
+            quarter, account_name, sub_account, channel,
             quarter, account_name, sub_account, channel,
         ],
     ).collect()
