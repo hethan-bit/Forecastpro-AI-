@@ -77,6 +77,23 @@ def planning_quarters(
     return [str(row["QUARTER"]).strip() for row in rows if row["QUARTER"]]
 
 
+def planning_projection_quarters(session: Any) -> list[str]:
+    """Return every distinct quarter available across planning input tables."""
+    rows = session.sql(
+        f"""
+        SELECT DISTINCT TRIM(QUARTER) AS QUARTER
+        FROM (
+            SELECT QUARTER FROM {PLANNING_INPUT_TEST_TABLE}
+            UNION ALL
+            SELECT QUARTER FROM {PLANNING_INPUT_TABLE}
+        )
+        WHERE QUARTER IS NOT NULL AND TRIM(QUARTER) <> ''
+        ORDER BY QUARTER
+        """
+    ).collect()
+    return [str(row["QUARTER"]).strip() for row in rows if row["QUARTER"]]
+
+
 def planning_input(
     session: Any,
     quarter: str,
