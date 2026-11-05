@@ -605,16 +605,34 @@ def seasonal_indexes(
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
-    seasonal_quarters: list[str] = []
-    if projection_quarter:
-        monthly_rows, seasonal_quarters = _complete_quarter_month_rows(
-            session, account_name, sub_account, event, channel,
-            history_quarters or (), projection_quarter,
+    # Interface integration: honor the complete-quarter selection supplied by the UI.
+    seasonal_quarters = None
+    if history_quarters is not None or projection_quarter is not None:
+        def _quarter_key(label: str) -> int:
+            match = re.fullmatch(r"Q([1-4])\s+(\d{4})", str(label or "").strip(), re.I)
+            return int(match.group(2)) * 4 + int(match.group(1)) if match else 0
+
+        previews, _ = historical_previews(
+            session, table_name, attribution_window,
+            account_name, sub_account, event, channel,
         )
-    else:
-        monthly_rows = _seasonal_month_rows(
-            session, account_name, sub_account, event, channel, as_of_quarter
-        )
+        complete_quarters = {
+            str(row["campaign_quarter"]).strip().upper()
+            for row in previews
+            if row.get("is_complete")
+            and (not projection_quarter or _quarter_key(row["campaign_quarter"]) < _quarter_key(projection_quarter))
+            and (not as_of_quarter or _quarter_key(row["campaign_quarter"]) <= _quarter_key(as_of_quarter))
+        }
+        selected_quarters = {str(q).strip().upper() for q in (history_quarters or ())}
+        seasonal_quarters = tuple(sorted(
+            selected_quarters if len(selected_quarters) == 4 and selected_quarters <= complete_quarters
+            else sorted(complete_quarters, key=_quarter_key, reverse=True)[:4],
+            key=_quarter_key,
+        ))
+    monthly_rows = _seasonal_month_rows(
+        session, account_name, sub_account, event, channel, as_of_quarter,
+        campaign_quarters=seasonal_quarters,
+    )
 
     organic_values = {month: 0.0 for month in month_names}
     incremental_values = {month: 0.0 for month in month_names}
@@ -701,67 +719,7 @@ def seasonal_indexes(
         "monthly_gross_normalized": monthly_gross_normalized,
         "seasonality_warnings": warnings,
         "monthly_rows": monthly_rows,
-        "seasonal_quarters": seasonal_quarters,
     }
-
-
-def _complete_quarter_month_rows(
-    session: Any,
-    account_name: str | None,
-    sub_account: str | None,
-    event: str | None,
-    channel: str | None,
-    history_quarters: tuple[str, ...],
-    projection_quarter: str,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Return one month row per calendar month drawn only from complete quarters.
-
-    Uses the selected historical quarters when four complete ones are chosen;
-    otherwise the four most recent complete quarters before the projection quarter.
-    A quarter is complete when it owns three calendar months and has ended.
-    """
-    rows = _seasonal_month_rows(
-        session, account_name, sub_account, event, channel, owned_only=True
-    )
-    today = date.today()
-    months_by_quarter: dict[str, set] = {}
-    for row in rows:
-        quarter = str(row.get("CAMPAIGN_QUARTER", "")).strip().upper()
-        cal = row.get("CALENDAR_MONTH")
-        if quarter and cal is not None:
-            months_by_quarter.setdefault(quarter, set()).add(cal)
-
-    def _ended(cal) -> bool:
-        nxt = date(cal.year + (cal.month == 12), cal.month % 12 + 1, 1)
-        return nxt <= today
-
-    complete = {
-        q for q, months in months_by_quarter.items()
-        if len(months) >= 3 and all(_ended(m) for m in months)
-    }
-    target = _quarter_sort(projection_quarter.strip().upper())
-    chosen = sorted(
-        {str(q).strip().upper() for q in history_quarters} & complete,
-        key=_quarter_sort,
-    )
-    if len(chosen) < 4:
-        chosen = sorted(
-            (q for q in complete if 0 < _quarter_sort(q) < target),
-            key=_quarter_sort,
-        )[-4:]
-    chosen_set = set(chosen)
-    latest_by_month: dict[int, dict[str, Any]] = {}
-    for row in rows:
-        if str(row.get("CAMPAIGN_QUARTER", "")).strip().upper() not in chosen_set:
-            continue
-        cal = row.get("CALENDAR_MONTH")
-        if cal is None:
-            continue
-        current = latest_by_month.get(cal.month)
-        if current is None or cal > current["CALENDAR_MONTH"]:
-            latest_by_month[cal.month] = row
-    ordered = [latest_by_month[m] for m in sorted(latest_by_month)]
-    return ordered, chosen
 
 
 def _seasonal_month_rows(
@@ -771,19 +729,23 @@ def _seasonal_month_rows(
     event: str | None = None,
     channel: str | None = None,
     as_of_quarter: str | None = None,
-    owned_only: bool = False,
+    campaign_quarters: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return one campaign-owned record per calendar month for seasonal QA.
-
-    With owned_only, return every campaign-owned month (all years) so the caller
-    can choose complete quarters itself.
-    """
+    """Return one campaign-owned record per calendar month for seasonal QA."""
     monthly_where, monthly_params = _dimension_filters(
         account_name, sub_account, event, channel
     )
     organic_where, organic_params = _legacy_dimension_filters(
         account_name, sub_account, event, channel
     )
+    if campaign_quarters is not None:
+        if not campaign_quarters:
+            return []
+        quarter_filter = " AND UPPER(TRIM(CAMPAIGN_QUARTER)) IN (" + ", ".join("?" for _ in campaign_quarters) + ")"
+        monthly_where += quarter_filter
+        organic_where += quarter_filter
+        monthly_params = [*monthly_params, *campaign_quarters]
+        organic_params = [*organic_params, *campaign_quarters]
     as_of_end = _quarter_end(as_of_quarter) if as_of_quarter else None
     monthly_cutoff = (
         "AND TRY_TO_DATE(REGEXP_REPLACE(TRIM(MONTH_MARKER), "
@@ -791,11 +753,6 @@ def _seasonal_month_rows(
         if as_of_end else ""
     )
     organic_cutoff = "AND CONVERSION_DATE::DATE <= ?" if as_of_end else ""
-    latest_filter = "" if owned_only else (
-        "QUALIFY ROW_NUMBER() OVER ("
-        "PARTITION BY DATE_PART('MONTH', CALENDAR_MONTH) "
-        "ORDER BY CALENDAR_MONTH DESC) = 1"
-    )
     query = f"""
         WITH monthly_rollup AS (
             SELECT
@@ -825,7 +782,10 @@ def _seasonal_month_rows(
         latest_months AS (
             SELECT *
             FROM owned_months
-            {latest_filter}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY DATE_PART('MONTH', CALENDAR_MONTH)
+                ORDER BY CALENDAR_MONTH DESC
+            ) = 1
         ),
         organic AS (
             SELECT
@@ -842,7 +802,6 @@ def _seasonal_month_rows(
             m.CAMPAIGN_QUARTER,
             m.MONTH_MARKER,
             TO_CHAR(m.CALENDAR_MONTH, 'Mon') AS MONTH,
-            m.CALENDAR_MONTH,
             COALESCE(o.ORGANIC, 0) AS ORGANIC,
             GREATEST(COALESCE(m.INCREMENTAL, 0), 0) AS INCREMENTAL,
             COALESCE(m.GROSS_TRT_CONVERSIONS, 0) AS GROSS_TRT_CONVERSIONS,

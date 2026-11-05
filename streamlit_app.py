@@ -1538,6 +1538,19 @@ def clear_downstream_input_state() -> None:
     st.session_state.pop("tier_scope_signature", None)
 
 
+def scenario_display_label(factor) -> str:
+    """UI/UX only: one signed scenario label, shared by headings and selectors."""
+    percentage = Decimal(str(factor)) * Decimal("100")
+    magnitude = format(abs(percentage), "f")
+    if "." in magnitude:
+        magnitude = magnitude.rstrip("0").rstrip(".")
+    if percentage > 0:
+        return f"+{magnitude}% Improvement"
+    if percentage < 0:
+        return f"-{magnitude}% Decline"
+    return "0% No Change"
+
+
 def money(value) -> str:
     return f"${float(value):,.0f}"
 
@@ -2828,7 +2841,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     range_map = {r.tier_label: r for r in vis_ranges}
     for name, factor, imp_rows in improvements:
         f_rows.append([""] * nc)
-        f_rows.append([f"{name}: +{float(factor)*100:.0f}% Improvement"] + [""] * (nc - 1))
+        f_rows.append([scenario_display_label(factor)] + [""] * (nc - 1))
         f_rows.append(f_header.copy())
         by_tier = _dd(list)
         for ir in imp_rows:
@@ -3715,7 +3728,7 @@ if active_tab == 0:
         campaign = st.session_state.get("selected_sub_account")
         for event, channel in pairs:
             try:
-                if _cached_planning_quarters(session, account, campaign, channel):
+                if _cached_planning_quarters(session, account, campaign, event, channel):
                     return event, channel
             except Exception:
                 # If the planning lookup is unavailable, preserve the valid
@@ -3753,7 +3766,7 @@ if active_tab == 0:
         preferred_channel = channels[0]
         for channel in channels:
             try:
-                if _cached_planning_quarters(session, account, campaign, channel):
+                if _cached_planning_quarters(session, account, campaign, event, channel):
                     preferred_channel = channel
                     break
             except Exception:
@@ -5227,7 +5240,7 @@ if st.session_state.forecast and active_tab == 2:
     if not _is_quarterly_mode:
         _scenario_options = ["Baseline"]
         for _sn, _sf, _sr in result["improvements"]:
-            _scenario_options.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
+            _scenario_options.append(scenario_display_label(_sf))
         st.session_state.setdefault("annual_scenario", "Baseline")
         _selected_scenario = st.radio(
             "Scenario for Quarterly & Monthly Splits",
@@ -5243,7 +5256,7 @@ if st.session_state.forecast and active_tab == 2:
         if result["improvements"]:
             _scenario_options_q = ["Baseline"]
             for _sn, _sf, _sr in result["improvements"]:
-                _scenario_options_q.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
+                _scenario_options_q.append(scenario_display_label(_sf))
             st.session_state.setdefault("quarterly_scenario", "Baseline")
             _selected_q_scenario = st.radio(
                 "Scenario for Monthly Split",
@@ -5324,11 +5337,11 @@ if st.session_state.forecast and active_tab == 2:
         for name, factor, rows in result["improvements"]:
             scenario_heading = None
             if simple_headers:
-                scenario_heading = f"{name}: +{float(factor)*100:.0f}% Improvement"
+                scenario_heading = scenario_display_label(factor)
             else:
                 st.markdown(f'<div class="kpi-card" style="margin-top:1rem;">'
-                    f'<div class="kpi-label">{name}</div>'
-                    f'<div class="kpi-value">+{float(factor)*100:.0f}% improvement</div></div>', unsafe_allow_html=True)
+                    f'<div class="kpi-label">Performance scenario</div>'
+                    f'<div class="kpi-value">{scenario_display_label(factor)}</div></div>', unsafe_allow_html=True)
             from collections import defaultdict as _dd
             _imp_by_tier: dict[str, list] = _dd(list)
             for r in rows:
@@ -5495,7 +5508,7 @@ if st.session_state.forecast and active_tab == 2:
         # Annual improvement scenarios
         _range_adj_ann = st.session_state.get("range_percent_input", 10) / 100
         for name, factor, rows in result["improvements"]:
-            _annual_scenario_heading = f"{name}: +{float(factor)*100:.0f}% Improvement"
+            _annual_scenario_heading = scenario_display_label(factor)
             from collections import defaultdict as _dd_ann
             _imp_by_tier_ann: dict[str, list] = _dd_ann(list)
             for r in rows:
@@ -5595,7 +5608,7 @@ if (st.session_state.forecast
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
-        if f"{_name}: +{float(_factor)*100:.0f}% Improvement" == _annual_scenario:
+        if scenario_display_label(_factor) == _annual_scenario:
             _imp_factor_val = float(_factor)
             break
     _imp_mult = 1 + _imp_factor_val
@@ -5768,7 +5781,7 @@ if (st.session_state.forecast
     _annual_scenario = st.session_state.get("annual_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
-        if f"{_name}: +{float(_factor)*100:.0f}% Improvement" == _annual_scenario:
+        if scenario_display_label(_factor) == _annual_scenario:
             _imp_factor_val = float(_factor)
             break
     _imp_mult = 1 + _imp_factor_val
@@ -5982,7 +5995,7 @@ if (st.session_state.forecast
     _quarterly_scenario = st.session_state.get("quarterly_scenario", "Baseline")
     _imp_factor_val = 0.0
     for _name, _factor, _rows in result["improvements"]:
-        if f"{_name}: +{float(_factor)*100:.0f}% Improvement" == _quarterly_scenario:
+        if scenario_display_label(_factor) == _quarterly_scenario:
             _imp_factor_val = float(_factor)
             break
     _imp_mult = 1 + _imp_factor_val
@@ -6508,7 +6521,7 @@ if st.session_state.forecast and active_tab == _qa_tab_idx:
                 scenario_tabs, result.get("improvements", [])
             ):
                 with scenario_tab:
-                    st.caption(f"Improvement factor: {float(scenario_factor) * 100:.1f}%")
+                    st.caption(scenario_display_label(scenario_factor))
                     _qa_render_table(
                         _qa_scenario_frame([
                             row for row in scenario_rows
@@ -6649,7 +6662,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     # Build scenario options
     _scenario_opts = ["Baseline"]
     for _sn, _sf, _sr in result["improvements"]:
-        _scenario_opts.append(f"{_sn}: +{float(_sf)*100:.0f}% Improvement")
+        _scenario_opts.append(scenario_display_label(_sf))
 
     # Scenario selection — each selected scenario exports all output tables
     st.subheader("Select Scenarios to Export")
@@ -6698,7 +6711,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
 
             _scenario_factors = {"Baseline": 0.0}
             for _sn, _sf, _sr in result["improvements"]:
-                _scenario_factors[f"{_sn}: +{float(_sf)*100:.0f}% Improvement"] = float(_sf)
+                _scenario_factors[scenario_display_label(_sf)] = float(_sf)
 
             rows_saved = 0
 
