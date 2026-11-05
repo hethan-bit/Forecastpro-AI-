@@ -4631,7 +4631,23 @@ if st.session_state.confirmed and active_tab == 1:
     st.session_state.setdefault("manual_tier_mode", False)
     st.session_state.setdefault("manual_tier_values", {})
     st.session_state.setdefault("manual_tiers_applied", False)
+    st.session_state.setdefault("manual_tier_count", len(labels))
+    st.session_state.manual_tier_count = max(
+        1, min(int(st.session_state.manual_tier_count), len(labels))
+    )
     investment_increase_key = "_tier_adjustment_step"
+
+    def _active_manual_tiers() -> list[tuple[int, str]]:
+        """(widget index, label) pairs for the manual tiers currently in use.
+
+        Middle tiers are removed first; Optimal Scale stays last until only
+        the baseline tier remains.
+        """
+        count = st.session_state.manual_tier_count
+        indexed = list(enumerate(labels))
+        if count <= 1:
+            return indexed[:1]
+        return indexed[: count - 1] + indexed[-1:]
     has_adjustable_tier_range = (
         len(calculated_tier_values) > 2
         and not high_utilization
@@ -4642,7 +4658,8 @@ if st.session_state.confirmed and active_tab == 1:
         if not has_adjustable_tier_range:
             return 0.0
         span = float(calculated_tier_values[-1]) - float(calculated_tier_values[0])
-        return max(1_000.0, round(span / 5 / 1_000) * 1_000.0)
+        floor = _tier_rounding_increment(calculated_tier_values[0])
+        return max(floor, round(span / 5 / floor) * floor)
 
     investment_increase_version = "investment-increase-per-tier-v2"
     if st.session_state.get("_tier_adjustment_mode") != investment_increase_version:
@@ -4660,6 +4677,7 @@ if st.session_state.confirmed and active_tab == 1:
     if st.session_state.get("tier_scope_signature") != tier_scope_signature:
         st.session_state.manual_tier_mode = False
         st.session_state.manual_tier_values = {}
+        st.session_state.manual_tier_count = len(labels)
         st.session_state.tier_scope_signature = tier_scope_signature
 
     tier_calculation_signature = (
@@ -4695,10 +4713,21 @@ if st.session_state.confirmed and active_tab == 1:
         st.session_state.manual_tier_mode = False
         st.session_state.manual_tiers_applied = False
         st.session_state.manual_tier_values = {}
+        st.session_state.manual_tier_count = len(labels)
         st.session_state[investment_increase_key] = _initial_investment_increase()
         _clear_stale_forecast(
             "Calculated tiers reset. Create a new forecast draft to update results."
         )
+
+    def _add_manual_tier() -> None:
+        if st.session_state.manual_tier_count < len(labels):
+            st.session_state.manual_tier_count += 1
+            _clear_stale_forecast("Manual tier added. Click Use Manual Edits to apply.")
+
+    def _remove_manual_tier() -> None:
+        if st.session_state.manual_tier_count > 1:
+            st.session_state.manual_tier_count -= 1
+            _clear_stale_forecast("Manual tier removed. Click Use Manual Edits to apply.")
 
     def _calculated_tier_plan() -> tuple[list[str], list[float]]:
         """Build automatic tiers with at most one tier per utilization bucket."""
@@ -4708,7 +4737,7 @@ if st.session_state.confirmed and active_tab == 1:
         current = float(calculated_tier_values[0])
         optimal = float(calculated_tier_values[-1])
         increase = max(
-            1_000.0,
+            _tier_rounding_increment(current),
             float(
                 st.session_state.get(
                     investment_increase_key, _initial_investment_increase()
@@ -4794,12 +4823,13 @@ if st.session_state.confirmed and active_tab == 1:
                         _clear_stale_forecast("Manual tier editor reopened. Apply edits before forecasting.")
                         st.rerun()
                 elif st.button("Use Manual Edits", key="apply_manual_tiers"):
+                    _active = _active_manual_tiers()
                     _manual_values = [
-                        _round_tier_investment(float(st.session_state.get(f"manual_tier_{index}", st.session_state.manual_tier_values.get(label, value))))
-                        for index, (label, value) in enumerate(zip(labels, calculated_tier_values))
+                        _round_tier_investment(float(st.session_state.get(f"manual_tier_{index}", st.session_state.manual_tier_values.get(label, calculated_tier_values[index]))))
+                        for index, label in _active
                     ]
                     if all(value > 0 for value in _manual_values) and all(left < right for left, right in zip(_manual_values, _manual_values[1:])):
-                        st.session_state.manual_tier_values = dict(zip(labels, _manual_values))
+                        st.session_state.manual_tier_values = dict(zip([label for _, label in _active], _manual_values))
                         st.session_state.manual_tiers_applied = True
                         _clear_stale_forecast("Manual edits applied. Create a new forecast draft.")
                         st.rerun()
@@ -4831,10 +4861,30 @@ if st.session_state.confirmed and active_tab == 1:
                 float(calculated_tier_values[-1])
                 - float(calculated_tier_values[0])
             )
+            _min_increase = _tier_rounding_increment(calculated_tier_values[0])
             _max_increase = max(
-                1_000.0,
-                _round_tier_investment(_tier_span - minimum_tier_gap),
+                _min_increase,
+                _round_tier_investment(_tier_span),
             )
+
+            def _investment_increase_changed() -> None:
+                # In manual mode, re-space the intermediate manual tiers from the
+                # baseline using the new increase; the last tier stays as entered.
+                if st.session_state.manual_tier_mode and not st.session_state.manual_tiers_applied:
+                    step = float(st.session_state[investment_increase_key])
+                    base = float(st.session_state.get("manual_tier_0", calculated_tier_values[0]))
+                    _active = _active_manual_tiers()
+                    for position, (tier_index, tier_label) in enumerate(_active[1:-1], start=1):
+                        new_value = _round_tier_investment(base + step * position)
+                        st.session_state[f"manual_tier_{tier_index}"] = new_value
+                        st.session_state.manual_tier_values[tier_label] = new_value
+                    _clear_stale_forecast(
+                        "Investment increase changed. Review manual tiers, then click Use Manual Edits."
+                    )
+                else:
+                    _clear_stale_forecast(
+                        "Investment increase changed. Create a new forecast draft to update results."
+                    )
             st.markdown(
                 '<div class="adjustment-factor-label">Investment increase for each tier '
                 '<span class="info-icon" title="Each generated intermediate tier increases by this amount. '
@@ -4850,13 +4900,13 @@ if st.session_state.confirmed and active_tab == 1:
                 )
             )
             _current_tier_step = min(
-                max(_current_tier_step, 1_000.0),
+                max(_current_tier_step, _min_increase),
                 float(_max_increase),
             )
             st.session_state[investment_increase_key] = _current_tier_step
             st.number_input(
                 "Investment increase for each tier",
-                min_value=1_000.0,
+                min_value=float(_min_increase),
                 max_value=float(_max_increase),
                 value=float(
                     st.session_state.get(
@@ -4864,10 +4914,11 @@ if st.session_state.confirmed and active_tab == 1:
                         _initial_investment_increase(),
                     )
                 ),
-                step=1_000.0,
+                step=float(_min_increase),
                 format="%.0f",
                 key=investment_increase_key,
-                disabled=st.session_state.manual_tier_mode,
+                on_change=_investment_increase_changed,
+                disabled=st.session_state.manual_tier_mode and st.session_state.manual_tiers_applied,
                 label_visibility="collapsed",
             )
 
@@ -4876,12 +4927,12 @@ if st.session_state.confirmed and active_tab == 1:
     if st.session_state.manual_tier_mode and not st.session_state.manual_tiers_applied and not at_full_utilization:
         st.caption("Manual values replace the calculated investment tiers for this forecast.")
         st.caption("Enter values in strictly increasing order from left to right.")
+        _active_tiers = _active_manual_tiers()
         manual_cols = st.columns(3)
         tier_values = []
-        for index, (label, calculated_value) in enumerate(
-            zip(labels, calculated_tier_values)
-        ):
-            with manual_cols[index % 3]:
+        for position, (index, label) in enumerate(_active_tiers):
+            calculated_value = calculated_tier_values[index]
+            with manual_cols[position % 3]:
                 manual_key = f"manual_tier_{index}"
                 fallback_value = max(0.01, float(calculated_value))
                 try:
@@ -4918,6 +4969,22 @@ if st.session_state.confirmed and active_tab == 1:
                 rounded_value = _round_tier_investment(value)
                 tier_values.append(rounded_value)
                 st.session_state.manual_tier_values[label] = rounded_value
+        tier_labels_for_forecast = [label for _, label in _active_tiers]
+        _tier_count_note, _tier_add_col, _tier_remove_col = st.columns([4, 1, 1])
+        with _tier_count_note:
+            st.caption(
+                f"{len(_active_tiers)} of {len(labels)} tiers in use. "
+                "Removing a tier drops the highest middle tier first; Optimal Scale stays last."
+            )
+        with _tier_add_col:
+            st.button("+ Add", key="add_manual_tier", on_click=_add_manual_tier,
+                      disabled=st.session_state.manual_tier_count >= len(labels),
+                      use_container_width=True)
+        with _tier_remove_col:
+            st.button("− Remove", key="remove_manual_tier", on_click=_remove_manual_tier,
+                      disabled=st.session_state.manual_tier_count <= 1,
+                      use_container_width=True,
+                      help="Remove a tier (minimum 1).")
     else:
         if not at_full_utilization and not has_tier_headroom:
             st.warning(
@@ -4927,11 +4994,12 @@ if st.session_state.confirmed and active_tab == 1:
                 "to manual tier mode and enter a strictly increasing Current-to-Optimal ladder."
             )
         if st.session_state.manual_tier_mode and st.session_state.manual_tiers_applied:
-            tier_labels_for_forecast = list(labels)
-            tier_values = [float(st.session_state.manual_tier_values[label]) for label in labels]
+            tier_labels_for_forecast = [label for _, label in _active_manual_tiers()]
+            tier_values = [float(st.session_state.manual_tier_values[label]) for label in tier_labels_for_forecast]
         else:
             tier_labels_for_forecast, tier_values = _calculated_tier_plan()
-        if 1 < len(tier_labels_for_forecast) < len(labels):
+        _using_applied_manual = st.session_state.manual_tier_mode and st.session_state.manual_tiers_applied
+        if not _using_applied_manual and 1 < len(tier_labels_for_forecast) < len(labels):
             st.info(
                 f"Investment increase of {money(st.session_state[investment_increase_key])} "
                 f"supports {len(tier_values)} meaningful tiers before Optimal Scale. "
@@ -5183,6 +5251,47 @@ if st.session_state.confirmed and active_tab == 1:
                 ],
                 "show_expansion": show_expansion,
                 "seasonal_indexes": seasonal_snapshot,
+                # Exact Tab 1/2 inputs used for this draft; exported to
+                # FORECASTING_OUTPUT_MAILOPS_REFERENCE so saves don't depend on
+                # FORECASTING_INPUTS staying unchanged.
+                "input_snapshot": {
+                    "projection_mode": st.session_state.get("projection_mode"),
+                    "projection_quarter": st.session_state.get("projection_quarter"),
+                    "using_data_from_quarter": st.session_state.get("selected_planning_quarter"),
+                    "attribution_window": st.session_state.get("attribution_window", 30),
+                    "range_percent": float(range_percent),
+                    "mailops_campaign_budget": float(st.session_state.get("current_budget") or 0),
+                    "mailops_cpm": float(st.session_state.get("cpm") or 0),
+                    "mailops_planned_reach": float(st.session_state.get("planned_reach") or 0),
+                    "mailops_max_reach": float(st.session_state.get("max_reach") or 0),
+                    "mailops_signal_utilization": float(st.session_state.get("signal_utilization") or 0),
+                    "mailops_frequency": float(st.session_state.get("frequency_at_max") or 0),
+                    "frequency_at_max": float(frequency_at_max),
+                    "historical_frequency": float(historical_frequency),
+                    "max_investment": float(max_investment),
+                    "max_impressions": float(max_volume_max_signal),
+                    "tier_mode": "Manual" if st.session_state.manual_tier_mode else "Calculated",
+                    "tier_investment_increase": float(
+                        st.session_state.get(investment_increase_key) or 0
+                    ),
+                    "tiers": [
+                        {"label": label, "investment": float(val)}
+                        for label, val in zip(tier_labels_for_forecast, tier_values)
+                    ],
+                    "scenarios": [
+                        {"name": scenario_names[i], "factor_pct": float(scenario_factors[i])}
+                        for i in range(num_scenarios)
+                    ],
+                    "seasonality_mode": seasonal_snapshot.get("mode"),
+                    "seasonality_profiles": seasonal_snapshot.get("selected_conversion_profiles", []),
+                    "monthly_seasonal_indexes": {
+                        key: value for key, value in seasonal_snapshot.items()
+                        if key.startswith("monthly_") and isinstance(value, dict)
+                    },
+                    "forecast_current_budget": float(forecast_current_budget),
+                    "forecast_optimal_investment": float(forecast_optimal_investment),
+                    "forecast_signal_utilization": float(forecast_signal_utilization),
+                },
             }
             st.session_state.message = "Forecast draft created."
             st.session_state.active_tab = 2
@@ -6648,6 +6757,8 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     import uuid as _uuid_save
 
     result = st.session_state.forecast
+    # Unique per forecast draft; a new draft (from any input change) gets a new token.
+    _forecast_token = result.setdefault("_export_token", _uuid_save.uuid4().hex)
     visible_ranges = [
         r for r in result["ranges"]
         if visible_tier(r.tier_label, result["show_expansion"])
@@ -6686,9 +6797,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     _quarterly_scenarios = list(_selected_scenarios)
     _monthly_scenarios = list(_selected_scenarios)
 
-    st.info("Historical input reference data (from Tab 2) is always saved alongside your outputs.")
+    st.info(
+        "Historical input reference data (from Tab 2) and a snapshot of the exact "
+        "Mail Ops / Tab 1–2 inputs are always saved alongside your outputs."
+    )
 
-    _can_export = bool(_selected_scenarios)
+    _has_input_snapshot = "input_snapshot" in result
+    if not _has_input_snapshot:
+        st.warning(
+            "This forecast draft was created before input snapshots were added. "
+            "Recreate the forecast draft in Tab 2 to export."
+        )
+    _can_export = bool(_selected_scenarios) and _has_input_snapshot
 
     if st.button("Export to Snowflake", type="primary", key="_btn_export_sf", disabled=not _can_export):
         _export_status = st.empty()
@@ -6721,19 +6841,19 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
             for row in selected_history:
                 _ref_q_str = row["campaign_quarter"]
                 _ref_q_match = re.match(r"(Q\d)\s+(\d{4})", _ref_q_str)
-                _ref_planning_quarter = _ref_q_match.group(1) if _ref_q_match else _ref_q_str
-                _ref_planning_year = int(_ref_q_match.group(2)) if _ref_q_match else None
+                _ref_campaign_quarter = _ref_q_match.group(1) if _ref_q_match else _ref_q_str
+                _ref_campaign_year = int(_ref_q_match.group(2)) if _ref_q_match else None
                 session.sql(
                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE
                        (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
-                        PLANNING_QUARTER, PLANNING_YEAR,
+                        CAMPAIGN_QUARTER, CAMPAIGN_YEAR,
                         DELIVERED, SPEND, AVG_FREQUENCY, PROSPECTS,
                         INC_CUSTOMERS, INC_REVENUE, AVG_INC_REVENUE, CPIX, IROAS,
                         CREATED_BY, DATE_CREATED)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     params=[
                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
-                        _ref_planning_quarter, _ref_planning_year,
+                        _ref_campaign_quarter, _ref_campaign_year,
                         float(row["delivered_volume"]), float(row["source_spend"]),
                         float(row["frequency"]), float(row["prospects"]),
                         float(row["incremental_customers"]), float(row["incremental_revenue"]),
@@ -6743,6 +6863,43 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                     ],
                 ).collect()
                 rows_saved += 1
+
+            # --- 1b. Forecast inputs snapshot (one row per export) ---
+            _snap = result["input_snapshot"]
+            session.sql(
+                """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MAILOPS_REFERENCE
+                   (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
+                    PROJECTION_MODE, PROJECTION_QUARTER, USING_DATA_FROM_QUARTER, ATTRIBUTION_WINDOW, RANGE_PERCENT,
+                    MAILOPS_CAMPAIGN_BUDGET, MAILOPS_CPM, MAILOPS_PLANNED_REACH, MAILOPS_MAX_REACH,
+                    MAILOPS_SIGNAL_UTILIZATION, MAILOPS_FREQUENCY,
+                    FREQUENCY_AT_MAX, HISTORICAL_FREQUENCY, MAX_INVESTMENT, MAX_IMPRESSIONS,
+                    TIER_MODE, TIER_INVESTMENT_INCREASE, TIERS, SCENARIOS,
+                    SEASONALITY_MODE, SEASONALITY_PROFILES, MONTHLY_SEASONAL_INDEXES,
+                    FORECAST_CURRENT_BUDGET, FORECAST_OPTIMAL_INVESTMENT, FORECAST_SIGNAL_UTILIZATION,
+                    CREATED_BY, DATE_CREATED)
+                   SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          PARSE_JSON(?), PARSE_JSON(?), ?, PARSE_JSON(?)::ARRAY, PARSE_JSON(?),
+                          ?, ?, ?, ?, ?""",
+                params=[
+                    forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
+                    _snap["projection_mode"], _snap["projection_quarter"],
+                    _snap["using_data_from_quarter"], _snap["attribution_window"], _snap["range_percent"],
+                    _snap["mailops_campaign_budget"], _snap["mailops_cpm"],
+                    _snap["mailops_planned_reach"], _snap["mailops_max_reach"],
+                    _snap["mailops_signal_utilization"], _snap["mailops_frequency"],
+                    _snap["frequency_at_max"], _snap["historical_frequency"],
+                    _snap["max_investment"], _snap["max_impressions"],
+                    _snap["tier_mode"], _snap["tier_investment_increase"],
+                    json.dumps(_snap["tiers"]), json.dumps(_snap["scenarios"]),
+                    _snap["seasonality_mode"],
+                    json.dumps(_snap["seasonality_profiles"]),
+                    json.dumps(_snap["monthly_seasonal_indexes"], default=float),
+                    _snap["forecast_current_budget"], _snap["forecast_optimal_investment"],
+                    _snap["forecast_signal_utilization"],
+                    current_user, _today_date,
+                ],
+            ).collect()
+            rows_saved += 1
 
             # Helper to get improvement multiplier from scenario label
             def _imp_mult_for(scenario_label):
@@ -6952,20 +7109,38 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     ).collect()
                                     rows_saved += 1
 
-            _tables_written = ["`ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE`"]
+            _tables_written = [
+                "`ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE`",
+                "`ZX.ANALYTICS.FORECASTING_OUTPUT_MAILOPS_REFERENCE`",
+            ]
             if not _is_quarterly_save and _annual_scenarios:
                 _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY`")
             if _quarterly_scenarios:
                 _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY`")
             if _monthly_scenarios:
                 _tables_written.append("`ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY`")
-            _export_status.success(
+            _export_message = (
                 f"Saved {rows_saved} rows to Snowflake.\n\n"
                 f"**Forecast Tag (unique ID):** `{forecast_tag}`\n\n"
                 f"**Scenarios exported:** {', '.join(_selected_scenarios)}\n\n"
                 f"**Tables written to:** {', '.join(_tables_written)}"
             )
+            # Persist for this forecast so the confirmation survives tab changes;
+            # any input change replaces the forecast object and hides it.
+            st.session_state["_last_export"] = {
+                "forecast_id": _forecast_token,
+                "message": _export_message,
+                "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            }
+            _export_status.success(_export_message)
         except Exception as exc:
             _export_status.error(f"Export failed: {exc}")
+    else:
+        _last_export = st.session_state.get("_last_export")
+        if _last_export and _last_export.get("forecast_id") == _forecast_token:
+            st.success(
+                f"Already saved to Snowflake at {_last_export['saved_at']} "
+                "(inputs unchanged since).\n\n" + _last_export["message"]
+            )
 
     tab_nav_buttons(tab_names, _save_tab_idx)
