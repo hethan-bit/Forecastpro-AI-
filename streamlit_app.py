@@ -3157,7 +3157,7 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     #   3=section-label(bold navy, left), 4=data-right(grid), 5=data-left(grid),
     #   6=section-label-right, 7=avg-left(bold navy, grid), 8=avg-right(bold navy, grid)
     _STYLED_STYLES = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<?xml version="1.0" encoding="UTF-8" stand `alone="yes"?>'
         '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
         '<fonts count="5">'
         '<font><sz val="10"/><color rgb="FF000000"/><name val="Calibri"/></font>'
@@ -6976,6 +6976,43 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
             def _imp_mult_for(scenario_label):
                 return 1.0 + _scenario_factors.get(scenario_label, 0.0)
 
+            # Marginal CPIx / iROAS per tier (ratios, so period-scale invariant).
+            # Mirrors the Excel export: first tier has no marginal, a single
+            # historical quarter is widened by the range %. Scenario lift scales
+            # customers and revenue, so CPIx divides and iROAS multiplies by it.
+            _range_adj_save = st.session_state.get("range_percent_input", 10) / 100
+            _first_tier_save = visible_ranges[0].tier_label if visible_ranges else ""
+            _mcpix_save: dict[str, list[float]] = {}
+            _miroas_save: dict[str, list[float]] = {}
+            for _p in result["projections"]:
+                if not visible_tier(_p.tier_label, result["show_expansion"]):
+                    continue
+                if _p.marginal_cpix is not None:
+                    _mcpix_save.setdefault(_p.tier_label, []).append(float(_p.marginal_cpix))
+                if _p.marginal_iroas is not None:
+                    _miroas_save.setdefault(_p.tier_label, []).append(float(_p.marginal_iroas))
+
+            def _marginals_for(tier_label, imp_mult, has_activity=True):
+                """Return [MARGINAL_CPIX_MIN, MAX, MARGINAL_IROAS_MIN, MAX] (None when N/A)."""
+                if tier_label == _first_tier_save or not has_activity:
+                    return [None, None, None, None]
+                mc = _mcpix_save.get(tier_label)
+                mi = _miroas_save.get(tier_label)
+                mc_lo = mc_hi = mi_lo = mi_hi = None
+                if mc:
+                    if len(mc) == 1:
+                        mc_lo, mc_hi = mc[0] / (1 + _range_adj_save), mc[0] / (1 - _range_adj_save)
+                    else:
+                        mc_lo, mc_hi = min(mc), max(mc)
+                    mc_lo, mc_hi = mc_lo / imp_mult, mc_hi / imp_mult
+                if mi:
+                    if len(mi) == 1:
+                        mi_lo, mi_hi = mi[0] * (1 - _range_adj_save), mi[0] * (1 + _range_adj_save)
+                    else:
+                        mi_lo, mi_hi = min(mi), max(mi)
+                    mi_lo, mi_hi = mi_lo * imp_mult, mi_hi * imp_mult
+                return [mc_lo, mc_hi, mi_lo, mi_hi]
+
             # --- 2a. Annual table (annual mode only) ---
             if not _is_quarterly_save and _annual_scenarios:
                 _rqs = rolling_quarters(_proj_q_save)
@@ -7000,8 +7037,9 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                 INC_REVENUE_MIN, INC_REVENUE_MAX,
                                 CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                 SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             params=[
                                 forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                 _annual_start_quarter, _annual_start_year,
@@ -7012,6 +7050,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 inv / cust_min if cust_min > 0 else 0,
                                 rev_min / inv if inv > 0 else 0,
                                 rev_max / inv if inv > 0 else 0,
+                                *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                 _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                             ],
                         ).collect()
@@ -7036,8 +7075,9 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                     INC_REVENUE_MIN, INC_REVENUE_MAX,
                                     CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                    MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                     SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 params=[
                                     forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                     f"Q{_pq_num_save}", _pq_year_save,
@@ -7048,6 +7088,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     inv / cust_min if cust_min > 0 else 0,
                                     rev_min / inv if inv > 0 else 0,
                                     rev_max / inv if inv > 0 else 0,
+                                    *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                     _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                 ],
                             ).collect()
@@ -7075,8 +7116,9 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                        MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                         SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     params=[
                                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                         _q_key, _q_year,
@@ -7087,6 +7129,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         inv / cust_min if cust_min > 0 else 0,
                                         rev_min / inv if inv > 0 else 0,
                                         rev_max / inv if inv > 0 else 0,
+                                        *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                         _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                     ],
                                 ).collect()
@@ -7117,8 +7160,9 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                        MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                         SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     params=[
                                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                         month, _pq_year_save,
@@ -7129,6 +7173,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         inv / cust_min if cust_min > 0 else 0,
                                         rev_min / inv if inv > 0 else 0,
                                         rev_max / inv if inv > 0 else 0,
+                                        *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                         _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                     ],
                                 ).collect()
@@ -7163,8 +7208,9 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                             INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                             INC_REVENUE_MIN, INC_REVENUE_MAX,
                                             CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
+                                            MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                             SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                         params=[
                                             forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                             month, _q_year,
@@ -7175,6 +7221,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                             inv / cust_min if cust_min > 0 else 0,
                                             rev_min / inv if inv > 0 else 0,
                                             rev_max / inv if inv > 0 else 0,
+                                            *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                             _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
                                         ],
                                     ).collect()
