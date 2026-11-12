@@ -26,6 +26,9 @@ from data_access import (
     seasonal_indexes,
     REFERENCE_HISTORICAL_TABLE,
 )
+# Runtime: refresh the matching workspace engine after saved formula changes.
+import forecast_core as _forecast_core
+_forecast_core = importlib.reload(_forecast_core)
 from forecast_core import (
     ForecastScenarioInput,
     HistoricalPerformance,
@@ -1443,6 +1446,48 @@ def _cached_seasonal_indexes(
     )
 
 
+def _apply_full_utilization_frequency_default() -> bool:
+    """LOGIC: default exactly-100% frequency to budget; preserve user edits per scope."""
+    if float(st.session_state.get("signal_utilization") or 0.0) != 1.0:
+        st.session_state.pop("_full_frequency_default_scope", None)
+        return False
+    budget = Decimal(str(st.session_state.get("current_budget") or 0))
+    cpm_value = Decimal(str(st.session_state.get("cpm") or 0))
+    reach = Decimal(str(st.session_state.get("max_reach") or 0))
+    if min(budget, cpm_value, reach) <= 0:
+        return False
+    # Campaign/source changes explicitly clear this scope in their reset handlers.
+    # Do not key it to widget-backed selectors, which disappear on other tabs.
+    scope = (str(budget.normalize()), str(cpm_value.normalize()), str(reach.normalize()))
+    if st.session_state.get("_full_frequency_default_scope") != scope:
+        # Keep the full-precision default internally; only the widget display rounds.
+        frequency = float(budget * Decimal("1000") / (cpm_value * reach))
+        st.session_state.frequency_at_max = frequency
+        st.session_state["_widget_frequency_at_max"] = frequency
+        st.session_state["_full_frequency_default_scope"] = scope
+        st.session_state.pop("_full_frequency_user_value", None)
+        st.session_state.forecast = None
+    elif "_full_frequency_user_value" in st.session_state:
+        # Keep a durable override when Streamlit removes off-page widget state.
+        frequency = float(st.session_state["_full_frequency_user_value"])
+        st.session_state.frequency_at_max = frequency
+        if "_widget_frequency_at_max" not in st.session_state:
+            st.session_state["_widget_frequency_at_max"] = frequency
+    snapshot = (st.session_state.get("forecast") or {}).get("input_snapshot", {})
+    if (
+        snapshot.get("mailops_campaign_budget") == float(budget)
+        and snapshot.get("mailops_cpm") == float(cpm_value)
+        and snapshot.get("mailops_max_reach") == float(reach)
+        and snapshot.get("frequency_at_max") is not None
+    ):
+        # Results navigation restores the exact frequency used for this draft.
+        frequency = float(snapshot["frequency_at_max"])
+        st.session_state.frequency_at_max = frequency
+        st.session_state["_widget_frequency_at_max"] = frequency
+        st.session_state["_full_frequency_user_value"] = frequency
+    return True
+
+
 def reset_for_new_account() -> None:
     """Clear all app state so user can start fresh with a new account."""
     _clear_query_cache()
@@ -1450,7 +1495,7 @@ def reset_for_new_account() -> None:
         "sources", "preview", "confirmed", "forecast",
         "planning_campaigns", "message", "source_account",
         "current_budget", "cpm", "planned_reach", "signal_utilization",
-        "max_reach", "frequency_at_max", "_widget_frequency_at_max", "selected_source",
+        "max_reach", "frequency_at_max", "_widget_frequency_at_max", "_full_frequency_default_scope", "_full_frequency_user_value", "selected_source",
         "historical_scope_label", "selected_history", "tier_overrides",
         "show_input_data", "show_historical_kpis",
         "applied_planning_key", "active_tab", "num_scenarios",
@@ -1507,6 +1552,8 @@ def reset_after_source() -> None:
     st.session_state.pop("applied_planning_key", None)
     for key in (
         "_widget_frequency_at_max",
+        "_full_frequency_default_scope",
+        "_full_frequency_user_value",
         "tier_adjustments",
         "manual_tier_values",
         "manual_tier_mode",
@@ -1524,6 +1571,8 @@ def reset_after_source() -> None:
 
 def clear_downstream_input_state() -> None:
     """Invalidate a loaded slice when any of its four identifying inputs changes."""
+    st.session_state.pop("_full_frequency_default_scope", None)
+    st.session_state.pop("_full_frequency_user_value", None)
     _clear_query_cache(keep_account_options=True)
     st.session_state.preview = []
     st.session_state.monthly_history = []
@@ -2885,11 +2934,10 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
     _mail_max_reach = float(st.session_state.get("max_reach") or 0.0)
     _mail_frequency_at_max = float(st.session_state.get("frequency_at_max") or 0.0)
     _mail_max_impressions = _mail_max_reach * _mail_frequency_at_max
-    _mail_full_anchor = abs(float(_mail_signal_utilization) - 1.0) < 1e-9
-    _mail_max_investment = _mail_budget if _mail_full_anchor else _mail_max_impressions * _mail_cpm / 1000
-    if _mail_full_anchor and _mail_cpm > 0:
-        _mail_max_impressions = _mail_budget * 1000 / _mail_cpm
-    _mail_max_scale = _mail_max_investment * 1.25
+    # UI/UX + LOGIC: exports use the selected frequency, including 100% accounts.
+    _mail_full_anchor = float(_mail_signal_utilization) == 1.0
+    _mail_max_investment = _mail_max_impressions * _mail_cpm / 1000
+    _mail_max_scale = _mail_max_investment * 1.50
     _mail_ops_rows = [
         ["Current Quarterly Investment", fmoney(_mail_budget)],
         ["Current Quarter CPM", f"${_mail_cpm:,.2f}"],
@@ -4099,6 +4147,11 @@ if active_tab == 0:
                 channel_choice,
             )
             st.session_state.current_budget = float(planning_values["campaign_budget"])
+            st.session_state.kpi_type = planning_values.get("kpi_type")
+            st.session_state.kpi_target = (
+                float(planning_values["kpi_target"])
+                if planning_values.get("kpi_target") is not None else None
+            )
             st.session_state.cpm = float(planning_values["cpm"])
             st.session_state.planned_reach = float(planning_values["planned_reach"])
             st.session_state.max_reach = float(planning_values["maximum_reach"])
@@ -4108,9 +4161,10 @@ if active_tab == 0:
                 if planning_utilization > 1
                 else planning_utilization
             )
-            st.session_state.frequency_at_max = float(
-                planning_values["frequency_at_max"]
-            )
+            if not _apply_full_utilization_frequency_default():
+                st.session_state.frequency_at_max = float(
+                    planning_values["frequency_at_max"]
+                )
             st.session_state.applied_planning_key = planning_key
             forecast_input_match_ready = True
         except Exception as exc:
@@ -4393,6 +4447,10 @@ if st.session_state.confirmed and active_tab == 1:
         )
         st.stop()
 
+    # LOGIC: only exactly-100% accounts use the budget-derived frequency default.
+    _full_frequency_account = float(signal_utilization) == 1.0
+    if _full_frequency_account:
+        _apply_full_utilization_frequency_default()
     minimum_viable_frequency = (
         current_budget * 1000 / (max_reach * cpm)
     )
@@ -4406,6 +4464,8 @@ if st.session_state.confirmed and active_tab == 1:
         st.session_state.frequency_at_max = float(
             st.session_state[frequency_widget_key]
         )
+        if _full_frequency_account:
+            st.session_state["_full_frequency_user_value"] = st.session_state.frequency_at_max
         st.session_state.tier_adjustments = {}
         st.session_state.forecast = None
         st.session_state.message = (
@@ -4438,6 +4498,11 @@ if st.session_state.confirmed and active_tab == 1:
                     st.session_state.selected_channel or "",
                 )
                 st.session_state.current_budget = float(values["campaign_budget"])
+                st.session_state.kpi_type = values.get("kpi_type")
+                st.session_state.kpi_target = (
+                    float(values["kpi_target"])
+                    if values.get("kpi_target") is not None else None
+                )
                 st.session_state.cpm = float(values["cpm"])
                 st.session_state.planned_reach = float(values["planned_reach"])
                 st.session_state.max_reach = float(values["maximum_reach"])
@@ -4447,9 +4512,10 @@ if st.session_state.confirmed and active_tab == 1:
                     if planning_utilization > 1
                     else planning_utilization
                 )
-                planning_frequency = float(values["frequency_at_max"])
-                st.session_state.frequency_at_max = planning_frequency
-                st.session_state[frequency_widget_key] = planning_frequency
+                if not _apply_full_utilization_frequency_default():
+                    planning_frequency = float(values["frequency_at_max"])
+                    st.session_state.frequency_at_max = planning_frequency
+                    st.session_state[frequency_widget_key] = planning_frequency
                 st.session_state.tier_overrides = {}
                 st.session_state.tier_adjustments = {}
                 st.session_state.applied_planning_key = planning_key
@@ -4470,11 +4536,14 @@ if st.session_state.confirmed and active_tab == 1:
     with frequency_col:
         frequency_at_max = st.number_input(
             "Frequency at Max Reach Utilization",
-            min_value=minimum_viable_frequency,
+            min_value=0.01 if _full_frequency_account else minimum_viable_frequency,
             step=0.5,
             key=frequency_widget_key,
             on_change=_frequency_changed,
             help=(
+                "At 100% utilization, the default frequency matches Current Budget. "
+                "Changing frequency recalculates Optimal Scale from Max Reach and CPM."
+                if _full_frequency_account else
                 f"Minimum {minimum_viable_frequency:.2f} keeps Optimal Scale "
                 "at or above Current Budget."
             ),
@@ -4485,13 +4554,10 @@ if st.session_state.confirmed and active_tab == 1:
     range_percent = int(st.session_state.get("range_percent_input", 10))
 
     # Calculated values retained for the existing tier and forecast methodology.
-    # LOGIC: exact 100% utilization uses approved Current Budget as the sole anchor.
-    _single_full_anchor = abs(float(signal_utilization) - 1.0) < 1e-9
-    max_investment = (
-        float(current_budget) if _single_full_anchor
-        else max_reach * frequency_at_max * cpm / 1000
-    )
-    maximum_scale = max_investment * 1.25
+    # LOGIC: the single 100% Optimal Scale responds to the selected frequency.
+    _single_full_anchor = float(signal_utilization) == 1.0
+    max_investment = max_reach * frequency_at_max * cpm / 1000
+    maximum_scale = max_investment * 1.50
 
     def kpi_card(col, label, value, hint="", tooltip="", accent=False):
         val_class = "kpi-value-accent" if accent else "kpi-value"
@@ -4537,7 +4603,7 @@ if st.session_state.confirmed and active_tab == 1:
         "Reach available before 100% utilization.",
         "Prospects that can be reached before 100% signal utilization while expecting similar historical performance. This does not mean every prospect has an intent signal.",
     )
-    max_volume_max_signal = (max_investment * 1000 / cpm if _single_full_anchor else max_reach * frequency_at_max)
+    max_volume_max_signal = max_reach * frequency_at_max
     kpi_card(
         row2[1], "Max Media Impressions at 100%", number(max_volume_max_signal),
         "Expected volume at selected frequency.",
@@ -4552,8 +4618,8 @@ if st.session_state.confirmed and active_tab == 1:
     )
     kpi_card(
         row2[3], "Max-Max Scale", money(maximum_scale),
-        "25% additional reach beyond 100%.",
-        "Represents 25% additional reach beyond 100% signal utilization. Scaling beyond 100% uses signals at rest, so marginal performance can decline quickly.",
+        "50% additional reach beyond 100%.",
+        "Represents 50% additional reach beyond 100% signal utilization. Scaling beyond 100% uses signals at rest, so marginal performance can decline quickly.",
         accent=True,
     )
 
@@ -4587,7 +4653,7 @@ if st.session_state.confirmed and active_tab == 1:
 
     if _single_full_anchor:
         labels = ["Optimal Scale"]
-        calculated_tier_values = [float(current_budget)]
+        calculated_tier_values = [float(max_investment)]
         minimum_tier_gap = 0.01
     elif at_full_utilization or high_utilization:
         # Current Investment and Optimal Scale are fixed endpoints. There are
@@ -4794,7 +4860,7 @@ if st.session_state.confirmed and active_tab == 1:
     control_edit, control_reset, control_step = st.columns([3.2, 1.2, 2.5])
     with control_edit:
         if _single_full_anchor:
-            st.caption("At 100% utilization, Current Budget is the single Optimal Scale anchor for all forecasts and scenarios.")
+            st.caption("At 100% utilization, Optimal Scale is Max Reach × CPM × selected Frequency ÷ 1,000. The default frequency matches Current Budget; edits update all forecast tiers.")
             st.session_state.manual_tier_mode = False
             st.session_state.manual_tiers_applied = False
         else:
@@ -5129,7 +5195,7 @@ if st.session_state.confirmed and active_tab == 1:
     )
     forecast_ready = (
         st.session_state.get("forecast_input_match_ready", False)
-        and forecast_optimal_investment >= forecast_current_budget
+        and (_single_full_anchor or forecast_optimal_investment >= forecast_current_budget)
         and tiers_strictly_increasing
         and calculated_tiers_available
         and seasonal_indexes_are_valid
@@ -5261,6 +5327,8 @@ if st.session_state.confirmed and active_tab == 1:
                     "attribution_window": st.session_state.get("attribution_window", 30),
                     "range_percent": float(range_percent),
                     "mailops_campaign_budget": float(st.session_state.get("current_budget") or 0),
+                    "kpi_type": st.session_state.get("kpi_type"),
+                    "kpi_target": st.session_state.get("kpi_target"),
                     "mailops_cpm": float(st.session_state.get("cpm") or 0),
                     "mailops_planned_reach": float(st.session_state.get("planned_reach") or 0),
                     "mailops_max_reach": float(st.session_state.get("max_reach") or 0),
@@ -6870,21 +6938,24 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                 """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MAILOPS_REFERENCE
                    (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
                     PROJECTION_MODE, PROJECTION_QUARTER, USING_DATA_FROM_QUARTER, ATTRIBUTION_WINDOW, RANGE_PERCENT,
-                    MAILOPS_CAMPAIGN_BUDGET, MAILOPS_CPM, MAILOPS_PLANNED_REACH, MAILOPS_MAX_REACH,
+                    MAILOPS_CAMPAIGN_BUDGET, KPI_TYPE, KPI_TARGET_VALUE,
+                    MAILOPS_CPM, MAILOPS_PLANNED_REACH, MAILOPS_MAX_REACH,
                     MAILOPS_SIGNAL_UTILIZATION, MAILOPS_FREQUENCY,
                     FREQUENCY_AT_MAX, HISTORICAL_FREQUENCY, MAX_INVESTMENT, MAX_IMPRESSIONS,
                     TIER_MODE, TIER_INVESTMENT_INCREASE, TIERS, SCENARIOS,
                     SEASONALITY_MODE, SEASONALITY_PROFILES, MONTHLY_SEASONAL_INDEXES,
                     FORECAST_CURRENT_BUDGET, FORECAST_OPTIMAL_INVESTMENT, FORECAST_SIGNAL_UTILIZATION,
                     CREATED_BY, DATE_CREATED)
-                   SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           PARSE_JSON(?), PARSE_JSON(?), ?, PARSE_JSON(?)::ARRAY, PARSE_JSON(?),
                           ?, ?, ?, ?, ?""",
                 params=[
                     forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                     _snap["projection_mode"], _snap["projection_quarter"],
                     _snap["using_data_from_quarter"], _snap["attribution_window"], _snap["range_percent"],
-                    _snap["mailops_campaign_budget"], _snap["mailops_cpm"],
+                    _snap["mailops_campaign_budget"],
+                    _snap.get("kpi_type"), _snap.get("kpi_target"),
+                    _snap["mailops_cpm"],
                     _snap["mailops_planned_reach"], _snap["mailops_max_reach"],
                     _snap["mailops_signal_utilization"], _snap["mailops_frequency"],
                     _snap["frequency_at_max"], _snap["historical_frequency"],
