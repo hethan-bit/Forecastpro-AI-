@@ -439,11 +439,13 @@ def _historical_cumulative_rows(
     event: str | None,
     channel: str | None,
 ) -> list[dict[str, Any]]:
-    """Fetch per-week cumulative rows from the new view.
+    """Fetch one latest source observation per filtered campaign quarter/week.
 
     Uses per-quarter attribution windows. Filters by all four dimensions
     including CONVERSION_TYPE (event) to avoid summing across different
     event types (e.g. CONV_COMCASTVIEW + CONV_PRECISION for COMCAST).
+    LOGIC: select LAST_CONVERSION_DATE DESC within each quarter/week; never SUM
+    source observations. Existing final-week selection remains downstream.
     Computes INC_NEW_SALES as (trt_rate - ctr_rate) * trt_prospects.
     Derives MONTH_MARKER from LAST_DELIVERY_DATE.
     """
@@ -479,68 +481,54 @@ def _historical_cumulative_rows(
                 RIGHT(TO_CHAR(DATE_PART('YEAR', LAST_DELIVERY_DATE)), 2) AS MONTH_MARKER,
             CLIENT_NAME AS ACCT_NAME,
             NULL AS ACCT_ID,
-            SUM(DELIVERED_IMPRESSIONS) AS DELIVERED,
-            SUM(TREATMENT_PROSPECTS) AS TRT_PROSPECTS,
-            SUM(CONTROL_PROSPECTS) AS CTR_PROSPECTS,
-            SUM(TREATMENT_CONVERSIONS) AS TRT_CONVERSIONS,
-            SUM(TREATMENT_ORDERS) AS TRT_ORDERS,
-            SUM(TREATMENT_REVENUE) AS TRT_REVENUE,
-            SUM(CONTROL_CONVERSIONS) AS CTR_CONVERSIONS,
-            SUM(CONTROL_ORDERS) AS CTR_ORDERS,
-            SUM(CONTROL_REVENUE) AS CTR_REVENUE,
-            SUM(CONTROL_SCALED_REVENUE) AS CTR_SCALED_REVENUE,
-            SUM(INVESTMENT) AS SPEND,
-            MAX(LAST_CONVERSION_DATE) AS CUS_MEASURE_THROUGH
+            COALESCE(DELIVERED_IMPRESSIONS, 0) AS DELIVERED,
+            COALESCE(TREATMENT_PROSPECTS, 0) AS TRT_PROSPECTS,
+            COALESCE(CONTROL_PROSPECTS, 0) AS CTR_PROSPECTS,
+            COALESCE(TREATMENT_CONVERSIONS, 0) AS TRT_CONVERSIONS,
+            COALESCE(TREATMENT_ORDERS, 0) AS TRT_ORDERS,
+            COALESCE(TREATMENT_REVENUE, 0) AS TRT_REVENUE,
+            COALESCE(CONTROL_CONVERSIONS, 0) AS CTR_CONVERSIONS,
+            COALESCE(CONTROL_ORDERS, 0) AS CTR_ORDERS,
+            COALESCE(CONTROL_REVENUE, 0) AS CTR_REVENUE,
+            COALESCE(CONTROL_SCALED_REVENUE, 0) AS CTR_SCALED_REVENUE,
+            COALESCE(INVESTMENT, 0) AS SPEND,
+            LAST_CONVERSION_DATE AS CUS_MEASURE_THROUGH
         FROM {REFERENCE_HISTORICAL_TABLE}
         WHERE {full_where}
-        GROUP BY CAMPAIGN_QUARTER, QUARTERLY_WEEK_NUMBER,
-                 LAST_DELIVERY_DATE, CLIENT_NAME
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY CAMPAIGN_QUARTER,
+                CAST(REPLACE(QUARTERLY_WEEK_NUMBER, 'W', '') AS INT)
+            ORDER BY LAST_CONVERSION_DATE DESC NULLS LAST,
+                     LAST_DELIVERY_DATE DESC NULLS LAST,
+                     ZMP_SITE_ID ASC NULLS LAST,
+                     ZMP_ACCOUNT_ID ASC NULLS LAST,
+                     MEASUREMENT_CAMPAIGN_DISPLAY_NAME ASC NULLS LAST,
+                     DELIVERED_IMPRESSIONS DESC NULLS LAST,
+                     TREATMENT_PROSPECTS DESC NULLS LAST,
+                     CONTROL_PROSPECTS DESC NULLS LAST,
+                     TREATMENT_CONVERSIONS DESC NULLS LAST,
+                     CONTROL_CONVERSIONS DESC NULLS LAST,
+                     TREATMENT_REVENUE DESC NULLS LAST,
+                     CONTROL_SCALED_REVENUE DESC NULLS LAST,
+                     INVESTMENT DESC NULLS LAST,
+                     TREATMENT_ORDERS DESC NULLS LAST,
+                     CONTROL_ORDERS DESC NULLS LAST,
+                     CONTROL_REVENUE DESC NULLS LAST
+        ) = 1
         ORDER BY CAMPAIGN_QUARTER, WEEK_ORDER
     """
     raw_rows = _rows(session.sql(query, params=all_params).collect())
 
-    # Aggregate across campaigns per quarter+week and compute INC_NEW_SALES
-    grouped: dict[tuple[str, int], dict[str, Any]] = {}
-    for row in raw_rows:
-        key = (str(row["CAMPAIGN_QUARTER"]), int(row["WEEK_ORDER"]))
-        if key not in grouped:
-            grouped[key] = {
-                "CAMPAIGN_QUARTER": row["CAMPAIGN_QUARTER"],
-                "WEEK_ORDER": row["WEEK_ORDER"],
-                "MONTH_MARKER": row["MONTH_MARKER"],
-                "ACCT_NAME": row["ACCT_NAME"],
-                "ACCT_ID": row.get("ACCT_ID"),
-                "DELIVERED": 0, "TRT_PROSPECTS": 0, "CTR_PROSPECTS": 0,
-                "TRT_CONVERSIONS": 0, "TRT_ORDERS": 0, "TRT_REVENUE": 0.0,
-                "CTR_CONVERSIONS": 0, "CTR_ORDERS": 0,
-                "CTR_REVENUE": 0.0, "CTR_SCALED_REVENUE": 0.0,
-                "SPEND": 0.0,
-                "CUS_MEASURE_THROUGH": row["CUS_MEASURE_THROUGH"],
-                "DELIVERY_WEEK": row["WEEK_ORDER"],
-            }
-        g = grouped[key]
-        g["DELIVERED"] += int(row.get("DELIVERED") or 0)
-        g["TRT_PROSPECTS"] += int(row.get("TRT_PROSPECTS") or 0)
-        g["CTR_PROSPECTS"] += int(row.get("CTR_PROSPECTS") or 0)
-        g["TRT_CONVERSIONS"] += int(row.get("TRT_CONVERSIONS") or 0)
-        g["TRT_ORDERS"] += int(row.get("TRT_ORDERS") or 0)
-        g["TRT_REVENUE"] += float(row.get("TRT_REVENUE") or 0)
-        g["CTR_CONVERSIONS"] += int(row.get("CTR_CONVERSIONS") or 0)
-        g["CTR_ORDERS"] += int(row.get("CTR_ORDERS") or 0)
-        g["CTR_REVENUE"] += float(row.get("CTR_REVENUE") or 0)
-        g["CTR_SCALED_REVENUE"] += float(row.get("CTR_SCALED_REVENUE") or 0)
-        g["SPEND"] += float(row.get("SPEND") or 0)
-        try:
-            new_mt = _date(row["CUS_MEASURE_THROUGH"])
-            old_mt = _date(g["CUS_MEASURE_THROUGH"])
-            if new_mt > old_mt:
-                g["CUS_MEASURE_THROUGH"] = row["CUS_MEASURE_THROUGH"]
-        except Exception:
-            pass
-
-    # Compute INC_NEW_SALES = (trt_rate - ctr_rate) * trt_prospects
+    # LOGIC: SQL already selected one observation per quarter/week.
+    # Preserve every metric from that same row; do not aggregate in Python.
     valid = []
-    for g in grouped.values():
+    for row in raw_rows:
+        g = dict(row)
+        for key in ("DELIVERED", "TRT_PROSPECTS", "CTR_PROSPECTS",
+                    "TRT_CONVERSIONS", "TRT_ORDERS", "CTR_CONVERSIONS", "CTR_ORDERS"):
+            g[key] = int(row.get(key) or 0)
+        for key in ("TRT_REVENUE", "CTR_REVENUE", "CTR_SCALED_REVENUE", "SPEND"):
+            g[key] = float(row.get(key) or 0)
         trt_p = g["TRT_PROSPECTS"]
         ctr_p = g["CTR_PROSPECTS"]
         trt_c = g["TRT_CONVERSIONS"]
@@ -591,6 +579,8 @@ def seasonal_indexes(
     event: str | None = None,
     channel: str | None = None,
     as_of_quarter: str | None = None,
+    history_quarters: tuple[str, ...] | None = None,
+    projection_quarter: str | None = None,
 ) -> dict[str, Any]:
     """Compute raw and spend-normalized monthly conversion profiles.
 
@@ -603,8 +593,33 @@ def seasonal_indexes(
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
+    # Interface integration: honor the complete-quarter selection supplied by the UI.
+    seasonal_quarters = None
+    if history_quarters is not None or projection_quarter is not None:
+        def _quarter_key(label: str) -> int:
+            match = re.fullmatch(r"Q([1-4])\s+(\d{4})", str(label or "").strip(), re.I)
+            return int(match.group(2)) * 4 + int(match.group(1)) if match else 0
+
+        previews, _ = historical_previews(
+            session, table_name, attribution_window,
+            account_name, sub_account, event, channel,
+        )
+        complete_quarters = {
+            str(row["campaign_quarter"]).strip().upper()
+            for row in previews
+            if row.get("is_complete")
+            and (not projection_quarter or _quarter_key(row["campaign_quarter"]) < _quarter_key(projection_quarter))
+            and (not as_of_quarter or _quarter_key(row["campaign_quarter"]) <= _quarter_key(as_of_quarter))
+        }
+        selected_quarters = {str(q).strip().upper() for q in (history_quarters or ())}
+        seasonal_quarters = tuple(sorted(
+            selected_quarters if len(selected_quarters) == 4 and selected_quarters <= complete_quarters
+            else sorted(complete_quarters, key=_quarter_key, reverse=True)[:4],
+            key=_quarter_key,
+        ))
     monthly_rows = _seasonal_month_rows(
-        session, account_name, sub_account, event, channel, as_of_quarter
+        session, account_name, sub_account, event, channel, as_of_quarter,
+        campaign_quarters=seasonal_quarters,
     )
 
     organic_values = {month: 0.0 for month in month_names}
@@ -702,6 +717,7 @@ def _seasonal_month_rows(
     event: str | None = None,
     channel: str | None = None,
     as_of_quarter: str | None = None,
+    campaign_quarters: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Return one campaign-owned record per calendar month for seasonal QA."""
     monthly_where, monthly_params = _dimension_filters(
@@ -710,6 +726,14 @@ def _seasonal_month_rows(
     organic_where, organic_params = _legacy_dimension_filters(
         account_name, sub_account, event, channel
     )
+    if campaign_quarters is not None:
+        if not campaign_quarters:
+            return []
+        quarter_filter = " AND UPPER(TRIM(CAMPAIGN_QUARTER)) IN (" + ", ".join("?" for _ in campaign_quarters) + ")"
+        monthly_where += quarter_filter
+        organic_where += quarter_filter
+        monthly_params = [*monthly_params, *campaign_quarters]
+        organic_params = [*organic_params, *campaign_quarters]
     as_of_end = _quarter_end(as_of_quarter) if as_of_quarter else None
     monthly_cutoff = (
         "AND TRY_TO_DATE(REGEXP_REPLACE(TRIM(MONTH_MARKER), "
