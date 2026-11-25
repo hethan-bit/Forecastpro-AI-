@@ -1321,7 +1321,9 @@ def initialize_state() -> None:
         "projection_quarter": None,
         "monthly_history": [],
         "monthly_index_mode": "Automatic",
-        "selected_seasonality_profiles": ["Incremental %"],
+        "selected_seasonality_profiles": ["Incremental %", "Gross TRT %"],
+        "manual_monthly_profiles": {},
+        "manual_seasonality_editor_revision": 0,
         "manual_monthly_organic": {},
         "manual_monthly_incremental": {},
         "manual_monthly_signature": None,
@@ -1504,6 +1506,8 @@ def reset_for_new_account() -> None:
         "planning_quarter_scope", "monthly_index_mode",
         "selected_seasonality_profiles",
         "manual_monthly_organic", "manual_monthly_incremental",
+        "manual_monthly_profiles", "manual_seasonality_editor_revision",
+        "scenario_factor_values",
         "manual_quarterly_organic", "manual_quarterly_incremental",
         "monthly_index_signature",
         "_widget_all_account", "_widget_sub_account", "_widget_event",
@@ -1564,6 +1568,8 @@ def reset_after_source() -> None:
         "selected_seasonality_profiles",
         "manual_monthly_organic",
         "manual_monthly_incremental",
+        "manual_monthly_profiles",
+        "manual_seasonality_editor_revision",
         "monthly_index_signature",
     ):
         st.session_state.pop(key, None)
@@ -1922,41 +1928,43 @@ def effective_monthly_indexes(automatic_indexes: dict) -> dict:
 
     if st.session_state.get("monthly_index_mode", "Automatic") == "Manual":
         organic = st.session_state.get("manual_monthly_organic", {})
-        incremental = st.session_state.get("manual_monthly_incremental", {})
-        if set(organic) == set(MONTH_NAMES) and set(incremental) == set(MONTH_NAMES):
+        if set(organic) == set(MONTH_NAMES):
             indexes["monthly_organic"] = {
                 month: _rounded_seasonal_share(organic[month])
-                for month in MONTH_NAMES
-            }
-            manual_conversion = {
-                month: _rounded_seasonal_share(incremental[month])
                 for month in MONTH_NAMES
             }
             indexes["quarterly_organic"] = _quarterize_monthly_profile(
                 indexes["monthly_organic"], ownership
             )
-            automatic_profiles = {"Manual Incremental %": manual_conversion}
-            automatic_quarterly_profiles = {
-                "Manual Incremental %": _quarterize_monthly_profile(
-                    manual_conversion, ownership
-                )
-            }
             st.session_state.manual_monthly_organic = dict(indexes["monthly_organic"])
-            st.session_state.manual_monthly_incremental = dict(manual_conversion)
-            selected_profiles = ["Manual Incremental %"]
-        else:
-            selected_profiles = ["Incremental %"]
-    else:
-        selected_profiles = [
-            label
-            for label in st.session_state.get(
-                "selected_seasonality_profiles", ["Incremental %"]
-            )
-            if label in automatic_profiles
-        ][:2]
-        if not selected_profiles:
-            selected_profiles = ["Incremental %"]
-        st.session_state.selected_seasonality_profiles = list(selected_profiles)
+        manual_profiles = st.session_state.get("manual_monthly_profiles", {})
+        for label, (monthly_key, quarterly_key) in CONVERSION_SEASONALITY_PROFILES.items():
+            values = manual_profiles.get(label, {})
+            if set(values) == set(MONTH_NAMES):
+                rounded = {
+                    month: _rounded_seasonal_share(values[month])
+                    for month in MONTH_NAMES
+                }
+                automatic_profiles[label] = rounded
+                automatic_quarterly_profiles[label] = _quarterize_monthly_profile(
+                    rounded, ownership
+                )
+                indexes[monthly_key] = rounded
+                indexes[quarterly_key] = automatic_quarterly_profiles[label]
+        st.session_state.manual_monthly_incremental = dict(
+            automatic_profiles["Incremental %"]
+        )
+
+    selected_profiles = [
+        label
+        for label in st.session_state.get(
+            "selected_seasonality_profiles", ["Incremental %", "Gross TRT %"]
+        )
+        if label in automatic_profiles
+    ][:2]
+    if not selected_profiles:
+        selected_profiles = ["Incremental %"]
+    st.session_state.selected_seasonality_profiles = list(selected_profiles)
 
     primary_profile = selected_profiles[0]
     indexes["monthly_conversion_profiles"] = automatic_profiles
@@ -2002,17 +2010,21 @@ def _indexes_for_output_profile(
 
 
 def manual_seasonal_indexes_valid() -> bool:
-    """Manual monthly Organic and Incremental allocations must each total 100%."""
+    """Organic and the selected manual conversion profiles must total 100%."""
     if st.session_state.get("monthly_index_mode", "Automatic") != "Manual":
         return True
-    required = (
-        (st.session_state.get("manual_monthly_organic", {}), set(MONTH_NAMES)),
-        (st.session_state.get("manual_monthly_incremental", {}), set(MONTH_NAMES)),
+    profiles = st.session_state.get("manual_monthly_profiles", {})
+    required = [st.session_state.get("manual_monthly_organic", {})]
+    required.extend(
+        profiles.get(label, {})
+        for label in st.session_state.get(
+            "selected_seasonality_profiles", ["Incremental %", "Gross TRT %"]
+        )
     )
     return all(
-        set(values) == expected
+        set(values) == set(MONTH_NAMES)
         and abs(sum(float(value) for value in values.values()) - 1.0) < 0.00001
-        for values, expected in required
+        for values in required
     )
 
 
@@ -2031,7 +2043,8 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         # A genuine campaign change starts with automatic seasonality. Navigating
         # away from and back to Inputs keeps the analyst's manual values.
         st.session_state.monthly_index_mode = "Automatic"
-        st.session_state.selected_seasonality_profiles = ["Incremental %"]
+        st.session_state.selected_seasonality_profiles = ["Incremental %", "Gross TRT %"]
+        st.session_state.manual_monthly_profiles = {}
         st.session_state.pop("_widget_primary_seasonality_profile", None)
         st.session_state.pop("_widget_comparison_seasonality_profile", None)
         st.session_state.manual_monthly_organic = {}
@@ -2058,6 +2071,10 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         ) + 1
         st.session_state.manual_monthly_organic = {}
         st.session_state.manual_monthly_incremental = {}
+        st.session_state.manual_monthly_profiles = {}
+        st.session_state.manual_seasonality_editor_revision = int(
+            st.session_state.get("manual_seasonality_editor_revision", 0)
+        ) + 1
         st.session_state.manual_quarterly_organic = {}
         st.session_state.manual_quarterly_incremental = {}
         st.session_state.manual_monthly_signature = None
@@ -2101,74 +2118,80 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
             on_click=_reset_monthly_indexes,
         )
 
-    if st.session_state.monthly_index_mode == "Manual" and not st.session_state.manual_monthly_organic:
-        st.session_state.manual_monthly_organic = _rounded_seasonal_distribution(
-            automatic_indexes["monthly_organic"]
-        )
-        st.session_state.manual_monthly_incremental = _rounded_seasonal_distribution(
-            automatic_indexes["monthly_incremental"]
-        )
+    if st.session_state.monthly_index_mode == "Manual":
+        if not st.session_state.manual_monthly_organic:
+            st.session_state.manual_monthly_organic = _rounded_seasonal_distribution(
+                automatic_indexes["monthly_organic"]
+            )
+        manual_profiles = dict(st.session_state.get("manual_monthly_profiles", {}))
+        for label, (monthly_key, _) in CONVERSION_SEASONALITY_PROFILES.items():
+            if label not in manual_profiles:
+                # Preserve existing Incremental edits when upgrading a live session.
+                previous = st.session_state.get("manual_monthly_incremental", {})
+                source = (
+                    previous if label == "Incremental %" and previous
+                    else automatic_indexes.get(monthly_key, {})
+                )
+                manual_profiles[label] = _rounded_seasonal_distribution(source)
+        st.session_state.manual_monthly_profiles = manual_profiles
         st.session_state.manual_monthly_signature = signature
 
-    if st.session_state.monthly_index_mode == "Automatic":
-        available_profiles = [
-            label
-            for label, (monthly_key, _) in CONVERSION_SEASONALITY_PROFILES.items()
-            if sum(float(value) for value in automatic_indexes.get(monthly_key, {}).values()) > 0
-        ]
-        if not available_profiles:
-            available_profiles = ["Incremental %"]
-        stored_profiles = [
-            label
-            for label in st.session_state.get(
-                "selected_seasonality_profiles", ["Incremental %"]
-            )
-            if label in available_profiles
-        ][:2]
-        if not stored_profiles:
-            stored_profiles = [available_profiles[0]]
-        profile_col, comparison_col = st.columns(2)
-        with profile_col:
-            primary_profile = st.selectbox(
-                "Primary conversion seasonality",
-                available_profiles,
-                index=available_profiles.index(stored_profiles[0]),
-                key="_widget_primary_seasonality_profile",
-                help="This profile is used first in forecast outputs.",
-            )
-        comparison_options = ["None"] + [
-            label for label in available_profiles if label != primary_profile
-        ]
-        stored_comparison = (
-            stored_profiles[1]
-            if len(stored_profiles) > 1 and stored_profiles[1] in comparison_options
-            else "None"
+    # Both modes use the same primary/comparison selections.
+    available_profiles = [
+        label
+        for label, (monthly_key, _) in CONVERSION_SEASONALITY_PROFILES.items()
+        if st.session_state.monthly_index_mode == "Manual"
+        or sum(float(value) for value in automatic_indexes.get(monthly_key, {}).values()) > 0
+    ]
+    if not available_profiles:
+        available_profiles = ["Incremental %"]
+    stored_profiles = [
+        label
+        for label in st.session_state.get(
+            "selected_seasonality_profiles", ["Incremental %", "Gross TRT %"]
         )
-        with comparison_col:
-            comparison_profile = st.selectbox(
-                "Comparison profile (optional)",
-                comparison_options,
-                index=comparison_options.index(stored_comparison),
-                key="_widget_comparison_seasonality_profile",
-                help="Choose one second profile to compare complete forecast splits.",
-            )
-        selected_profiles = [primary_profile]
-        if comparison_profile != "None":
-            selected_profiles.append(comparison_profile)
-        if selected_profiles != st.session_state.get("selected_seasonality_profiles"):
-            st.session_state.selected_seasonality_profiles = selected_profiles
-            st.session_state.forecast = None
-            st.session_state.message = (
-                "Conversion seasonality selection changed. Create a new forecast draft "
-                "to update results."
-            )
+        if label in available_profiles
+    ][:2]
+    if not stored_profiles:
+        stored_profiles = [available_profiles[0]]
+    profile_col, comparison_col = st.columns(2)
+    with profile_col:
+        primary_profile = st.selectbox(
+            "Primary conversion seasonality",
+            available_profiles,
+            index=available_profiles.index(stored_profiles[0]),
+            key=f"_widget_primary_seasonality_profile_{mode_widget_generation}",
+            help="This profile is used first in forecast outputs.",
+        )
+    comparison_options = ["None"] + [
+        label for label in available_profiles if label != primary_profile
+    ]
+    stored_comparison = (
+        stored_profiles[1]
+        if len(stored_profiles) > 1 and stored_profiles[1] in comparison_options
+        else "None"
+    )
+    with comparison_col:
+        comparison_profile = st.selectbox(
+            "Comparison profile (optional)",
+            comparison_options,
+            index=comparison_options.index(stored_comparison),
+            key=f"_widget_comparison_seasonality_profile_{mode_widget_generation}",
+            help="Choose one second profile to compare complete forecast splits.",
+        )
+    selected_profiles = [primary_profile]
+    if comparison_profile != "None":
+        selected_profiles.append(comparison_profile)
+    if selected_profiles != st.session_state.get("selected_seasonality_profiles"):
+        st.session_state.selected_seasonality_profiles = selected_profiles
+        st.session_state.forecast = None
+        st.session_state.message = (
+            "Conversion seasonality selection changed. Create a new forecast draft "
+            "to update results."
+        )
+    if st.session_state.monthly_index_mode == "Automatic":
         for warning in automatic_indexes.get("seasonality_warnings", []):
             st.warning(warning)
-    else:
-        st.caption(
-            "Manual mode uses the manually entered Incremental percentages as the "
-            "conversion seasonality profile."
-        )
 
     indexes = effective_monthly_indexes(automatic_indexes)
     monthly_organic = indexes["monthly_organic"]
@@ -2250,26 +2273,22 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
         ordered_columns.append(total_columns[quarter])
     ordered_columns.append("Overall Total")
 
+    editable_profiles = {"Organic %": monthly_organic}
+    editable_profiles.update(indexes["monthly_conversion_profiles"])
     transposed_frame = pd.DataFrame(
         [
             {
-                "Metric": "Organic %",
-                **{month: round(monthly_organic.get(month, 0.0) * 100, 2) for month in MONTH_NAMES},
+                "Metric": label,
+                **{month: round(values.get(month, 0.0) * 100, 2) for month in MONTH_NAMES},
                 **{
-                    total_columns[quarter]: round(quarterly_organic.get(quarter, 0.0) * 100, 2)
+                    total_columns[quarter]: round(
+                        sum(values.get(month, 0.0) for month in _ordered_campaign_months(quarter)) * 100, 2
+                    )
                     for quarter in QUARTER_MONTHS
                 },
-                "Overall Total": round(sum(monthly_organic.values()) * 100, 2),
-            },
-            {
-                "Metric": "Incremental %",
-                **{month: round(monthly_incremental.get(month, 0.0) * 100, 2) for month in MONTH_NAMES},
-                **{
-                    total_columns[quarter]: round(quarterly_incremental.get(quarter, 0.0) * 100, 2)
-                    for quarter in QUARTER_MONTHS
-                },
-                "Overall Total": round(sum(monthly_incremental.values()) * 100, 2),
-            },
+                "Overall Total": round(sum(values.values()) * 100, 2),
+            }
+            for label, values in editable_profiles.items()
         ]
     )[["Metric", *ordered_columns]]
 
@@ -2300,9 +2319,13 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
     st.markdown("**Monthly Seasonal Indexes**")
     if st.session_state.monthly_index_mode == "Manual":
         st.caption(
-            "Edit the monthly Organic and Incremental percentages directly. Quarter and "
-            "overall totals recalculate immediately; each metric must total exactly 100.00%."
+            "Edit all five monthly profiles to two decimal places. Organic allocates "
+            "investment; the selected primary and comparison profiles allocate conversions. "
+            "Quarter totals are calculated. Organic and each selected conversion profile "
+            "must total exactly 100.00%. Normalized manual rows are independent edits."
         )
+        editor_revision = int(st.session_state.get("manual_seasonality_editor_revision", 0))
+        editor_key = f"monthly_seasonal_index_editor_{mode_widget_generation}_{editor_revision}"
         monthly_edited = st.data_editor(
             transposed_frame,
             hide_index=True,
@@ -2312,51 +2335,45 @@ def render_monthly_index_section(automatic_indexes: dict) -> dict:
                 *[total_columns[quarter] for quarter in QUARTER_MONTHS],
                 "Overall Total",
             ],
-            key="monthly_seasonal_index_editor",
+            key=editor_key,
             column_config=seasonal_columns,
         )
-        new_monthly_organic = {
-            month: _rounded_seasonal_share(
-                float(
-                    monthly_edited.loc[
-                        monthly_edited["Metric"] == "Organic %", month
-                    ].iloc[0]
-                ) / 100
-            )
-            for month in MONTH_NAMES
-        }
-        new_monthly_incremental = {
-            month: _rounded_seasonal_share(
-                float(
-                    monthly_edited.loc[
-                        monthly_edited["Metric"] == "Incremental %", month
-                    ].iloc[0]
-                ) / 100
-            )
-            for month in MONTH_NAMES
+        edited_profiles = {
+            label: {
+                month: _rounded_seasonal_share(
+                    float(monthly_edited.loc[monthly_edited["Metric"] == label, month].iloc[0]) / 100
+                )
+                for month in MONTH_NAMES
+            }
+            for label in editable_profiles
         }
         changed = any(
-            abs(new_monthly_organic[month] - st.session_state.manual_monthly_organic.get(month, 0.0)) > 0.000000001
-            or abs(new_monthly_incremental[month] - st.session_state.manual_monthly_incremental.get(month, 0.0)) > 0.000000001
+            abs(edited_profiles[label][month] - editable_profiles[label].get(month, 0.0)) > 0.000000001
+            for label in editable_profiles
             for month in MONTH_NAMES
         )
         if changed:
-            st.session_state.manual_monthly_organic = new_monthly_organic
-            st.session_state.manual_monthly_incremental = new_monthly_incremental
+            # Durable, non-widget state survives removal of the Inputs tab widgets.
+            st.session_state.manual_monthly_organic = edited_profiles["Organic %"]
+            st.session_state.manual_monthly_profiles = {
+                label: edited_profiles[label] for label in CONVERSION_SEASONALITY_PROFILES
+            }
+            st.session_state.manual_monthly_incremental = edited_profiles["Incremental %"]
             st.session_state.manual_monthly_signature = signature
+            # Recreate the editor from committed values rather than reapply an old delta.
+            st.session_state.manual_seasonality_editor_revision = editor_revision + 1
             st.session_state.forecast = None
             st.session_state.message = (
-                "Manual seasonal indexes changed. Create a new forecast draft to "
-                "update results."
+                "Manual seasonal indexes changed. Create a new forecast draft to update results."
             )
             st.rerun()
-        st.caption(
-            f"Overall organic: {sum(st.session_state.manual_monthly_organic.values()) * 100:.2f}%"
-            f" | Overall incremental: {sum(st.session_state.manual_monthly_incremental.values()) * 100:.2f}%"
-        )
+        st.caption(" | ".join(
+            f"{label}: {sum(values.values()) * 100:.2f}%"
+            for label, values in edited_profiles.items()
+        ))
         if not manual_seasonal_indexes_valid():
             st.error(
-                "Manual monthly Organic and Incremental indexes must each total "
+                "Manual Organic and each selected conversion profile must total "
                 "exactly 100.00% before you create a forecast."
             )
     else:
@@ -2589,31 +2606,241 @@ def visible_tier(label: str, show_expansion: bool) -> bool:
     )
 
 
+# CHANGES (2026-11-25): UI/UX = start navigated pages at the top after render.
+# Scenario defaults = empty; Add starts at 10%, then 15%; explicit edits persist.
+# Forecast calculations, tier rules, source queries and save logic are unchanged.
 def scroll_page_to_top() -> None:
-    """Reset the Streamlit main viewport after tab navigation."""
+    """Reset only on navigation, after content and navigation controls render."""
+    generation = int(st.session_state.get("_navigation_scroll_generation", 0)) + 1
+    st.session_state["_navigation_scroll_generation"] = generation
     components.html(
         """
         <script>
+        // A unique request forces this navigation effect to rerun on each page change.
+        const request = "__NAVIGATION_REQUEST__";
+        const host = window.parent;
+        const doc = host.document;
+        let cancelled = false;
+        const cancel = () => { cancelled = true; cleanup(); };
+        const events = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+        const cleanup = () => events.forEach(event => doc.removeEventListener(event, cancel, true));
+        events.forEach(event => doc.addEventListener(event, cancel, {capture: true, passive: true}));
         const scrollToTop = () => {
-          const main = window.parent.document.querySelector(
-            'section[data-testid="stMain"]'
-          );
-          if (main) {
-            main.scrollTop = 0;
-            main.scrollTo({top: 0, left: 0, behavior: 'auto'});
-          }
-          window.parent.scrollTo({top: 0, left: 0, behavior: 'auto'});
+          if (cancelled) return;
+          const focused = doc.activeElement;
+          if (focused && focused.tagName === 'BUTTON') focused.blur();
+          const targets = [
+            doc.querySelector('[data-testid="stMain"]'),
+            doc.querySelector('section.main'),
+            doc.scrollingElement
+          ];
+          targets.forEach(target => {
+            if (target) target.scrollTo({top: 0, left: 0, behavior: 'instant'});
+          });
+          host.scrollTo({top: 0, left: 0, behavior: 'instant'});
         };
         scrollToTop();
-        window.parent.setTimeout(scrollToTop, 50);
-        window.parent.setTimeout(scrollToTop, 150);
-        window.parent.setTimeout(scrollToTop, 400);
-        window.parent.setTimeout(scrollToTop, 800);
+        host.requestAnimationFrame(scrollToTop);
+        [100, 300, 700, 1400, 2400].forEach(delay => host.setTimeout(scrollToTop, delay));
+        host.setTimeout(cleanup, 2600);
         </script>
-        """,
+        """.replace("__NAVIGATION_REQUEST__", str(generation)),
         height=0,
         width=0,
     )
+
+
+def snowflake_display_tiers(result: dict) -> dict[str, str]:
+    """SAVE LOGIC ONLY: retain raw TIER and select two expansion DISPLAY_TIERs.
+
+    Baseline marginal bounds determine one pair for every saved period/scenario.
+    Any strictly negative CPIx/iROAS marginal observation makes a bound negative;
+    zero is non-negative and missing marginals do not trigger the threshold.
+    Forecast tables, charts, Excel, and calculation formulas are not filtered.
+    """
+    # Tool versions differ in expansion steps (+5%..+25% or +10%..+50%);
+    # use whichever complete set this forecast draft contains.
+    expansion_label_sets = (
+        (
+            "Incremental Reach (+10%)", "Incremental Reach (+20%)",
+            "Incremental Reach (+30%)", "Incremental Reach (+40%)",
+            "Maximum Scale (+50%)",
+        ),
+        (
+            "Incremental Reach (+5%)", "Incremental Reach (+10%)",
+            "Incremental Reach (+15%)", "Incremental Reach (+20%)",
+            "Maximum Scale (+25%)",
+        ),
+    )
+    available = {row.tier_label for row in result["ranges"]}
+    expansion_labels = next(
+        (labels for labels in expansion_label_sets if set(labels).issubset(available)),
+        None,
+    )
+    if expansion_labels is None:
+        raise ValueError(
+            "Recreate the forecast draft with the full set of expansion tiers "
+            "(+5% through +25% or +10% through +50%) before saving."
+        )
+    negative = {label: False for label in expansion_labels}
+    for row in result["projections"]:
+        if row.tier_label in negative:
+            negative[row.tier_label] = negative[row.tier_label] or any(
+                value is not None and Decimal(str(value)) < 0
+                for value in (row.marginal_cpix, row.marginal_iroas)
+            )
+    first_negative = next(
+        (index for index, label in enumerate(expansion_labels) if negative[label]),
+        None,
+    )
+    if first_negative is None:
+        growth, maximum = expansion_labels[2], expansion_labels[4]
+    elif first_negative == 0:
+        growth, maximum = expansion_labels[0], expansion_labels[4]
+    else:
+        growth = expansion_labels[first_negative - 1]
+        maximum = expansion_labels[first_negative]
+    display = {
+        "Current Investment": "Current Plan",
+        "Growth Momentum": "Expand",
+        "Strategic Growth": "Accelerate",
+        "Market Expansion": "Scale",
+        "Strategic Scale": "Optimal Scale: Efficiency",
+        "Optimal Scale": "Optimal Scale: Balanced",
+        growth: "Optimal Scale: Growth",
+        maximum: "Optimal Scale: Maximum",
+    }
+    return {label: display.get(label, label) for label in available
+            if label not in expansion_labels or label in (growth, maximum)}
+
+
+_PRIOR_TIER_PLAN_SQL = """
+WITH q AS (
+  SELECT FORECAST_TAG, FORECASTING_YEAR * 10 + TRY_TO_NUMBER(SUBSTR(FORECASTING_QUARTER, 2, 1)) AS YQ,
+         TIER, INVESTMENT, DATE_CREATED
+  FROM ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
+  WHERE UPPER(TRIM(CLIENT_NAME)) = UPPER(TRIM(?)) AND UPPER(TRIM(CAMPAIGN_NAME)) = UPPER(TRIM(?))
+    AND UPPER(TRIM(CONVERSION_EVENT)) = UPPER(TRIM(?)) AND UPPER(TRIM(MARKETING_CHANNEL)) = UPPER(TRIM(?))
+), a AS (
+  SELECT FORECAST_TAG, FORECAST_YEAR_START_YEAR * 10 + TRY_TO_NUMBER(SUBSTR(FORECAST_YEAR_START_QUARTER, 2, 1)) AS YQ,
+         TIER, INVESTMENT / 4 AS INVESTMENT, DATE_CREATED
+  FROM ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY
+  WHERE UPPER(TRIM(CLIENT_NAME)) = UPPER(TRIM(?)) AND UPPER(TRIM(CAMPAIGN_NAME)) = UPPER(TRIM(?))
+    AND UPPER(TRIM(CONVERSION_EVENT)) = UPPER(TRIM(?)) AND UPPER(TRIM(MARKETING_CHANNEL)) = UPPER(TRIM(?))
+), m AS (
+  SELECT FORECAST_TAG, FORECAST_YEAR * 10 + CEIL(DATE_PART(MONTH, TRY_TO_DATE(FORECAST_MONTH, 'MON')) / 3) AS YQ,
+         DATE_CREATED
+  FROM ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
+  WHERE UPPER(TRIM(CLIENT_NAME)) = UPPER(TRIM(?)) AND UPPER(TRIM(CAMPAIGN_NAME)) = UPPER(TRIM(?))
+    AND UPPER(TRIM(CONVERSION_EVENT)) = UPPER(TRIM(?)) AND UPPER(TRIM(MARKETING_CHANNEL)) = UPPER(TRIM(?))
+), tags AS (
+  SELECT FORECAST_TAG, MIN(YQ) AS YQ, MAX(DATE_CREATED) AS DATE_CREATED
+  FROM (SELECT FORECAST_TAG, YQ, DATE_CREATED FROM q
+        UNION ALL SELECT FORECAST_TAG, YQ, DATE_CREATED FROM a
+        UNION ALL SELECT FORECAST_TAG, YQ, DATE_CREATED FROM m)
+  GROUP BY FORECAST_TAG
+), mailops AS (
+  SELECT r.FORECAST_TAG, t.value:label::STRING AS TIER, t.value:investment::FLOAT AS INVESTMENT
+  FROM ZX.ANALYTICS.FORECASTING_OUTPUT_MAILOPS_REFERENCE r, LATERAL FLATTEN(input => r.TIERS) t
+  WHERE r.FORECAST_TAG IN (SELECT FORECAST_TAG FROM tags)
+), tier_rows AS (
+  -- Annual rows are x4 quarterly values; quarterly rows of annual-mode
+  -- forecasts are seasonally split, so only quarterly-mode rows are used as-is.
+  SELECT FORECAST_TAG, TIER, INVESTMENT FROM a
+  UNION ALL
+  SELECT FORECAST_TAG, TIER, INVESTMENT FROM q WHERE FORECAST_TAG NOT IN (SELECT FORECAST_TAG FROM a)
+  UNION ALL
+  SELECT FORECAST_TAG, TIER, INVESTMENT FROM mailops
+  WHERE FORECAST_TAG NOT IN (SELECT FORECAST_TAG FROM a UNION SELECT FORECAST_TAG FROM q)
+), tiers AS (
+  SELECT FORECAST_TAG, REGEXP_REPLACE(TIER, '^Tier [0-9]+: ', '') AS TIER_LABEL, MIN(INVESTMENT) AS INVESTMENT
+  FROM tier_rows
+  GROUP BY 1, 2
+  HAVING TIER_LABEL NOT LIKE 'Incremental Reach%' AND TIER_LABEL NOT LIKE 'Maximum Scale%'
+), best AS (
+  SELECT g.FORECAST_TAG, g.YQ, g.DATE_CREATED
+  FROM tags g JOIN tiers t ON t.FORECAST_TAG = g.FORECAST_TAG
+  WHERE g.YQ <= ?
+  GROUP BY 1, 2, 3
+  HAVING ABS(MIN(t.INVESTMENT) - ?) <= 0.01
+  ORDER BY g.YQ DESC, g.DATE_CREATED DESC, g.FORECAST_TAG DESC
+  LIMIT 1
+)
+SELECT b.FORECAST_TAG, b.YQ, b.DATE_CREATED, t.TIER_LABEL, t.INVESTMENT
+FROM best b JOIN tiers t ON t.FORECAST_TAG = b.FORECAST_TAG
+ORDER BY t.INVESTMENT
+"""
+
+
+def load_prior_tier_plan(
+    client: str, campaign: str, event: str, channel: str,
+    projection_quarter: str, baseline: float,
+) -> dict | None:
+    """Most recent saved forecast (same or earlier quarter) with this baseline.
+
+    Ranked by quarter first, then newest DATE_CREATED. Returns None when no
+    saved forecast qualifies, so callers fall back to calculated tiers.
+    """
+    quarter_match = re.match(r"Q(\d)\s+(\d{4})", projection_quarter or "")
+    if not quarter_match or not all((client, campaign, event, channel)):
+        return None
+    max_yq = int(quarter_match.group(2)) * 10 + int(quarter_match.group(1))
+    baseline = round(float(baseline), 2)
+
+    def _load():
+        dims = [client, campaign, event, channel]
+        try:
+            rows = get_session().sql(
+                _PRIOR_TIER_PLAN_SQL, params=dims * 3 + [max_yq, baseline]
+            ).collect()
+        except Exception:
+            return None
+        if not rows:
+            return None
+        labels = [str(row["TIER_LABEL"]) for row in rows]
+        values = [round(float(row["INVESTMENT"]), 2) for row in rows]
+        if labels[-1] != "Optimal Scale" or any(
+            left >= right for left, right in zip(values, values[1:])
+        ):
+            return None
+        yq = int(rows[0]["YQ"])
+        return {
+            "forecast_tag": rows[0]["FORECAST_TAG"],
+            "quarter": f"Q{yq % 10} {yq // 10}",
+            "date_created": str(rows[0]["DATE_CREATED"]),
+            "labels": labels,
+            "values": values,
+        }
+
+    return _cached_query(
+        "prior_tier_plan",
+        _query_cache_key(client, campaign, event, channel, max_yq, baseline),
+        _load,
+    )
+
+
+def numbered_tier_labels(tier_labels: list[str]) -> dict[str, str]:
+    """SAVE LOGIC ONLY: 'Tier 1: Current Investment', 'Tier 2: ...' in save order."""
+    return {
+        label: f"Tier {index}: {label}"
+        for index, label in enumerate(tier_labels, start=1)
+    }
+
+
+# Output-table rounding: dollar amounts to cents, customer counts to whole numbers.
+def _round_save_params(params: list, money_idx: set[int], count_idx: set[int]) -> list:
+    rounded = list(params)
+    for index in money_idx | count_idx:
+        value = rounded[index]
+        if value is None or isinstance(value, str):
+            continue
+        rounded[index] = round(float(value), 2 if index in money_idx else 0)
+    return rounded
+
+
+# Positions shared by the ANNUALLY / QUARTERLY / MONTHLY INSERT parameter lists.
+_FORECAST_MONEY_IDX = {10, 14, 15, 16, 17, 20, 21}
+_FORECAST_COUNT_IDX = {12, 13}
 
 
 def export_tier_label(tier_label: str) -> str:
@@ -3434,8 +3661,6 @@ def _render_download_button(key_suffix: str, chart_images: list[tuple[str, bytes
 
 def tab_nav_buttons(tab_names: list[str], current_index: int) -> None:
     """Render Previous / Next navigation buttons at the bottom of a tab."""
-    if _should_scroll_to_top:
-        scroll_page_to_top()
     st.markdown("---")
     cols = st.columns([1, 8, 1])
     if current_index > 0:
@@ -3516,8 +3741,6 @@ def render_user_guide() -> None:
 
 initialize_state()
 _should_scroll_to_top = st.session_state.pop("scroll_to_top", False)
-if _should_scroll_to_top:
-    scroll_page_to_top()
 
 # --- Get session (simple — no caching, no health checks) ---
 session = get_session()
@@ -3621,6 +3844,8 @@ with reset_col:
 # =============================================================================
 if st.session_state.get("mailops_mode"):
     render_mailops_editor(session)
+    if _should_scroll_to_top:
+        scroll_page_to_top()
     st.stop()
 
 st.info(st.session_state.message)
@@ -3672,6 +3897,8 @@ for i, name in enumerate(tab_names):
 st.markdown('<div class="compact-workflow-divider"></div>', unsafe_allow_html=True)
 if st.session_state.get("show_user_guide", False):
     render_user_guide()
+    if _should_scroll_to_top:
+        scroll_page_to_top()
     st.stop()
 active_tab = st.session_state.active_tab
 
@@ -4316,6 +4543,8 @@ if st.session_state.preview and active_tab == 0:
 
     if not _eligible_preview:
         st.warning("No historical quarters exist before the selected projection quarter.")
+        if _should_scroll_to_top:
+            scroll_page_to_top()
         st.stop()
 
     display = pd.DataFrame(
@@ -4445,6 +4674,8 @@ if st.session_state.confirmed and active_tab == 1:
             "There is no valid max reach or CPM data available for this campaign. "
             "Forecasts cannot be completed until this data is added in Change MailOps Data."
         )
+        if _should_scroll_to_top:
+            scroll_page_to_top()
         st.stop()
 
     # LOGIC: only exactly-100% accounts use the budget-derived frequency default.
@@ -4531,6 +4762,8 @@ if st.session_state.confirmed and active_tab == 1:
                 "Return to Inputs and create or correct the row in Change MailOps Data."
             )
             st.caption(f"Lookup detail: {exc}")
+            if _should_scroll_to_top:
+                scroll_page_to_top()
             st.stop()
 
     with frequency_col:
@@ -4795,8 +5028,26 @@ if st.session_state.confirmed and active_tab == 1:
             st.session_state.manual_tier_count -= 1
             _clear_stale_forecast("Manual tier removed. Click Use Manual Edits to apply.")
 
+    _prior_tier_plan = load_prior_tier_plan(
+        st.session_state.get("source_account") or "",
+        st.session_state.get("selected_sub_account") or "",
+        st.session_state.get("selected_event") or "",
+        st.session_state.get("selected_channel") or "",
+        st.session_state.get("projection_quarter") or "",
+        calculated_tier_values[0],
+    )
+
     def _calculated_tier_plan() -> tuple[list[str], list[float]]:
-        """Build automatic tiers with at most one tier per utilization bucket."""
+        """Build automatic tiers with at most one tier per utilization bucket.
+
+        A saved forecast from the same or an earlier quarter with the same
+        baseline populates the tiers until the investment increase is edited.
+        """
+        if _prior_tier_plan is not None and abs(
+            float(st.session_state.get(investment_increase_key, _initial_investment_increase()))
+            - _initial_investment_increase()
+        ) < 0.01:
+            return list(_prior_tier_plan["labels"]), list(_prior_tier_plan["values"])
         if not has_adjustable_tier_range:
             return list(labels), [float(value) for value in calculated_tier_values]
 
@@ -4877,6 +5128,16 @@ if st.session_state.confirmed and active_tab == 1:
                     if st.button("Edit Manual Tiers", key="edit_tiers_manually"):
                         st.session_state.manual_tier_mode = True
                         st.session_state.manual_tiers_applied = False
+                        # Start the editor from the reused saved forecast when
+                        # it is the plan currently shown.
+                        _shown_labels, _shown_values = _calculated_tier_plan()
+                        if (
+                            _prior_tier_plan is not None
+                            and not st.session_state.manual_tier_values
+                            and set(_shown_labels) <= set(labels)
+                        ):
+                            st.session_state.manual_tier_values = dict(zip(_shown_labels, _shown_values))
+                            st.session_state.manual_tier_count = len(_shown_labels)
                         for index, (label, value) in enumerate(zip(labels, calculated_tier_values)):
                             saved = st.session_state.manual_tier_values.get(label, float(value))
                             st.session_state.manual_tier_values[label] = saved
@@ -5065,7 +5326,15 @@ if st.session_state.confirmed and active_tab == 1:
         else:
             tier_labels_for_forecast, tier_values = _calculated_tier_plan()
         _using_applied_manual = st.session_state.manual_tier_mode and st.session_state.manual_tiers_applied
-        if not _using_applied_manual and 1 < len(tier_labels_for_forecast) < len(labels):
+        if not _using_applied_manual and _prior_tier_plan is not None and (
+            tier_values == list(_prior_tier_plan["values"])
+        ):
+            st.caption(
+                f"Reused tiers from saved forecast {_prior_tier_plan['forecast_tag']} "
+                f"({_prior_tier_plan['quarter']}, created {_prior_tier_plan['date_created']}) "
+                "with the same baseline investment."
+            )
+        elif not _using_applied_manual and 1 < len(tier_labels_for_forecast) < len(labels):
             st.info(
                 f"Investment increase of {money(st.session_state[investment_increase_key])} "
                 f"supports {len(tier_values)} meaningful tiers before Optimal Scale. "
@@ -5092,7 +5361,8 @@ if st.session_state.confirmed and active_tab == 1:
 
     # --- Improvement Scenarios ---
     if "num_scenarios" not in st.session_state:
-        st.session_state.num_scenarios = 2
+        st.session_state.num_scenarios = 0
+    st.session_state.setdefault("scenario_factor_values", {})
 
     def _add_scenario():
         if st.session_state.num_scenarios < 10:
@@ -5106,6 +5376,7 @@ if st.session_state.confirmed and active_tab == 1:
             removed_index = st.session_state.num_scenarios - 1
             st.session_state.pop(f"scenario_name_{removed_index}", None)
             st.session_state.pop(f"scenario_factor_{removed_index}", None)
+            st.session_state.scenario_factor_values.pop(removed_index, None)
             st.session_state.num_scenarios -= 1
             _clear_stale_forecast(
                 "Improvement scenario removed. Create a new forecast draft to update results."
@@ -5144,13 +5415,25 @@ if st.session_state.confirmed and active_tab == 1:
                 col = cols[idx]
                 scenario_idx = row_start + idx
                 default_factor = 15.0 if scenario_idx == 1 else 10.0
+                def _store_scenario_factor(index=scenario_idx):
+                    st.session_state.scenario_factor_values[index] = st.session_state[
+                        f"scenario_factor_{index}"
+                    ]
+                    _clear_stale_forecast(
+                        "Performance change updated. Create a new forecast draft to update results."
+                    )
+
                 factor = col.number_input(
                     "Performance Change (%)",
                     # UI/UX: user-controlled percentage; no business range limits.
-                    value=default_factor,
+                    value=float(st.session_state.scenario_factor_values.get(
+                        scenario_idx, st.session_state.get(f"scenario_factor_{scenario_idx}", default_factor)
+                    )),
                     step=0.5,
                     key=f"scenario_factor_{scenario_idx}",
+                    on_change=_store_scenario_factor,
                 )
+                st.session_state.scenario_factor_values[scenario_idx] = factor
                 if factor > 0:
                     name = f"+{factor:g}% Improvement"
                 elif factor < 0:
@@ -5222,6 +5505,17 @@ if st.session_state.confirmed and active_tab == 1:
                 "Forecast is paused because Optimal Scale rounds to the same amount "
                 "as Current Investment. Increase Frequency at Max Reach Utilization "
                 "slightly, then recalculate."
+            )
+        # CHANGES (2026-11-25): UI/UX = explain unapplied manual edits.
+        # LOGIC = forecast readiness and increasing-order validation unchanged.
+        elif (
+            st.session_state.manual_tier_mode
+            and not st.session_state.manual_tiers_applied
+            and tiers_strictly_increasing
+        ):
+            st.warning(
+                "Forecast is paused: click Use Manual Edits to apply your tier "
+                "values before creating a forecast draft."
             )
         else:
             st.error(
@@ -6835,8 +7129,30 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
     _proj_q_save = st.session_state.get("projection_quarter", "")
     _sig_util_save = st.session_state.get("_cached_sig_util", {})
 
+    # SAVE LOGIC: filter only Snowflake output rows; leave result and tool views intact.
+    _display_tier_error = None
+    try:
+        _display_tiers_save = snowflake_display_tiers(result)
+    except ValueError as exc:
+        _display_tiers_save = {}
+        _display_tier_error = str(exc)
+    _ranges_to_save = [r for r in visible_ranges if r.tier_label in _display_tiers_save]
+    _numbered_tiers_save = numbered_tier_labels(
+        [r.tier_label for r in sorted(_ranges_to_save, key=lambda r: float(r.investment))]
+    )
+
     render_input_data_section("tab5_save")
     st.header("Save Results to Snowflake")
+
+    # UI/UX: show the exact raw/display labels that will be written to Snowflake.
+    st.caption("All five expansion tiers stay visible in the tool. Snowflake saves only the selected Growth and Maximum pair, with original TIER preserved.")
+    if _display_tier_error:
+        st.error(_display_tier_error)
+    else:
+        st.dataframe(pd.DataFrame([
+            {"Tier": _numbered_tiers_save[row.tier_label], "Display Tier": _display_tiers_save[row.tier_label]}
+            for row in _ranges_to_save
+        ]), hide_index=True, use_container_width=True)
 
     # Build scenario options
     _scenario_opts = ["Baseline"]
@@ -6876,7 +7192,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
             "This forecast draft was created before input snapshots were added. "
             "Recreate the forecast draft in Tab 2 to export."
         )
-    _can_export = bool(_selected_scenarios) and _has_input_snapshot
+    _can_export = bool(_selected_scenarios) and _has_input_snapshot and bool(_ranges_to_save) and not _display_tier_error
 
     if st.button("Export to Snowflake", type="primary", key="_btn_export_sf", disabled=not _can_export):
         _export_status = st.empty()
@@ -6903,7 +7219,9 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
 
             rows_saved = 0
 
-            _today_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            # Full UTC timestamp so same-day saves can be ordered; DATE columns
+            # keep only the date until DATE_CREATED becomes TIMESTAMP_NTZ.
+            _today_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
             # --- 1. Always save input reference ---
             for row in selected_history:
@@ -6919,7 +7237,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                         INC_CUSTOMERS, INC_REVENUE, AVG_INC_REVENUE, CPIX, IROAS,
                         CREATED_BY, DATE_CREATED)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    params=[
+                    params=_round_save_params([
                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                         _ref_campaign_quarter, _ref_campaign_year,
                         float(row["delivered_volume"]), float(row["source_spend"]),
@@ -6928,7 +7246,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                         float(row["average_incremental_revenue"]),
                         float(row["cpix"]), float(row["iroas"]),
                         current_user, _today_date,
-                    ],
+                    ], {8, 12, 13, 14}, {11}),
                 ).collect()
                 rows_saved += 1
 
@@ -6949,7 +7267,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           PARSE_JSON(?), PARSE_JSON(?), ?, PARSE_JSON(?)::ARRAY, PARSE_JSON(?),
                           ?, ?, ?, ?, ?""",
-                params=[
+                params=_round_save_params([
                     forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                     _snap["projection_mode"], _snap["projection_quarter"],
                     _snap["using_data_from_quarter"], _snap["attribution_window"], _snap["range_percent"],
@@ -6961,14 +7279,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                     _snap["frequency_at_max"], _snap["historical_frequency"],
                     _snap["max_investment"], _snap["max_impressions"],
                     _snap["tier_mode"], _snap["tier_investment_increase"],
-                    json.dumps(_snap["tiers"]), json.dumps(_snap["scenarios"]),
+                    json.dumps([
+                        {**_t, "investment": round(float(_t["investment"]), 2)}
+                        if isinstance(_t, dict) and _t.get("investment") is not None else _t
+                        for _t in _snap["tiers"]
+                    ]), json.dumps(_snap["scenarios"]),
                     _snap["seasonality_mode"],
                     json.dumps(_snap["seasonality_profiles"]),
                     json.dumps(_snap["monthly_seasonal_indexes"], default=float),
                     _snap["forecast_current_budget"], _snap["forecast_optimal_investment"],
                     _snap["forecast_signal_utilization"],
                     current_user, _today_date,
-                ],
+                ], {10, 13, 20, 23, 29, 30}, set()),
             ).collect()
             rows_saved += 1
 
@@ -7022,7 +7344,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
 
                 for scenario_label in _annual_scenarios:
                     imp_mult = _imp_mult_for(scenario_label)
-                    for r in visible_ranges:
+                    for r in _ranges_to_save:
                         inv = float(r.investment) * 4
                         cust_min = float(r.incremental_customers.minimum) * 4 * imp_mult
                         cust_max = float(r.incremental_customers.maximum) * 4 * imp_mult
@@ -7032,18 +7354,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                             """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_ANNUALLY
                                (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
                                 FORECAST_YEAR_START_QUARTER, FORECAST_YEAR_START_YEAR,
-                                SCENARIO, TIER,
+                                SCENARIO, TIER, DISPLAY_TIER,
                                 INVESTMENT, DELIVERED_VOLUME,
                                 INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                 INC_REVENUE_MIN, INC_REVENUE_MAX,
                                 CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                 MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                 SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            params=[
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            params=_round_save_params([
                                 forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                 _annual_start_quarter, _annual_start_year,
-                                scenario_label, r.tier_label,
+                                scenario_label, _numbered_tiers_save[r.tier_label], _display_tiers_save[r.tier_label],
                                 inv, float(r.delivered_volume) * 4,
                                 cust_min, cust_max, rev_min, rev_max,
                                 inv / cust_max if cust_max > 0 else 0,
@@ -7052,7 +7374,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 rev_max / inv if inv > 0 else 0,
                                 *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                 _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
-                            ],
+                            ], _FORECAST_MONEY_IDX, _FORECAST_COUNT_IDX),
                         ).collect()
                         rows_saved += 1
 
@@ -7061,7 +7383,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                 for scenario_label in _quarterly_scenarios:
                     imp_mult = _imp_mult_for(scenario_label)
                     if _is_quarterly_save:
-                        for r in visible_ranges:
+                        for r in _ranges_to_save:
                             inv = float(r.investment)
                             cust_min = float(r.incremental_customers.minimum) * imp_mult
                             cust_max = float(r.incremental_customers.maximum) * imp_mult
@@ -7070,18 +7392,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                             session.sql(
                                 """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
                                    (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
-                                    FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER,
+                                    FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER, DISPLAY_TIER,
                                     INVESTMENT, DELIVERED_VOLUME,
                                     INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                     INC_REVENUE_MIN, INC_REVENUE_MAX,
                                     CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                     MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                     SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                params=[
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                params=_round_save_params([
                                     forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                     f"Q{_pq_num_save}", _pq_year_save,
-                                    scenario_label, r.tier_label,
+                                    scenario_label, _numbered_tiers_save[r.tier_label], _display_tiers_save[r.tier_label],
                                     inv, float(r.delivered_volume),
                                     cust_min, cust_max, rev_min, rev_max,
                                     inv / cust_max if cust_max > 0 else 0,
@@ -7090,7 +7412,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     rev_max / inv if inv > 0 else 0,
                                     *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                     _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
-                                ],
+                                ], _FORECAST_MONEY_IDX, _FORECAST_COUNT_IDX),
                             ).collect()
                             rows_saved += 1
                     else:
@@ -7102,7 +7424,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                             _q_year = int(_q_year_m.group()) if _q_year_m else _pq_year_save
                             o_pct = indexes.get("quarterly_organic", {}).get(_q_key, 0.0)
                             i_pct = indexes.get("quarterly_incremental", {}).get(_q_key, 0.0)
-                            for r in visible_ranges:
+                            for r in _ranges_to_save:
                                 inv = float(r.investment) * 4 * o_pct
                                 cust_min = float(r.incremental_customers.minimum) * 4 * i_pct * imp_mult
                                 cust_max = float(r.incremental_customers.maximum) * 4 * i_pct * imp_mult
@@ -7111,18 +7433,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 session.sql(
                                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_QUARTERLY
                                        (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
-                                        FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER,
+                                        FORECASTING_QUARTER, FORECASTING_YEAR, SCENARIO, TIER, DISPLAY_TIER,
                                         INVESTMENT, DELIVERED_VOLUME,
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                         MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                         SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                    params=[
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    params=_round_save_params([
                                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                         _q_key, _q_year,
-                                        scenario_label, r.tier_label,
+                                        scenario_label, _numbered_tiers_save[r.tier_label], _display_tiers_save[r.tier_label],
                                         inv, float(r.delivered_volume) * 4 * o_pct,
                                         cust_min, cust_max, rev_min, rev_max,
                                         inv / cust_max if cust_max > 0 else 0,
@@ -7131,7 +7453,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         rev_max / inv if inv > 0 else 0,
                                         *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                         _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
-                                    ],
+                                    ], _FORECAST_MONEY_IDX, _FORECAST_COUNT_IDX),
                                 ).collect()
                                 rows_saved += 1
 
@@ -7146,7 +7468,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                         for month in _proj_months_save:
                             m_org = indexes.get("monthly_organic", {}).get(month, 0.0) / org_sum if org_sum else 0.0
                             m_inc = indexes.get("monthly_incremental", {}).get(month, 0.0) / inc_sum if inc_sum else 0.0
-                            for r in visible_ranges:
+                            for r in _ranges_to_save:
                                 inv = float(r.investment) * m_org
                                 cust_min = float(r.incremental_customers.minimum) * m_inc * imp_mult
                                 cust_max = float(r.incremental_customers.maximum) * m_inc * imp_mult
@@ -7155,18 +7477,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                 session.sql(
                                     """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
                                        (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
-                                        FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER,
+                                        FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER, DISPLAY_TIER,
                                         INVESTMENT, DELIVERED_VOLUME,
                                         INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                         INC_REVENUE_MIN, INC_REVENUE_MAX,
                                         CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                         MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                         SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                    params=[
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    params=_round_save_params([
                                         forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                         month, _pq_year_save,
-                                        scenario_label, r.tier_label,
+                                        scenario_label, _numbered_tiers_save[r.tier_label], _display_tiers_save[r.tier_label],
                                         inv, float(r.delivered_volume) * m_org,
                                         cust_min, cust_max, rev_min, rev_max,
                                         inv / cust_max if cust_max > 0 else 0,
@@ -7175,7 +7497,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                         rev_max / inv if inv > 0 else 0,
                                         *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                         _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
-                                    ],
+                                    ], _FORECAST_MONEY_IDX, _FORECAST_COUNT_IDX),
                                 ).collect()
                                 rows_saved += 1
                     else:
@@ -7194,7 +7516,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                             for month in months:
                                 m_org = q_org * (indexes.get("monthly_organic", {}).get(month, 0.0) / org_sum) if org_sum else 0.0
                                 m_inc = q_inc * (indexes.get("monthly_incremental", {}).get(month, 0.0) / inc_sum) if inc_sum else 0.0
-                                for r in visible_ranges:
+                                for r in _ranges_to_save:
                                     inv = float(r.investment) * 4 * m_org
                                     cust_min = float(r.incremental_customers.minimum) * 4 * m_inc * imp_mult
                                     cust_max = float(r.incremental_customers.maximum) * 4 * m_inc * imp_mult
@@ -7203,18 +7525,18 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                     session.sql(
                                         """INSERT INTO ZX.ANALYTICS.FORECASTING_OUTPUT_MONTHLY
                                            (FORECAST_TAG, CLIENT_NAME, CAMPAIGN_NAME, CONVERSION_EVENT, MARKETING_CHANNEL,
-                                            FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER,
+                                            FORECAST_MONTH, FORECAST_YEAR, SCENARIO, TIER, DISPLAY_TIER,
                                             INVESTMENT, DELIVERED_VOLUME,
                                             INC_CUSTOMERS_MIN, INC_CUSTOMERS_MAX,
                                             INC_REVENUE_MIN, INC_REVENUE_MAX,
                                             CPIX_MIN, CPIX_MAX, IROAS_MIN, IROAS_MAX,
                                             MARGINAL_CPIX_MIN, MARGINAL_CPIX_MAX, MARGINAL_IROAS_MIN, MARGINAL_IROAS_MAX,
                                             SIGNAL_UTILIZATION, CREATED_BY, DATE_CREATED)
-                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                        params=[
+                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        params=_round_save_params([
                                             forecast_tag, _client_name, _campaign_name, _conversion_event, _marketing_channel,
                                             month, _q_year,
-                                            scenario_label, r.tier_label,
+                                            scenario_label, _numbered_tiers_save[r.tier_label], _display_tiers_save[r.tier_label],
                                             inv, float(r.delivered_volume) * 4 * m_org,
                                             cust_min, cust_max, rev_min, rev_max,
                                             inv / cust_max if cust_max > 0 else 0,
@@ -7223,10 +7545,12 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
                                             rev_max / inv if inv > 0 else 0,
                                             *_marginals_for(r.tier_label, imp_mult, inv > 0 or cust_max > 0),
                                             _sig_util_save.get(r.tier_label, 0), current_user, _today_date,
-                                        ],
+                                        ], _FORECAST_MONEY_IDX, _FORECAST_COUNT_IDX),
                                     ).collect()
                                     rows_saved += 1
 
+            # New saves become reuse candidates for the next tier lookup.
+            st.session_state.get("_forecast_query_cache", {}).pop("prior_tier_plan", None)
             _tables_written = [
                 "`ZX.ANALYTICS.FORECASTING_OUTPUT_INPUT_REFERENCE`",
                 "`ZX.ANALYTICS.FORECASTING_OUTPUT_MAILOPS_REFERENCE`",
@@ -7262,3 +7586,7 @@ if st.session_state.forecast and active_tab == _save_tab_idx:
             )
 
     tab_nav_buttons(tab_names, _save_tab_idx)
+
+# Navigation-only effect comes last so Streamlit cannot restore the old bottom focus afterward.
+if _should_scroll_to_top:
+    scroll_page_to_top()

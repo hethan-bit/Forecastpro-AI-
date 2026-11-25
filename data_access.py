@@ -48,6 +48,35 @@ def discover_sources(
     return list(unique.values())
 
 
+# CHANGES (2026-11-24): LOGIC = DIRECTV SIGNATURE/GENRE quarterly history
+# maps to CORE / SEGMENT / selected segment. Monthly/organic filters, formulas,
+# final-week selection and latest-LAST_CONVERSION_DATE deduplication are unchanged.
+# UI/UX = existing campaign labels retained; no additional controls.
+def _directv_quarterly_segment(account_name: str | None, sub_account: str | None) -> str | None:
+    segment = str(sub_account or "").strip().upper()
+    if str(account_name or "").strip().upper() == "DIRECTV" and segment in {"SIGNATURE", "GENRE"}:
+        return segment
+    return None
+
+
+def _quarterly_history_dimensions(
+    account_name: str | None,
+    sub_account: str | None,
+    event: str | None,
+    channel: str | None,
+) -> tuple[str, list[Any], str]:
+    """Quarterly-only mapping; never used by monthly or organic queries."""
+    segment = _directv_quarterly_segment(account_name, sub_account)
+    where_clause, params = _dimension_filters(
+        account_name, "CORE" if segment else sub_account, event, channel
+    )
+    if segment:
+        where_clause += " AND UPPER(TRIM(COALESCE(VALUE_OF_AGGREGATION_LEVEL, ''))) = ?"
+        params = [*params, segment]
+    aggregation_level = "SEGMENT" if segment else "OVERALL"
+    return where_clause, params, aggregation_level
+
+
 def account_dimensions(
     session: Any,
     account_identifier: str,
@@ -58,6 +87,22 @@ def account_dimensions(
     identifier = str(account_identifier or "").strip()
     if not identifier:
         return []
+    segment = _directv_quarterly_segment(identifier, sub_account)
+    if segment:
+        where_clause, params, aggregation_level = _quarterly_history_dimensions(
+            identifier, sub_account, event, None
+        )
+        query = f"""
+            SELECT DISTINCT
+                ? AS SUB_ACCOUNT,
+                CONVERSION_TYPE AS EVENT,
+                MARKETING_CHANNEL AS CHANNEL
+            FROM {REFERENCE_HISTORICAL_TABLE}
+            WHERE {where_clause}
+              AND AGGREGATION_LEVEL = '{aggregation_level}'
+            ORDER BY SUB_ACCOUNT, EVENT, CHANNEL
+        """
+        return _rows(session.sql(query, params=[segment, *params]).collect())
     filters = [
         "COALESCE(ZMP_SITE_ID, '') NOT ILIKE '%TEST%'",
         "UPPER(TRIM(COALESCE(CLIENT_NAME, ''))) = UPPER(TRIM(?))",
@@ -79,7 +124,29 @@ def account_dimensions(
           AND AGGREGATION_LEVEL = 'OVERALL'
         ORDER BY SUB_ACCOUNT, EVENT, CHANNEL
     """
-    return _rows(session.sql(query, params=params).collect())
+    rows = _rows(session.sql(query, params=params).collect())
+    if identifier.upper() == "DIRECTV" and not sub_account:
+        # Expose the existing labels even if only CORE segment history exists.
+        segment_filters = list(filters)
+        segment_filters.extend([
+            "UPPER(TRIM(CAMPAIGN_NAME)) = 'CORE'",
+            "AGGREGATION_LEVEL = 'SEGMENT'",
+            "UPPER(TRIM(VALUE_OF_AGGREGATION_LEVEL)) IN ('SIGNATURE', 'GENRE')",
+        ])
+        segment_query = f"""
+            SELECT DISTINCT
+                UPPER(TRIM(VALUE_OF_AGGREGATION_LEVEL)) AS SUB_ACCOUNT,
+                CONVERSION_TYPE AS EVENT,
+                MARKETING_CHANNEL AS CHANNEL
+            FROM {REFERENCE_HISTORICAL_TABLE}
+            WHERE {' AND '.join(segment_filters)}
+        """
+        rows.extend(_rows(session.sql(segment_query, params=params).collect()))
+        unique = {(row["SUB_ACCOUNT"], row["EVENT"], row["CHANNEL"]): row for row in rows}
+        rows = sorted(unique.values(), key=lambda row: tuple(
+            str(row.get(key) or "") for key in ("SUB_ACCOUNT", "EVENT", "CHANNEL")
+        ))
+    return rows
 
 
 def resolve_attribution_window(
@@ -90,7 +157,7 @@ def resolve_attribution_window(
     channel: str | None = None,
 ) -> int:
     """Choose 30-day attribution when present, otherwise the largest available."""
-    where_clause, params = _dimension_filters(
+    where_clause, params, aggregation_level = _quarterly_history_dimensions(
         account_name, sub_account, event, channel
     )
     query = f"""
@@ -99,7 +166,7 @@ def resolve_attribution_window(
             MAX(TRY_CAST(RESPONSE_WINDOW AS INT)) AS MAX_WINDOW
         FROM {REFERENCE_HISTORICAL_TABLE}
         WHERE {where_clause}
-          AND AGGREGATION_LEVEL = 'OVERALL'
+          AND AGGREGATION_LEVEL = '{aggregation_level}'
     """
     rows = _rows(session.sql(query, params=params).collect())
     if not rows:
@@ -351,18 +418,26 @@ def _per_quarter_attribution_windows(
     sub_account: str | None = None,
     event: str | None = None,
     channel: str | None = None,
+    *,
+    quarterly_segment_mapping: bool = False,
 ) -> dict[str, int]:
     """Return a mapping of CAMPAIGN_QUARTER -> best RESPONSE_WINDOW for each quarter."""
-    where_clause, params = _dimension_filters(
-        account_name, sub_account, event, channel
-    )
+    if quarterly_segment_mapping:
+        where_clause, params, aggregation_level = _quarterly_history_dimensions(
+            account_name, sub_account, event, channel
+        )
+    else:
+        where_clause, params = _dimension_filters(
+            account_name, sub_account, event, channel
+        )
+        aggregation_level = "OVERALL"
     query = f"""
         SELECT CAMPAIGN_QUARTER,
                MAX(IFF(RESPONSE_WINDOW = '30', 30, NULL)) AS W30,
                MAX(TRY_CAST(RESPONSE_WINDOW AS INT)) AS MAX_W
         FROM {REFERENCE_HISTORICAL_TABLE}
         WHERE {where_clause}
-          AND AGGREGATION_LEVEL = 'OVERALL'
+          AND AGGREGATION_LEVEL = '{aggregation_level}'
         GROUP BY CAMPAIGN_QUARTER
     """
     result = {}
@@ -388,6 +463,7 @@ def historical_preview(
         _historical_cumulative_rows(
             session, attribution_window,
             account_name, sub_account, event, channel,
+            quarterly_segment_mapping=True,
         ),
         period="quarter",
     )
@@ -423,11 +499,18 @@ def historical_previews(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch the filtered history once and derive quarter and month previews."""
     rows = _historical_cumulative_rows(
-        session, attribution_window, account_name, sub_account, event, channel
+        session, attribution_window, account_name, sub_account, event, channel,
+        quarterly_segment_mapping=True,
     )
+    monthly_rows = rows
+    if _directv_quarterly_segment(account_name, sub_account):
+        # Do not substitute segment cumulative snapshots for existing monthly history.
+        monthly_rows = _historical_cumulative_rows(
+            session, attribution_window, account_name, sub_account, event, channel
+        )
     return (
         _latest_historical_snapshots(rows, period="quarter"),
-        _latest_historical_snapshots(rows, period="month"),
+        _latest_historical_snapshots(monthly_rows, period="month"),
     )
 
 
@@ -438,6 +521,8 @@ def _historical_cumulative_rows(
     sub_account: str | None,
     event: str | None,
     channel: str | None,
+    *,
+    quarterly_segment_mapping: bool = False,
 ) -> list[dict[str, Any]]:
     """Fetch one latest source observation per filtered campaign quarter/week.
 
@@ -450,15 +535,22 @@ def _historical_cumulative_rows(
     Derives MONTH_MARKER from LAST_DELIVERY_DATE.
     """
     quarter_windows = _per_quarter_attribution_windows(
-        session, account_name, sub_account, event, channel
+        session, account_name, sub_account, event, channel,
+        quarterly_segment_mapping=quarterly_segment_mapping,
     )
     if not quarter_windows:
         return []
 
     # Build dimension filters (includes event/channel/sub_account)
-    where_clause, params = _dimension_filters(
-        account_name, sub_account, event, channel
-    )
+    if quarterly_segment_mapping:
+        where_clause, params, aggregation_level = _quarterly_history_dimensions(
+            account_name, sub_account, event, channel
+        )
+    else:
+        where_clause, params = _dimension_filters(
+            account_name, sub_account, event, channel
+        )
+        aggregation_level = "OVERALL"
 
     quarter_filter_parts = []
     quarter_params = []
@@ -467,7 +559,7 @@ def _historical_cumulative_rows(
         quarter_params.extend([quarter, str(window)])
 
     full_where = (
-        f"AGGREGATION_LEVEL = 'OVERALL'"
+        f"AGGREGATION_LEVEL = '{aggregation_level}'"
         f" AND ({' OR '.join(quarter_filter_parts)})"
         f" AND {where_clause}"
     )
