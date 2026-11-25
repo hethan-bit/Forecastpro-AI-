@@ -2682,6 +2682,14 @@ def snowflake_display_tiers(result: dict) -> dict[str, str]:
             "Recreate the forecast draft with the full set of expansion tiers "
             "(+5% through +25% or +10% through +50%) before saving."
         )
+    expansion_labels = (
+        "Incremental Reach (+10%)", "Incremental Reach (+20%)",
+        "Incremental Reach (+30%)", "Incremental Reach (+40%)",
+        "Maximum Scale (+50%)",
+    )
+    available = {row.tier_label for row in result["ranges"]}
+    if not set(expansion_labels).issubset(available):
+        raise ValueError("Recreate the forecast draft with the +10% through +50% tiers before saving.")
     negative = {label: False for label in expansion_labels}
     for row in result["projections"]:
         if row.tier_label in negative:
